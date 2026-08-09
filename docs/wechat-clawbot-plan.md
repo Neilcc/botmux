@@ -1,13 +1,27 @@
 # 微信 Clawbot 接入 botmux 方案文档
 
-> 状态：**方案梳理中（v0.1）**
-> 日期：2026-08-09
+> 状态：**已联通（Track 1 可用）+ Track 2 基础已落地（v0.2）**
+> 日期：2026-08-09（更新 2026-08-10）
 > 目标：让「微信 Clawbot」的对话能控制本服务器（走 botmux → Claude Code / Codex 会话）
 > 参考：[微信 clawbot 实测文章](https://mp.weixin.qq.com/s/1_8gWO-lo-BqsuKbGCwxfg)
 
 ---
 
-## 0. 现状盘点（2026-08-09，服务器刚重启后）
+## 0. 现状盘点（2026-08-10）
+
+### 已联通（Track 1，立即可用）
+- openclaw 网关默认模型已切 `claude-cli/sonnet`，微信 clawbot 消息 → 本机 Claude Code CLI 回复。
+- root 下需 `IS_SANDBOX=1` 解锁 Claude Code root 逃生舱（**用户已授权**，写入 `~/.config/systemd/user/openclaw-gateway.service`）。
+- 微信通道 `ad84cc0d97e4-im-bot` 健康，`openclaw channels status --probe` 确认。
+
+### Track 2（botmux 微信通道）已落地
+- `src/im/weixin/{client,adapter,index}.ts`：微信长轮询传输 + ImAdapter，编译通过、`pnpm build` 绿。
+- `BotConfig.channel?: 'lark'|'weixin'` 配置面已加（缺省 lark，飞书主路径不动）。
+- Telegram 适配器编译已修复（同款 StreamStatus 导入/类型/徽标问题）。
+- 提交 `c5ce8b6`。
+- **剩余**：daemon 会话接线（channel-aware `getBotClient` 出站 + 微信入站灌 `botEventHandlers`），是后续增量。
+
+## 1. 现状盘点（2026-08-09，服务器刚重启后）
 
 ### 已修复 / 已确认
 | 项 | 状态 |
