@@ -1082,6 +1082,16 @@ export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
   /**
+   * Telegram 通道用的 bot token（channel === 'telegram' 时必填）。
+   * larkAppId 仍用于 daemon 标识（如 `tg_<username>`），larkAppSecret 可缺省。
+   */
+  telegramBotToken?: string;
+  /**
+   * 微信 ClawBot 通道用的 bot id（channel === 'weixin' 时必填）。
+   * 基于官方 openclaw-weixin / iLink 协议，拆分为独立通道实现。
+   */
+  wechatClawbotId?: string;
+  /**
    * Core-only / headless 模式：该 bot 纯 HTTP 控制 API 驱动（trigger →
    * spawn → CLI → trigger-result），**不连接任何飞书**——boot 时跳过
    * open_id 探测、required-scope 校验、WSClient 事件订阅，也不投递飞书消息
@@ -1094,11 +1104,14 @@ export interface BotConfig {
   apiOnly?: boolean;
   /**
    * 消息通道。缺省 / 旧 bots.json 无此字段 → 视为 `'lark'`（飞书，字节不变）。
-   * `'weixin'`：微信 Clawbot 通道（见 src/im/weixin/），走 openclaw 扫码绑定的
-   * 微信凭证长轮询，消息进 botmux 会话机制。当前 `'weixin'` 通道的完整 daemon
-   * 会话接线仍在推进：本字段是配置面，缺省不改变任何现行为。
+   * - `'lark'`：飞书，用 larkAppId/larkAppSecret。
+   * - `'telegram'`：Telegram（见 src/im/telegram/），用 telegramBotToken，长轮询
+   *   拉取 / 原生 message reaction / 文本卡片。
+   * - `'weixin'`：微信 Clawbot 通道（见 src/im/weixin/），走 openclaw 扫码绑定的
+   *   微信凭证长轮询，消息进 botmux 会话机制。当前 `'weixin'`/`'telegram'` 通道的
+   *   完整 daemon 会话接线仍在推进：本字段是配置面，缺省不改变任何现行为。
    */
-  channel?: 'lark' | 'weixin';
+  channel?: 'lark' | 'telegram' | 'weixin';
   /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`

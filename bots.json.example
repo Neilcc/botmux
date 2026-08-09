@@ -1,5 +1,6 @@
 [
   {
+    "channel": "lark",
     "larkAppId": "cli_xxx_bot1",
     "larkAppSecret": "your_secret_1",
     "cliId": "claude-code",
@@ -16,6 +17,7 @@
     }
   },
   {
+    "channel": "lark",
     "larkAppId": "cli_xxx_bot2",
     "larkAppSecret": "your_secret_2",
     "cliId": "aiden",
@@ -23,32 +25,21 @@
     "workingDir": "~/work"
   },
   {
-    "larkAppId": "cli_xxx_bot3",
-    "larkAppSecret": "your_secret_3",
-    "cliId": "gemini",
-    "model": "gemini-2.5-pro",
-    "allowedUsers": ["charlie@company.com"],
+    "channel": "telegram",
+    "larkAppId": "tg_my_bot1",
+    "larkAppSecret": "",
+    "telegramBotToken": "123456789:ABCdef_YourTelegramBotToken",
+    "cliId": "claude-code",
+    "allowedUsers": ["5707358914"],
     "workingDir": "~/projects"
   },
   {
-    "larkAppId": "cli_xxx_bot4",
-    "larkAppSecret": "your_secret_4",
-    "cliId": "mtr",
-    "allowedUsers": ["dana@company.com"],
-    "workingDir": "~/projects"
-  },
-  {
-    "larkAppId": "cli_xxx_bot5",
-    "larkAppSecret": "your_secret_5",
-    "cliId": "mira",
-    "allowedUsers": ["erin@company.com"],
-    "workingDir": "~/projects"
-  },
-  {
-    "larkAppId": "cli_xxx_bot6",
-    "larkAppSecret": "your_secret_6",
-    "cliId": "pi",
-    "allowedUsers": ["frank@company.com"],
+    "channel": "weixin",
+    "larkAppId": "wx_clawbot1",
+    "larkAppSecret": "",
+    "wechatClawbotId": "wxid_xxxx",
+    "cliId": "codex",
+    "allowedUsers": ["zhuchengcheng@bytedance.com"],
     "workingDir": "~/projects"
   }
 ]
