@@ -1093,6 +1093,13 @@ export interface BotConfig {
    */
   apiOnly?: boolean;
   /**
+   * 消息通道。缺省 / 旧 bots.json 无此字段 → 视为 `'lark'`（飞书，字节不变）。
+   * `'weixin'`：微信 Clawbot 通道（见 src/im/weixin/），走 openclaw 扫码绑定的
+   * 微信凭证长轮询，消息进 botmux 会话机制。当前 `'weixin'` 通道的完整 daemon
+   * 会话接线仍在推进：本字段是配置面，缺省不改变任何现行为。
+   */
+  channel?: 'lark' | 'weixin';
+  /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
    * （见 {@link normalizeBrand}），向后兼容。决定 SDK Client / WSClient 的

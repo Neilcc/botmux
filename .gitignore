@@ -46,3 +46,67 @@ src/desktop/assets/*.png
 # 静默忽略，`git add` 只报一行提示，很容易漏提交。
 /platform/
 /mcp-gateway/
+
+# ─────────────────────────────────────────────────────────────
+# 密钥加固（fork/公开仓防泄漏）：以下一律绝不提交。
+# 真实运行配置 vs 模板：只提交 *.example，不提交真实 bots.json。
+bot.json
+bots.json
+bots.json.bak
+*.local.json
+*.local.json.bak
+/session.json
+/session-*.json
+.json.bak
+
+# 所有明文/会话/token/密钥文件
+/session/
+/feishu-session.json
+/*.session.json
+/*-session.json
+secret*
+*secret*
+*.pem
+*.key
+*.p12
+*.pfx
+.pnpm-store/
+
+# 任何平台凭据/token 转储（含 .env 变体）
+.env
+.env.*
+.env.*.local
+.envrc
+*.env
+token*
+*token*
+*.token
+credential*
+*.tg-backend
+telegram-session*
+wechat-session*
+weixin-session*
+
+# 本地数据 / 日志 / 运行时状态
+data/
+log/
+logs/
+*.log
+*.tsbuildinfo
+storageState.json
+midscene_run/
+
+# 操作者本地 Git 凭据与 SSH（防误加）
+.ssh/
+*.git-credentials
+.gitconfig
+.netrc
+
+# 桌面/构建产物
+dist/
+packages/workflow-core/dist/
+packages/workflow-core/.packs/
+build/desktop-node/
+build/desktop-runtime/
+build/icon.png
+src/desktop/assets/*.png
