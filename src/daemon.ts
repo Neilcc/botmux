@@ -370,6 +370,9 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { createChannelAdapter } from './im/channel-factory.js';
+import { registerChannelAdapter } from './im/channel-registry.js';
+import { buildChannelImEventHandler } from './im/channel-bridge.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -20052,6 +20055,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  // 通道判定：channel 缺省 = lark（向后兼容）。非飞书 bot（weixin/telegram）
+  // 没有飞书应用，须跳过所有 Lark 专属启动步骤（open_id 探测 / scope 校验 /
+  // 改名改头像 / 文档订阅 / WSClient 事件订阅），只启动对应通道 adapter。
+  const isLarkChannel = cfg.channel === 'lark' || cfg.channel === undefined;
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.
@@ -20251,11 +20258,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   };
   setDisplayNameRefresher(refreshBotNameState);
-  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar. These
+  // apiOnly (core-only) bots have no Feishu app to rename / re-avatar, and
+  // non-lark channel bots (weixin/telegram) have no Feishu app at all. These
   // handlers drive the open-platform console (browser web-session, NOT
   // getBotClient — so the bot-level gate can't catch them); skip registering
-  // them entirely so the dashboard profile actions are inert for a core-only bot.
-  if (!cfg.apiOnly) {
+  // them entirely so the dashboard profile actions are inert for such bots.
+  if (!cfg.apiOnly && isLarkChannel) {
   // 机器人真·改名（dashboard 档案头 ✎）：开放平台自动化改飞书应用名并发布新版本
   // （群内显示名跟随已发布版本，见 services/open-platform-rename.ts）。成功后同步
   // 内存 botName / bots-info 名册 / descriptor，并清掉冗余的 displayName 别名——
@@ -20734,16 +20742,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     checkAllowedChatGroupsConfig(bot);
 
-    // apiOnly (core-only) bots never connect to Feishu: skip the open_id probe,
-    // the required-scope check, and the WSClient event subscription. They are
-    // driven purely over the HTTP control API (trigger → spawn → trigger-result),
-    // whose async path early-returns in deliverFinalOutput before any Feishu send.
-    // Seed a synthetic identity so downstream reads (worker botOpenId, dashboard
+    // apiOnly (core-only) bots never connect to Feishu; non-lark channel bots
+    // (weixin/telegram) have no Feishu app at all. Both skip the open_id probe,
+    // the required-scope check, and the WSClient event subscription. Seed a
+    // synthetic identity so downstream reads (worker botOpenId, dashboard
     // roster) get a stable non-undefined value instead of the never-probed one.
-    if (cfg.apiOnly) {
+    if (cfg.apiOnly || !isLarkChannel) {
       bot.botOpenId ||= `bot_${cfg.larkAppId}`;
       bot.botName ||= cfg.displayName ?? cfg.larkAppId;
-      logger.info(`[api-only] ${cfg.larkAppId} 以 core-only 模式启动：跳过飞书 open_id 探测 / scope 校验 / WSClient 订阅，仅 HTTP 控制 API 驱动`);
+      logger.info(`[api-only] ${cfg.larkAppId} 以 core-only/非飞书通道模式启动：跳过飞书 open_id 探测 / scope 校验 / WSClient 订阅`);
     } else {
     // Probe bot open_id and persist to bots-info.json. When the friendly
     // botName comes back from /bot/v3/info, refresh the dashboard descriptor
@@ -20780,7 +20787,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // im:message.group_at_msg.include_bot:readonly。缺失会 logger.error +
     // 私信 allowedUsers[0]。校验异步，跑失败不影响 daemon。
     // apiOnly 无飞书连接 → 无 scope 概念，跳过。
-    if (!cfg.apiOnly) {
+    if (!cfg.apiOnly && isLarkChannel) {
       checkRequiredScopes(cfg.larkAppId).catch(err => {
         logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
       });
@@ -20829,15 +20836,35 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     };
     // 存起来供授权成功后重放消息用（replayGrantedMessage → replayMessageEvent）。
     botHandlers.set(cfg.larkAppId, botEventHandlers);
-    // apiOnly bots never subscribe to Feishu events → no WSClient. This is the
-    // core decoupling: the daemon serves the HTTP control API only.
-    if (!cfg.apiOnly) {
+    // Channel-aware inbound routing:
+    // - lark（缺省）：飞书 WSClient 事件订阅（既有主路径，字节不变）。
+    // - apiOnly：无任何入站通道，仅 HTTP 控制 API。
+    // - weixin/telegram：构造 ImAdapter 并启动轮询，把入站经 channel-bridge
+    //   灌进同一个 botEventHandlers（复用全部会话/worker/CLI 逻辑）。
+    if (!cfg.apiOnly && isLarkChannel) {
       startEventDispatchers.push(() => startLarkEventDispatcher(
         cfg.larkAppId,
         cfg.larkAppSecret,
         botEventHandlers,
         normalizeBrand(cfg.brand),
       ));
+    } else if (!cfg.apiOnly && !isLarkChannel) {
+      startEventDispatchers.push(() => {
+        let adapter: ReturnType<typeof createChannelAdapter>;
+        try {
+          adapter = createChannelAdapter(cfg);
+        } catch (err) {
+          logger.error(`[channel] ${cfg.larkAppId} 启动 ${cfg.channel} 通道失败: ${err instanceof Error ? err.message : String(err)}`);
+          return;
+        }
+        if (!adapter) {
+          logger.error(`[channel] ${cfg.larkAppId} channel=${cfg.channel} 未返回 ImAdapter`);
+          return;
+        }
+        registerChannelAdapter(cfg.larkAppId, adapter);
+        logger.info(`[channel] ${cfg.larkAppId} 启动 ${cfg.channel} 通道（account=${adapter.getBotUserId() ?? '-'}）`);
+        void adapter.start(buildChannelImEventHandler(botEventHandlers, cfg.larkAppId));
+      });
     }
 
     // A distillation command is durably prepared before its model run/card
@@ -20976,7 +21003,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // bot 从不连飞书，且其合成身份不会有真实文档订阅——整块跳过，否则非 pristine
   // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
   let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
-  if (!cfg.apiOnly) {
+  if (!cfg.apiOnly && isLarkChannel) {
     // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
     // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
     await restoreDocSubscriptions(activeSessions);

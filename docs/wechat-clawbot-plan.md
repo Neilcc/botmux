@@ -1,6 +1,6 @@
 # 微信 Clawbot 接入 botmux 方案文档
 
-> 状态：**已联通（Track 1 可用）+ Track 2 基础已落地（v0.2）**
+> 状态：**已联通（Track 1 可用）+ Track 2 接线完成（v0.3）**
 > 日期：2026-08-09（更新 2026-08-10）
 > 目标：让「微信 Clawbot」的对话能控制本服务器（走 botmux → Claude Code / Codex 会话）
 > 参考：[微信 clawbot 实测文章](https://mp.weixin.qq.com/s/1_8gWO-lo-BqsuKbGCwxfg)
@@ -14,12 +14,27 @@
 - root 下需 `IS_SANDBOX=1` 解锁 Claude Code root 逃生舱（**用户已授权**，写入 `~/.config/systemd/user/openclaw-gateway.service`）。
 - 微信通道 `ad84cc0d97e4-im-bot` 健康，`openclaw channels status --probe` 确认。
 
-### Track 2（botmux 微信通道）已落地
+### Track 2（botmux 微信通道）接线完成
 - `src/im/weixin/{client,adapter,index}.ts`：微信长轮询传输 + ImAdapter，编译通过、`pnpm build` 绿。
-- `BotConfig.channel?: 'lark'|'weixin'` 配置面已加（缺省 lark，飞书主路径不动）。
+- `BotConfig.channel?: 'lark'|'weixin'|'telegram'` 配置面（缺省 lark，飞书主路径不动）。
 - Telegram 适配器编译已修复（同款 StreamStatus 导入/类型/徽标问题）。
-- 提交 `c5ce8b6`。
-- **剩余**：daemon 会话接线（channel-aware `getBotClient` 出站 + 微信入站灌 `botEventHandlers`），是后续增量。
+- **daemon 会话接线（v0.3，本次落地）**：
+  - `src/im/channel-registry.ts`：按 larkAppId 保存非飞书 bot 的 ImAdapter（出站路由源）。
+  - `src/im/channel-bridge.ts`：把 ImMessage 合成最小「飞书记事件」data + RoutingContext，
+    灌进既有 `botEventHandlers`（复用全部会话/worker/CLI 逻辑）；按 `isSessionOwner`
+    决定续话 vs 开新话题；卡片 JSON → 纯文本渲染。
+  - `src/im/lark/client.ts`：`sendMessage/replyMessage/updateMessage/addReaction/
+    removeReaction/deleteMessage` 顶部加通道分支——该 bot 注册了非飞书 adapter 就路由到
+    adapter，否则走原飞书路径（字节不变）。飞书 bot 从不注册 adapter，回归面最小。
+  - `src/daemon.ts`：按 `isLarkChannel` 跳过非飞书 bot 的飞书专属启动步骤（open_id 探测 /
+    scope 校验 / 改名改头像 / 文档订阅 / WSClient 订阅），改由 `createChannelAdapter` +
+    `adapter.start(buildChannelImEventHandler(...))` 启动对应通道。
+  - 新增单测 `test/channel-bridge.test.ts`（7 用例：data 合成 / 续话 vs 新话题 /
+    卡片文本提取）全绿；client 相关测试 188+79 全绿；既有失败均为上游环境相关（未新增）。
+- **剩余（后续增量）**：
+  - weixin 媒体映射（图片/文件下载，`event.media` 下载待接）。
+  - 微信 `allowedUserIds` 白名单对齐（weixin userId 与 Lark open_id 不同，需按微信 id 配置）。
+  - live 端到端验证（需在 bots.json 加 `channel:'weixin'` bot 并重启 daemon）。
 
 ## 1. 现状盘点（2026-08-09，服务器刚重启后）
 

@@ -4,6 +4,8 @@ import { pipeline } from 'node:stream/promises';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
+import { getChannelAdapter } from '../channel-registry.js';
+import { extractChannelCardText } from '../channel-bridge.js';
 import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
@@ -255,6 +257,22 @@ export async function sendMessage(
   hookContext?: Record<string, unknown>,
   options?: OutboundMessageOptions,
 ): Promise<string> {
+  // 非飞书通道（weixin/telegram）：路由到对应 ImAdapter，不走 Lark API。
+  const channelAdapter = getChannelAdapter(larkAppId);
+  if (channelAdapter) {
+    const text = msgType === 'interactive' ? extractChannelCardText(content) : content;
+    const sentId = await channelAdapter.sendMessage(chatId, text, 'text');
+    await emitOutboundHookIfAllowed(options, 'outbound.send', {
+      ...hookContext,
+      larkAppId,
+      chatId,
+      messageId: sentId,
+      msgType,
+      uuid,
+      content,
+    });
+    return sentId;
+  }
   assertLarkTransport(larkAppId, 'sendMessage');
   const c = getBotClient(larkAppId);
   const body = msgType === 'text'
@@ -316,6 +334,23 @@ export async function replyMessage(
   hookContext?: Record<string, unknown>,
   options?: OutboundMessageOptions,
 ): Promise<string> {
+  // 非飞书通道：messageId 即 threadId（`wx:<accountId>:<userId>`），路由到 adapter。
+  const channelAdapter = getChannelAdapter(larkAppId);
+  if (channelAdapter) {
+    const text = msgType === 'interactive' ? extractChannelCardText(content) : content;
+    const sentId = await channelAdapter.replyMessage(messageId, text, 'text');
+    await emitOutboundHookIfAllowed(options, 'outbound.reply', {
+      ...hookContext,
+      larkAppId,
+      messageId,
+      replyId: sentId,
+      msgType,
+      replyInThread,
+      uuid,
+      content,
+    });
+    return sentId;
+  }
   assertLarkTransport(larkAppId, 'replyMessage');
   const c = getBotClient(larkAppId);
   const body = msgType === 'text'
@@ -362,6 +397,11 @@ export async function replyMessage(
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
+  // 非飞书通道多无公开 reaction API：尽力而为，失败不炸会话。
+  const channelAdapter = getChannelAdapter(larkAppId);
+  if (channelAdapter) {
+    try { return await channelAdapter.addReaction(messageId, emojiType); } catch { return ''; }
+  }
   assertLarkTransport(larkAppId, 'addReaction');
   const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageReaction.create({
@@ -377,6 +417,11 @@ export async function addReaction(larkAppId: string, messageId: string, emojiTyp
 }
 
 export async function removeReaction(larkAppId: string, messageId: string, reactionId: string): Promise<void> {
+  const channelAdapter = getChannelAdapter(larkAppId);
+  if (channelAdapter) {
+    try { await channelAdapter.removeReaction(messageId, reactionId); } catch { /* 尽力而为 */ }
+    return;
+  }
   assertLarkTransport(larkAppId, 'removeReaction');
   const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageReaction.delete({
@@ -866,6 +911,8 @@ export async function getChatMode(
  * fall back instead of assuming success. Fire-and-forget callers can ignore it.
  */
 export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
+  // 非飞书通道无删除 API：视为成功（幂等），避免会话流程报错。
+  if (getChannelAdapter(larkAppId)) return true;
   assertLarkTransport(larkAppId, 'deleteMessage');
   const c = getBotClient(larkAppId);
   try {
@@ -947,6 +994,11 @@ export async function deleteEphemeralCard(larkAppId: string, messageId: string):
 }
 
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
+  // 非飞书通道无「编辑消息」能力（微信无卡片），静默忽略实为预期行为。
+  if (getChannelAdapter(larkAppId)) {
+    await getChannelAdapter(larkAppId)!.updateMessage(messageId, cardJson);
+    return;
+  }
   assertLarkTransport(larkAppId, 'updateMessage');
   const c = getBotClient(larkAppId);
   let res: any;
