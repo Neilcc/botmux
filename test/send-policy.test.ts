@@ -1,17 +1,26 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   resolveQuoteTarget,
+  shouldSuppressImplicitReplyTarget,
+  shouldDropAfterTheFactTopicQuote,
   validateMentionDecision,
+  classifyMentionIdentifiers,
+  outsidersForMembership,
   mentionBackAmbiguity,
   mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
+  parseDiffFlag,
+  diffUsageError,
+  parseUrgentFlag,
+  urgentUsageError,
   managedVcQuoteError,
   managedVcCustomCardError,
   managedVcSendControlError,
   managedVcSendPayloadError,
   containsLarkAtTag,
   neutralizeLarkAtTags,
+  matchUniqueChatMemberOpenId,
 } from '../src/services/send-policy.js';
 
 describe('resolveQuoteTarget', () => {
@@ -40,6 +49,56 @@ describe('resolveQuoteTarget', () => {
 
   it('--top-level never quotes', () => {
     expect(resolveQuoteTarget({ ...base, sendTopLevel: true, sessionQuoteTargetId: 'om_a' })).toBeNull();
+  });
+});
+
+describe('shouldSuppressImplicitReplyTarget', () => {
+  it('drops the implicit reply when an explicit recipient excludes the caller', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: ['ou_actual_handler'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(true);
+  });
+
+  it('keeps the reply when the caller is explicitly included', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: ['ou_triggering_bot', 'ou_other'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(false);
+  });
+
+  it('preserves an explicit --quote', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      explicitQuote: 'om_explicit',
+      mentionOpenIds: ['ou_actual_handler'],
+      replyTargetSenderOpenId: 'ou_triggering_bot',
+    })).toBe(false);
+  });
+
+  it('keeps the default reply when no recipient was selected', () => {
+    expect(shouldSuppressImplicitReplyTarget({
+      mentionOpenIds: [],
+      replyTargetSenderOpenId: 'ou_human',
+    })).toBe(false);
+  });
+});
+
+describe('matchUniqueChatMemberOpenId', () => {
+  const members = [
+    { openId: 'ou_owner', name: '汪睿麟' },
+    { openId: 'ou_other', name: '其他人' },
+  ];
+
+  it('resolves an exact unique member name', () => {
+    expect(matchUniqueChatMemberOpenId('汪睿麟', members)).toBe('ou_owner');
+  });
+
+  it('does not guess on missing or ambiguous names', () => {
+    expect(matchUniqueChatMemberOpenId('不存在', members)).toBeUndefined();
+    expect(matchUniqueChatMemberOpenId('同名', [
+      { openId: 'ou_a', name: '同名' },
+      { openId: 'ou_b', name: '同名' },
+    ])).toBeUndefined();
   });
 });
 
@@ -114,6 +173,7 @@ describe('managedVcSendControlError', () => {
       { ...safe, overrideChatId: 'oc_other' },
       { ...safe, sendInto: 'om_other' },
       { ...safe, attentionRequested: true },
+      { ...safe, urgentRequested: true },
     ]) {
       const error = managedVcSendControlError(input);
       if (!error) providerCall();
@@ -359,5 +419,184 @@ describe('attentionUsageError', () => {
   });
   it('rejects no-text (dashboard needs a reason)', () => {
     expect(attentionUsageError({ ...ok, hasText: false })).toMatch(/reason/);
+  });
+});
+
+describe('parseUrgentFlag', () => {
+  it('defaults a bare flag to in-app Buzz without eating the message', () => {
+    expect(parseUrgentFlag(['--urgent', 'please respond'])).toEqual({
+      requested: true,
+      mode: 'app',
+    });
+  });
+
+  it('accepts explicit app, sms and phone modes', () => {
+    expect(parseUrgentFlag(['--urgent=app'])).toMatchObject({ requested: true, mode: 'app' });
+    expect(parseUrgentFlag(['--urgent=sms'])).toMatchObject({ requested: true, mode: 'sms' });
+    expect(parseUrgentFlag(['--urgent=phone'])).toMatchObject({ requested: true, mode: 'phone' });
+  });
+
+  it('rejects unknown or repeated modes instead of choosing a costly channel', () => {
+    expect(parseUrgentFlag(['--urgent=all']).error).toMatch(/app\|sms\|phone/);
+    expect(parseUrgentFlag(['--urgent', '--urgent=phone']).error).toMatch(/只能指定一次/);
+  });
+});
+
+describe('urgentUsageError', () => {
+  const ok = {
+    requested: true,
+    mentionBack: true,
+    sendTopLevel: false,
+  };
+
+  it('requires the exact turn sender and accepts an ordinary reply', () => {
+    expect(urgentUsageError(ok)).toBeNull();
+    expect(urgentUsageError({ ...ok, mentionBack: false })).toMatch(/--mention-back/);
+  });
+
+  it('rejects detoured and voice sends', () => {
+    expect(urgentUsageError({ ...ok, sendTopLevel: true })).toMatch(/--top-level/);
+    expect(urgentUsageError({ ...ok, overrideChatId: 'oc_other' })).toMatch(/--chat-id/);
+    expect(urgentUsageError({ ...ok, sendInto: 'om_other' })).toMatch(/--into/);
+    expect(urgentUsageError({ ...ok, asVoice: true })).toMatch(/--voice/);
+  });
+});
+
+describe('shouldDropAfterTheFactTopicQuote', () => {
+  // 「顶层 @ 之后那条消息才被开成话题」的发送侧半边：quote 会继承被引用消息
+  // **此刻**的话题归属，所以必须在这种情况下放弃 quote、改平铺。
+  const base = { quoteTargetId: 'om_top_at' };
+
+  it('顶层进来的轮次 + 该消息现在已属于话题 → 放弃 quote(改平铺)', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: 'omt_after_fact',
+    })).toBe(true);
+  });
+
+  it('顶层进来但该消息现在确认没有话题 → 照旧 quote', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: null,
+    })).toBe(false);
+  });
+
+  it('本轮就是从话题里进来的(inThread=true) → 照旧 quote,不碰真话题的锚定', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: true, currentThreadId: 'omt_genuine',
+    })).toBe(false);
+  });
+
+  it('老会话行没有 inThread(undefined) → 按未知保持旧行为,绝不猜', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: undefined, currentThreadId: 'omt_x',
+    })).toBe(false);
+  });
+
+  it('探测失败/未探测(currentThreadId undefined) → 保持 quote,不确定不改行为', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: undefined,
+    })).toBe(false);
+  });
+
+  it('--quote 是操作者显式指定 → 一律照办,不覆盖', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: 'omt_after_fact', explicitQuote: 'om_top_at',
+    })).toBe(false);
+  });
+
+  it('本来就不 quote → 无需判断', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      quoteTargetId: null, quotedTurnInThread: false, currentThreadId: 'omt_x',
+    })).toBe(false);
+  });
+
+  it('空白 thread_id 不算话题(防把 "" / 空格当命中)', () => {
+    expect(shouldDropAfterTheFactTopicQuote({
+      ...base, quotedTurnInThread: false, currentThreadId: '   ',
+    })).toBe(false);
+  });
+});
+
+describe('classifyMentionIdentifiers', () => {
+  const oid = { identifier: 'ou_abc', name: 'Alice' };
+  const email = { identifier: 'bob@bytedance.com', name: 'Bob' };
+  const union = { identifier: 'on_xyz', name: '' };
+
+  it('passes literal open_ids through regardless of the switch', () => {
+    const r = classifyMentionIdentifiers([oid], false);
+    expect(r.ok).toBe(true);
+    expect(r.openIdMentions).toEqual([oid]);
+    expect(r.toResolve).toEqual([]);
+  });
+
+  it('rejects non-open_id identifiers when the switch is off', () => {
+    const r = classifyMentionIdentifiers([oid, email], false);
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('allowArbitraryMention');
+    expect(r.error).toContain('bob@bytedance.com');
+    // open_ids are still surfaced so callers could partially proceed if desired
+    expect(r.openIdMentions).toEqual([oid]);
+  });
+
+  it('routes non-open_id identifiers to resolution when the switch is on', () => {
+    const r = classifyMentionIdentifiers([oid, email, union], true);
+    expect(r.ok).toBe(true);
+    expect(r.openIdMentions).toEqual([oid]);
+    expect(r.toResolve).toEqual([email, union]);
+  });
+
+  it('is a no-op for an empty mention list', () => {
+    const r = classifyMentionIdentifiers([], false);
+    expect(r.ok).toBe(true);
+    expect(r.openIdMentions).toEqual([]);
+    expect(r.toResolve).toEqual([]);
+  });
+});
+
+describe('outsidersForMembership', () => {
+  const members = new Set(['ou_alice', 'ou_bob']);
+
+  it('returns empty when every resolved open_id is a member (in-group passes)', () => {
+    const out = outsidersForMembership(
+      [{ identifier: 'a@x.com', openId: 'ou_alice' }, { identifier: 'b@x.com', openId: 'ou_bob' }],
+      members,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('flags a resolved open_id that is NOT a member (out-of-group rejected)', () => {
+    const out = outsidersForMembership(
+      [{ identifier: 'a@x.com', openId: 'ou_alice' }, { identifier: 'c@x.com', openId: 'ou_carol' }],
+      members,
+    );
+    expect(out).toEqual([{ identifier: 'c@x.com', openId: 'ou_carol' }]);
+  });
+
+  it('flags everyone when the member set is empty (gate has teeth)', () => {
+    const out = outsidersForMembership(
+      [{ identifier: 'a@x.com', openId: 'ou_alice' }],
+      new Set<string>(),
+    );
+    expect(out).toHaveLength(1);
+  });
+});
+
+describe('core --diff policy', () => {
+  it('parses absent, separate and equals values like other send flags', () => {
+    expect(parseDiffFlag(['hello'])).toEqual({ requested: false });
+    expect(parseDiffFlag(['--diff', '/tmp/有 空格.diff'])).toEqual({ requested: true, path: '/tmp/有 空格.diff' });
+    expect(parseDiffFlag(['--diff=/tmp/a.diff'])).toEqual({ requested: true, path: '/tmp/a.diff' });
+  });
+
+  it.each([['--diff'], ['--diff='], ['--diff', '--no-mention'], ['--diff', '-'], ['--diff', '/dev/stdin'], ['--diff=x', '--diff=y']].map(args => ({ args })))('rejects missing/ambiguous paths $args', ({ args }) => {
+    expect(parseDiffFlag(args)).toMatchObject({ requested: true, error: expect.any(String) });
+  });
+
+  it('rejects incompatible display modes without changing ordinary send', () => {
+    const defaults = { requested: true, customCardRequested: false, mediaRequested: false, voice: false, slash: false };
+    expect(diffUsageError(defaults)).toBeNull();
+    for (const option of ['customCardRequested', 'mediaRequested', 'voice', 'slash']) {
+      expect(diffUsageError({ ...defaults, [option]: true })).toEqual(expect.any(String));
+    }
+    expect(diffUsageError({ ...defaults, requested: false, mediaRequested: true })).toBeNull();
   });
 });

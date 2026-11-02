@@ -2,9 +2,15 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { assertSafePluginRelativePath, resolvePluginPath } from './paths.js';
 import { loadSkillPackage } from '../skills/package.js';
+import { pluginCardActionSelectorOverlapsBotmux } from '../card-action-namespace.js';
+import { isBuiltinSlashCommandName } from '../command-schema.js';
+import { PASSTHROUGH_COMMANDS, SLASH_COMMAND_SHAPE } from '../passthrough-commands.js';
 import type {
   BotmuxPluginManifest,
   PluginCliCommandIndexEntry,
+  PluginCardActionsContribution,
+  PluginCommandEntry,
+  PluginCommandsContribution,
   PluginMcpServer,
   PluginServiceMode,
   ScannedPluginContributions,
@@ -168,12 +174,146 @@ function scanService(runtimeDir: string, mode: PluginServiceMode | undefined): S
   return { entry, mode: mode! };
 }
 
+const isCardActionSelector = (value: unknown): value is string => {
+  return typeof value === 'string'
+    && value === value.trim()
+    && Array.from(value).length > 0
+    && Array.from(value).length <= 256
+    && !/[\u0000-\u001f\u007f]/.test(value);
+};
+
+const readCardActionSelectors = (raw: unknown, field: 'actions' | 'actionPrefixes'): string[] | undefined => {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) throw new Error(`invalid_plugin_card_${field}`);
+  const selectors = raw.map((value) => {
+    if (!isCardActionSelector(value)) {
+      throw new Error(`invalid_plugin_card_${field}_selector`);
+    }
+    if (pluginCardActionSelectorOverlapsBotmux(
+      value,
+      field === 'actions' ? 'action' : 'prefix',
+    )) {
+      throw new Error(`plugin_card_${field}_selector_reserved:${value}`);
+    }
+    return value;
+  });
+  const seen = new Set(selectors);
+  if (seen.size !== selectors.length) {
+    const duplicate = selectors.find((value, index) => selectors.indexOf(value) !== index);
+    throw new Error(`duplicate_plugin_card_${field}_selector:${duplicate}`);
+  }
+  return selectors.length > 0 ? selectors : undefined;
+};
+
+const readCardActionEndpoint = (raw: unknown): string => {
+  if (
+    typeof raw !== 'string'
+    || raw !== raw.trim()
+    || !raw.startsWith('/')
+    || raw.startsWith('//')
+    || raw.includes('\\')
+    || raw.includes('?')
+    || raw.includes('#')
+    || /[\u0000-\u001f\u007f]/.test(raw)
+  ) {
+    throw new Error('invalid_plugin_card_actions_endpoint');
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw new Error('invalid_plugin_card_actions_endpoint');
+  }
+  if (decoded.includes('\\') || decoded.split('/').some(part => part === '..')) {
+    throw new Error('plugin_card_actions_endpoint_escapes_root');
+  }
+  return raw;
+};
+
+const scanCardActions = (
+  runtimeDir: string,
+  service: ScannedPluginContributions['service'],
+): PluginCardActionsContribution | undefined => {
+  const rel = 'card-actions/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  if (!service) throw new Error('plugin_card_actions_service_required');
+  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf-8')), 'card_actions');
+  if (record.schemaVersion !== 1) throw new Error('invalid_plugin_card_actions_schema');
+  const actions = readCardActionSelectors(record.actions, 'actions');
+  const actionPrefixes = readCardActionSelectors(record.actionPrefixes, 'actionPrefixes');
+  if (!actions && !actionPrefixes) throw new Error('plugin_card_actions_selectors_required');
+  const endpoint = readCardActionEndpoint(record.endpoint);
+  const contribution: PluginCardActionsContribution = {
+    schemaVersion: 1,
+    endpoint,
+  };
+  if (actions) contribution.actions = actions;
+  if (actionPrefixes) contribution.actionPrefixes = actionPrefixes;
+  return contribution;
+};
+
+const PLUGIN_COMMANDS_MAX = 16;
+const PLUGIN_COMMAND_DESCRIPTION_MAX = 120;
+
+const readPluginCommand = (raw: unknown): PluginCommandEntry => {
+  const record = optionalRecord(raw, 'plugin_command');
+  const name = record.name;
+  if (typeof name !== 'string' || name !== name.trim().toLowerCase() || !SLASH_COMMAND_SHAPE.test(name)) {
+    throw new Error('invalid_plugin_command_name');
+  }
+  // Built-in and CLI passthrough tokens stay Botmux's: a plugin can never
+  // shadow /close, /help, /compact … even if it is the only plugin installed.
+  if (isBuiltinSlashCommandName(name) || PASSTHROUGH_COMMANDS.has(name)) {
+    throw new Error(`plugin_command_reserved:${name}`);
+  }
+  const description = record.description;
+  if (description === undefined) return { name };
+  if (
+    typeof description !== 'string'
+    || !description.trim()
+    || Array.from(description).length > PLUGIN_COMMAND_DESCRIPTION_MAX
+    || /[\u0000-\u001f\u007f]/.test(description)
+  ) {
+    throw new Error('invalid_plugin_command_description');
+  }
+  return { name, description };
+};
+
+const scanCommands = (
+  runtimeDir: string,
+  service: ScannedPluginContributions['service'],
+): PluginCommandsContribution | undefined => {
+  const rel = 'commands/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  if (!service) throw new Error('plugin_commands_service_required');
+  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf-8')), 'commands');
+  if (record.schemaVersion !== 1) throw new Error('invalid_plugin_commands_schema');
+  if (!Array.isArray(record.commands) || record.commands.length === 0) {
+    throw new Error('plugin_commands_required');
+  }
+  if (record.commands.length > PLUGIN_COMMANDS_MAX) throw new Error('plugin_commands_too_many');
+  const commands = record.commands.map(readPluginCommand);
+  const names = commands.map(command => command.name);
+  const duplicate = names.find((name, index) => names.indexOf(name) !== index);
+  if (duplicate) throw new Error(`duplicate_plugin_command:${duplicate}`);
+  // Same relative-path rules as card actions: Botmux builds the loopback URL itself.
+  let endpoint: string;
+  try {
+    endpoint = readCardActionEndpoint(record.endpoint);
+  } catch {
+    throw new Error('invalid_plugin_commands_endpoint');
+  }
+  return { schemaVersion: 1, endpoint, commands };
+};
+
 export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {
   const skills = scanSkills(runtimeDir, manifest.id);
   const mcp = scanMcp(runtimeDir, manifest.id);
   const dashboard = scanDashboard(runtimeDir, manifest.id);
   const cli = scanCli(runtimeDir);
   const service = scanService(runtimeDir, manifest.service?.mode);
+  const cardActions = scanCardActions(runtimeDir, service);
+  const commands = scanCommands(runtimeDir, service);
   const contributions: ScannedPluginContributions = {
     ...(skills ? { skills } : {}),
     ...(mcp ? { mcp } : {}),
@@ -181,6 +321,8 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
     ...(cli ? { cli } : {}),
     ...(service ? { service } : {}),
   };
+  if (cardActions) contributions.cardActions = cardActions;
+  if (commands) contributions.commands = commands;
   return Object.keys(contributions).length > 0 ? contributions : undefined;
 }
 

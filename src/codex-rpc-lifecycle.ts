@@ -9,13 +9,12 @@ import {
   readComm,
 } from './core/session-discovery.js';
 import type { DaemonToWorker } from './types.js';
+import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
+import { tmuxEnv } from './setup/ensure-tmux.js';
+export { RPC_CAPABLE_CLIS } from './services/codex-rpc-input-policy.js';
+import { RPC_CAPABLE_CLIS } from './services/codex-rpc-input-policy.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
-
-/** CLIs that expose the codex-family `app-server --listen` + `--remote resume`
- *  protocol the RPC engine drives. codex + traex are verified identical; coco
- *  diverges (--resume flag) and needs its own verification before inclusion. */
-export const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
 
 /** Retry cadence for native turn/completed → rollout visibility hydration.
  *  Total window is 11.55s: bounded, but intentionally aligned with the 12s
@@ -138,7 +137,7 @@ export function codexRpcEligible(cfg: InitCfg, runtime: CodexRpcRuntimeGates = {
   return (
     cfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(cfg.cliId) &&
     cfg.backendType === 'tmux' &&
-    cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true && runtime.sandboxForced !== true &&
+    cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true && cfg.sandbox !== 'oncall' && cfg.sandbox !== 'scratch' && runtime.sandboxForced !== true &&
     cfg.disableCliBypass !== true &&
     !cfg.startupCommands?.length &&
     !cfg.wrapperCli && runtimeExecutableEligible &&
@@ -178,6 +177,8 @@ export function decideStartupDialogAction(screen: string, readyPattern?: RegExp)
 }
 
 export interface PaneProbes {
+  /** tmux server of the managed pane for the default panePidOf (undefined = default server). */
+  socketName?: string;
   panePidOf?: (sessionName: string) => number | undefined;
   argvOf?: (pid: number) => string[];
   commOf?: (pid: number) => string | undefined;
@@ -274,7 +275,24 @@ export async function orchestrateCodexRpcInit(
   runtime: CodexRpcRuntimeGates = {},
 ): Promise<RpcInitDecision> {
   const NONE: RpcInitDecision = { engaged: false, queuePrompt: false, abortSpawn: false };
-  if (!codexRpcEligible(cfg, runtime)) return NONE;
+  if (!codexRpcEligible(cfg, runtime)) {
+    // A saved RPC-off override must not reattach the old --remote viewer.
+    // Its previous app-server was owned by the old worker; replace only a
+    // positively identified remote pane, keeping native terminal panes intact.
+    if (cfg.codexRpcInput === false && RPC_CAPABLE_CLIS.has(cfg.cliId)
+      && cfg.backendType === 'tmux' && cfg.resume && cfg.cliSessionId
+      && !cfg.adoptMode && !cfg.existingAppServerEndpoint) {
+      const pane = fx.paneInfo(cfg.sessionId);
+      if (pane?.live && fx.paneIsRemote(pane.name)) {
+        if (!await fx.killVerify(pane.name)) {
+          fx.notify('RPC 输入已关闭，但无法替换旧 RPC 面板。请重试重启会话；尚未启动新的终端会话。');
+          return { ...NONE, abortSpawn: true };
+        }
+        fx.log('RPC input disabled: replaced the old --remote pane before terminal resume');
+      }
+    }
+    return NONE;
+  }
   const pane = fx.paneInfo(cfg.sessionId);
   if (!pane || !pane.live) {
     // Fresh session, or a resume whose pane didn't survive.
@@ -326,14 +344,26 @@ export async function orchestrateCodexRpcInit(
 
 export interface PersistentPaneKillEffects {
   kill: (sessionName: string) => void;
-  isLive: (sessionName: string) => boolean;
+  /** Tri-state on purpose. A boolean cannot distinguish "the pane is gone" from
+   *  "the liveness probe got no answer", and this function's return value is
+   *  read as PROOF of absence. `hasSession()`-style helpers collapse a probe
+   *  timeout into `false`, which is exactly the wrong direction here. */
+  probeLive: (sessionName: string) => 'live' | 'gone' | 'unknown';
   wait: (ms: number) => Promise<void>;
 }
 
 /** Kill a resolved persistent-session name and verify that exact name is gone.
  *  Keeping the resolved name opaque avoids accidentally applying sessionName()
  *  twice (`bmx-1234` -> `bmx-bmx-`), which would turn every failed kill into a
- *  false success and reattach the stale RPC pane. */
+ *  false success and reattach the stale RPC pane.
+ *
+ *  Returns true ONLY on an authoritative 'gone'. An indeterminate probe is not
+ *  proof: under host load even a cheap `has-session` (~20ms healthy) can be
+ *  killed by its own timeout, and reporting that as a verified kill lets a
+ *  surviving dead-`--remote` pane be reattached to the fresh-port engine — the
+ *  exact P0 freeze this verification layer exists to prevent. When every
+ *  attempt comes back 'unknown' we fail closed: the caller then aborts init
+ *  and tells the user, instead of silently proceeding on an unproven kill. */
 export async function killAndVerifyPersistentPane(
   sessionName: string,
   fx: PersistentPaneKillEffects,
@@ -342,16 +372,18 @@ export async function killAndVerifyPersistentPane(
 ): Promise<boolean> {
   for (let attempt = 0; attempt < attempts; attempt++) {
     try { fx.kill(sessionName); } catch { /* verify below */ }
-    if (!fx.isLive(sessionName)) return true;
+    // Retry on 'unknown' as well as 'live': an unanswered probe is a reason to
+    // look again, never a reason to declare success.
+    if (fx.probeLive(sessionName) === 'gone') return true;
     if (attempt + 1 < attempts) await fx.wait(retryMs);
   }
-  return !fx.isLive(sessionName);
+  return fx.probeLive(sessionName) === 'gone';
 }
 
-function tmuxPanePid(sessionName: string): number | undefined {
+function tmuxPanePid(sessionName: string, socketName?: string): number | undefined {
   try {
-    const out = execFileSync('tmux', ['display', '-t', sessionName, '-p', '#{pane_pid}'],
-      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+    const out = execFileSync('tmux', [...tmuxSocketArgs(socketName), 'display', '-t', sessionName, '-p', '#{pane_pid}'],
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, env: tmuxEnv() }).trim();
     const n = Number(out);
     return Number.isInteger(n) && n > 0 ? n : undefined;
   } catch { return undefined; }
@@ -371,7 +403,7 @@ export function paneRunsRemoteTui(
   probes: PaneProbes = {},
   expectedExecutable?: string,
 ): boolean {
-  const panePidOf = probes.panePidOf ?? tmuxPanePid;
+  const panePidOf = probes.panePidOf ?? ((name: string) => tmuxPanePid(name, probes.socketName));
   const argvOf = probes.argvOf ?? readCmdline;
   const commOf = probes.commOf ?? readComm;
   const childrenOf = probes.childrenOf ?? getChildPids;

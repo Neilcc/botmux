@@ -1,5 +1,5 @@
 import {
-  fetchGroupsSnapshot,
+  fetchGroupsNamesSnapshot,
 } from './groups-api.js';
 
 import {
@@ -19,6 +19,10 @@ import {
   type SkinId,
 } from './preferences.js';
 import { applyCyberFx } from './cyber-fx.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  type WorkbenchCapabilities,
+} from './agent-workbench-capabilities.js';
 import { larkHosts, normalizeBrand } from '../../im/lark/lark-hosts.js';
 
 type UiListener = () => void;
@@ -34,9 +38,23 @@ class DashboardUiState {
   // must not see a control whose endpoint they'd 401 on. Defaults true so a
   // transient probe failure never hides it from a real token holder.
   authed = true;
+  // A legacy owner, H5 session, or platform-dashboard identity may operate the
+  // narrow Workbench capability set. Keep this separate from `authed`: the
+  // latter alone controls host-management affordances across the rest of the
+  // Dashboard.
+  workbenchAuthed = true;
+  // P1-4：服务端投影的最小操作能力集（GET /api/workbench/capabilities，由
+  // app.tsx 的 loadAuthState 严格解析后写入）。与 workbenchAuthed 相反，它默认
+  // fail-closed 全 false：workbenchAuthed 只证明可进工作台，三类操作入口（定位/
+  // 终端接管/Preview 交互）各自只看对应布尔，绝不回落 true。
+  workbenchCapabilities: WorkbenchCapabilities = NO_WORKBENCH_CAPABILITIES;
   // Effective dashboard sharing policy. When enabled, tokenless visitors may
   // read allow-listed dashboard data; it does not downgrade authenticated users.
   publicReadOnly = false;
+  // 「终端」页（宿主 shell）只对本机 legacy 管理身份开放——比 `authed` 窄：带平台角色头
+  // 的协管者 authed 但不能拿宿主 shell（平台机器 Dashboard `m-` 反代不带角色头，那里进来
+  // 的机器主人和协管者就是 legacy 身份）。服务端 /api/settings 的 `hostTerminal` 写入，默认关。
+  hostTerminal = false;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;
@@ -264,6 +282,8 @@ export function chatAvatarHtml(opts: ChatAvatarOpts): string {
 // /api/groups 的注册表 + 群列表把 id 解析成人话。加载失败静默降级显示原值——
 // 纯展示增强，不挡核心功能。
 const botNameByAppId = new Map<string, string>();
+/** 注册表里出现过的全部 bot（含还没拿到友好名的），⌘K 按 app id 也要能直达。 */
+const registryBotAppIds = new Set<string>();
 const chatNameById = new Map<string, string>();
 const chatAvatarById = new Map<string, string>();
 let nameMapsPromise: Promise<void> | null = null;
@@ -319,11 +339,29 @@ export function overrideBotAvatar(larkAppId: string, name: string | undefined, u
   persistAvatarCache();
 }
 
+/** 名称 / 头像映射每次从服务端刷新成功就 +1；按会话行缓存展示文本的地方（⌘K 面板）据此失效。 */
+let nameMapsGeneration = 0;
+
+export function nameMapsVersion(): number {
+  return nameMapsGeneration;
+}
+
 export function loadNameMaps(): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
-      const data = await fetchGroupsSnapshot();
+      // 轻量视图：只要 bots 的名称/头像 + chats 的 chatId/name/avatar。完整矩阵
+      // 实测 12.59MB（memberBots 独占 12341KB），而这里一个字节都不用它——换成
+      // `?view=names` 后 372KB 级别，且省掉主线程 38-70ms 的 JSON.parse。
+      //
+      // 新鲜度**未被本次改动触及**：命中/失效时机完全照旧（成功后由下面的
+      // nameMapsPromise memo 持有，失败才清空重试），变的只有同一次请求传多少
+      // 字节。注意这个 memo 意味着名称/头像每个页面生命周期只真拉一次——这是
+      // 既有行为，不是本次引入的：bot 名称另有更快通路（/api/bots 每次刷新都带
+      // botName，Bot 配置页优先用它），头像则由 overrideBotAvatar() 在改完后
+      // 就地写内存+localStorage 生效，都不依赖本函数重跑。
+      const data = await fetchGroupsNamesSnapshot();
       for (const b of data.bots ?? []) {
+        if (b.larkAppId) registryBotAppIds.add(String(b.larkAppId));
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));
         }
@@ -337,6 +375,7 @@ export function loadNameMaps(): Promise<void> {
         if (c.chatId && c.avatar) chatAvatarById.set(c.chatId, String(c.avatar));
       }
       persistAvatarCache(); // 刷新本地缓存，下次冷加载首屏即出头像
+      nameMapsGeneration += 1;
     } catch {
       // 失败不缓存（dashboard 刚启动 /api/groups 可能短暂 503）——
       // 清掉 memo，下一个页面 mount / strip 重绘再重试；期间显示原始 id。
@@ -349,6 +388,15 @@ export function loadNameMaps(): Promise<void> {
 /** 按 larkAppId 查注册表友好名（含 localStorage 回灌的缓存）；查不到返回 undefined。 */
 export function botNameForAppId(appId?: string): string | undefined {
   return appId ? botNameByAppId.get(appId) : undefined;
+}
+
+/**
+ * 已知的全部 bot（⌘K 面板的「机器人」条目）：有友好名的用友好名，注册表里还没友好名的以 app id 充当
+ * 名字。来自 loadNameMaps / 本地缓存回灌，所以首屏名称映射到达前可能只有缓存里的那部分。
+ */
+export function knownBots(): Array<{ larkAppId: string; name: string }> {
+  const appIds = new Set([...botNameByAppId.keys(), ...registryBotAppIds]);
+  return [...appIds].map(larkAppId => ({ larkAppId, name: botNameByAppId.get(larkAppId) ?? larkAppId }));
 }
 
 /** 会话所属 bot 的显示名：注册表友好名 → 会话自带 botName（非 id 时）→ id。 */

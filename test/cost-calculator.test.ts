@@ -1,5 +1,5 @@
 /**
- * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost, formatNumber.
+ * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost.
  *
  * Run:  pnpm vitest run test/cost-calculator.test.ts
  */
@@ -71,6 +71,7 @@ vi.mock('../src/services/codex-transcript.js', () => ({
 
 vi.mock('../src/services/traex-transcript.js', () => ({
   findTraexRolloutBySessionId: vi.fn(() => undefined),
+  findTraexSessionIdByBotmuxSessionId: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/pi-transcript.js', () => ({
@@ -108,17 +109,22 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
   createCliAdapterSync: vi.fn(() => ({ claudeDataDir: FORK_DATA_DIR })),
 }));
 
+// resolveSessionTranscriptPath() 的 codex 分支会查会话库里的实例绑定。
+// 本套件整体 mock 了 node:fs，真实 store 会读到合成文件系统；stub 掉它需要的这一个入口。
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
+}));
+
 import { existsSync, readFileSync } from 'node:fs';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../src/services/aiden-checkpoints.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
-import { findTraexRolloutBySessionId } from '../src/services/traex-transcript.js';
+import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from '../src/services/traex-transcript.js';
 import { findPiTranscriptBySessionId } from '../src/services/pi-transcript.js';
 import {
   getSessionJsonlPath,
   getSessionCost,
   getSessionUsageSnapshot,
   getSessionTokenUsage,
-  formatNumber,
   __resetSessionUsageCachesForTest,
   type SessionCost,
 } from '../src/core/cost-calculator.js';
@@ -164,6 +170,8 @@ beforeEach(() => {
   vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
   vi.mocked(findTraexRolloutBySessionId).mockReset();
   vi.mocked(findTraexRolloutBySessionId).mockReturnValue(undefined);
+  vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReset();
+  vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
   vi.mocked(findPiTranscriptBySessionId).mockReset();
   vi.mocked(findPiTranscriptBySessionId).mockReturnValue(undefined);
   vi.mocked(findAidenLatestCheckpointBySessionId).mockReset();
@@ -580,7 +588,7 @@ describe('getSessionTokenUsage', () => {
     vi.mocked(existsSync).mockReturnValue(false);
 
     expect(getSessionTokenUsage({
-      cliId: 'gemini',
+      cliId: 'opencode',
       sessionId: 's1',
       cwd: '/tmp',
     })).toBeNull();
@@ -800,6 +808,43 @@ describe('getSessionTokenUsage', () => {
     });
   });
 
+  it('requires trusted native cliSessionId for Antigravity and refuses workspace fallback', () => {
+    expect(getSessionUsageSnapshot({
+      cliId: 'antigravity',
+      sessionId: 'botmux-sid',
+      cwd: '/workspace/unrelated',
+      fresh: true,
+    })).toEqual({
+      context: null,
+      tokens: null,
+      turnTokens: null,
+    });
+  });
+
+  it('maps Botmux session ids to TraeX native session ids for usage lookup', () => {
+    vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReturnValue('mapped-traex-sid');
+    vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/home/testuser/.trae/cli/sessions/2026/06/30/rollout-mapped-traex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 55, output_tokens: 6 },
+        },
+      },
+    }));
+
+    expect(getSessionTokenUsage({
+      cliId: 'traex',
+      sessionId: 'botmux-sid',
+    })).toMatchObject({
+      in: 55,
+      out: 6,
+    });
+    expect(findTraexSessionIdByBotmuxSessionId).toHaveBeenCalledWith('botmux-sid');
+    expect(findTraexRolloutBySessionId).toHaveBeenCalledWith('mapped-traex-sid');
+  });
+
   it('reports TraeX rollouts via the codex fold, capturing the turn_context model', () => {
     vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/home/testuser/.trae/cli/sessions/2026/06/30/rollout-traex-sid.jsonl');
     // Real TRAE rollout shapes: codex-format turn_context carries the model;
@@ -904,6 +949,187 @@ describe('getSessionTokenUsage', () => {
       model: 'claude-sonnet-4-20250514',
     });
     expect(findPiTranscriptBySessionId).toHaveBeenCalledWith('pi-sid', '/tmp');
+  });
+
+  it('reports Pi context usage without window when models.json is unavailable', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'deepseek-v4-flash',
+        usage: { input: 100, output: 20, cacheRead: 30, cacheWrite: 10 },
+      },
+    }));
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // input 100 + output 20 + cacheRead 30 + cacheWrite 10 = 160 (includes output)
+    expect(snapshot.context).toEqual({ usedTokens: 160 });
+  });
+
+  it('reports Pi context usage with window and percent from models.json', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'deepseek-v4-flash',
+        usage: { input: 400, output: 20, cacheRead: 100, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': {
+                models: [{ id: 'deepseek-v4-flash', contextWindow: 1000 }],
+              },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // input 400 + output 20 + cacheRead 100 = 520 used tokens over a 1000 window → 52%
+    expect(snapshot.context).toEqual({ usedTokens: 520, windowTokens: 1000, percentUsed: 52 });
+  });
+
+  it('resolves Pi models.json window for provider/variant model id shapes', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'team-gateway/deepseek-v4-flash:max',
+        usage: { input: 250, output: 20, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': {
+                models: [{ id: 'deepseek-v4-flash', contextWindow: 1000 }],
+              },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // input 250 + output 20 = 270 over a 1000 window → 27%
+    expect(snapshot.context).toEqual({ usedTokens: 270, windowTokens: 1000, percentUsed: 27 });
+  });
+
+  it('prefers usage.totalTokens for Pi native context accounting', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    // Mirrors a real Pi 0.84 transcript tail: totalTokens is the authoritative
+    // context value; the four-part sum must only be a fallback.
+    setupJsonl(JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-tt',
+        role: 'assistant',
+        model: 'deepseek-v4-flash',
+        usage: { input: 11684, output: 33, cacheRead: 0, cacheWrite: 0, totalTokens: 11717 },
+      },
+    }));
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    expect(snapshot.context).toEqual({ usedTokens: 11717 });
+  });
+
+  it('resolves Pi context window by transcript provider when bare model id collides', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-collide',
+        role: 'assistant',
+        provider: 'team-gateway',
+        model: 'shared-model',
+        usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': { models: [{ id: 'shared-model', contextWindow: 1000 }] },
+              'other-provider': { models: [{ id: 'shared-model', contextWindow: 2000 }] },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // provider-qualified hit wins: 100 over team-gateway's 1000 → 10% (not other-provider's 2000)
+    expect(snapshot.context).toEqual({ usedTokens: 100, windowTokens: 1000, percentUsed: 10 });
+  });
+
+  it('drops ambiguous bare Pi model ids instead of silently picking a provider', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    // No provider recorded in transcript + same bare id with different windows
+    // under two providers → must degrade to used-tokens-only, not guess.
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-ambiguous',
+        role: 'assistant',
+        model: 'shared-model',
+        usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': { models: [{ id: 'shared-model', contextWindow: 1000 }] },
+              'other-provider': { models: [{ id: 'shared-model', contextWindow: 2000 }] },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    expect(snapshot.context).toEqual({ usedTokens: 100 });
   });
 
   it('reports CoCo nested response_meta usage without counting agent_end duplicates', () => {
@@ -1287,25 +1513,5 @@ describe('getSessionTokenUsage', () => {
       turns: 2,
       model: 'claude-sonnet-4-20250514',
     });
-  });
-});
-
-// ── formatNumber ────────────────────────────────────────────────────────
-
-describe('formatNumber', () => {
-  it('formats small numbers without commas', () => {
-    expect(formatNumber(42)).toBe('42');
-  });
-
-  it('formats thousands with commas', () => {
-    expect(formatNumber(1_234)).toBe('1,234');
-  });
-
-  it('formats millions with commas', () => {
-    expect(formatNumber(1_234_567)).toBe('1,234,567');
-  });
-
-  it('formats zero', () => {
-    expect(formatNumber(0)).toBe('0');
   });
 });

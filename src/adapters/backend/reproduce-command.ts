@@ -8,13 +8,15 @@
 //     交互 bash，PATH/HOME/NVM 等由其 rcfile 提供，与 wrapper 目标一致；这里只补
 //     botmux 注入的那批权威 env（buildBotmuxEnvAssignments）——正是它们平时靠
 //     wrapper 的 `/usr/bin/env KEY=VAL` 注入、裸 bash 不会有。
-//   - riff 后端没有本地 bin/args（远端执行），返回 null → 接口报 unavailable，
+//   - riff / mojo 后端没有本地 bin/args（远端执行），返回 null → 接口报 unavailable，
 //     绝不伪造一条本地命令误导排障。
 // 供 worker 在 ready 时算出、上报给 daemon 只驻内存（含凭证，绝不落盘）。
 
 import type { BackendType } from './types.js';
 import { buildBotmuxEnvAssignments } from './tmux-backend.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
+import { buildForgeTraexLaunch, type CliLaunchMode } from '../../core/cli-launch-mode.js';
+import { isRemoteBackendId } from '../../core/remote-cli-ids.js';
 
 /** POSIX 单引号转义，安全用于 bash 粘贴。 */
 function shq(value: string): string {
@@ -27,21 +29,29 @@ function shq(value: string): string {
  *
  * 输入是**基础 CLI** 的 bin/args（cliAdapter.resolvedBin + buildArgs 产出，未经任何
  * Seatbelt/bwrap/credential 改写）。规则：
- *   - wrapperCli 生效**且** sandbox 关闭时 → 返回 wrapper 形态（`aiden x claude …`）。
- *     worker 侧 wrapperCli 与 file sandbox 互斥（sandboxOn 时忽略 wrapper），这里同构。
- *   - 其余（无 wrapper，或 sandbox 开启）→ 返回基础 CLI bin/args 原样。
+ *   - wrapperCli 生效时 → 返回 wrapper 形态（`aiden x claude …`）。sandbox 关闭时 wrapper
+ *     总是生效；sandbox 开启时只有 worker 把 wrapper 放进沙盒执行（wrapperInsideSandbox）
+ *     才生效，其余后端在沙盒下仍忽略 wrapper，这里同构。
+ *   - 其余 → 返回基础 CLI bin/args 原样。
  * 无论如何都**不**含 sandbox-exec / bwrap 外层——那是机器相关、裸 bash 跑不起来的包装。
  */
 export function selectReproduceLaunch(input: {
   baseBin: string;
   baseArgs: string[];
   wrapperCli?: string;
+  cliLaunchMode?: CliLaunchMode;
   sandboxOn: boolean;
+  /** worker 把 wrapperCli 放进了文件沙盒内执行。 */
+  wrapperInsideSandbox?: boolean;
   binResolver?: (bin: string) => string;
   ttadkModel?: string;
 }): { bin: string; args: string[] } {
-  const { baseBin, baseArgs, wrapperCli, sandboxOn } = input;
-  if (wrapperCli && wrapperCli.trim() && !sandboxOn) {
+  const { baseBin, baseArgs, wrapperCli, cliLaunchMode, sandboxOn } = input;
+  if (cliLaunchMode === 'forge-traex' && !sandboxOn) {
+    const launch = buildForgeTraexLaunch(baseArgs, input.binResolver ?? ((b) => b));
+    return { bin: launch.bin, args: launch.args };
+  }
+  if (wrapperCli && wrapperCli.trim() && (!sandboxOn || input.wrapperInsideSandbox)) {
     const launch = buildWrappedLaunch(
       wrapperCli,
       baseArgs,
@@ -66,19 +76,21 @@ export interface ReproduceCommandInput {
   env?: NodeJS.ProcessEnv;
   /** 每 bot 注入 env（bots.json env，含 provider 凭证）。 */
   injectEnv?: Record<string, string>;
+  /** Turn-authored git `-c` pairs; rebuilt into GIT_CONFIG_* assignments. */
+  gitConfigPairs?: ReadonlyArray<readonly [string, string]>;
 }
 
-// 组装近似复现命令。riff（远端后端）返回 null。其余后端返回：
+// 组装近似复现命令。riff / mojo（远端后端）返回 null。其余后端返回：
 //   cd '<cwd>' && KEY='v' KEY2='v2' ... '<bin>' '<arg>' ...
 // env 前缀取 buildBotmuxEnvAssignments（BOTMUX_* / SESSION_DATA_DIR /
 // CLAUDE_CONFIG_DIR / CODEX_HOME / 代理 / per-bot 凭证），每个 VAL 做 bash 单引号转义。
 export function buildReproduceCommand(input: ReproduceCommandInput): string | null {
-  if (input.backendType === 'riff') return null;
+  if (isRemoteBackendId(input.backendType)) return null;
   if (!input.bin) return null;
 
   const parts: string[] = [];
   // 权威注入 env（KEY=VAL 列表），VAL 做 bash 转义后作为命令前缀。
-  for (const assignment of buildBotmuxEnvAssignments(input.env, input.injectEnv)) {
+  for (const assignment of buildBotmuxEnvAssignments(input.env, input.injectEnv, undefined, input.gitConfigPairs)) {
     const eq = assignment.indexOf('=');
     if (eq <= 0) continue;
     const key = assignment.slice(0, eq);

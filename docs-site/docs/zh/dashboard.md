@@ -6,23 +6,65 @@
 botmux dashboard          # 获取当前 URL；尚无 token 时创建第一个
 botmux dashboard current  # 同一操作的显式写法
 botmux dashboard rotate   # 轮换 token 并输出新 URL
-# 输出: http://<lan-ip>:7891/?t=<token>
+# 已绑定中心化平台: https://m-<machineId>.<平台域名>/          ← 不带 token
+# 其余情况(局域网 / 自建反代 / Devbox 短链): …/?t=<token>      ← 带 token
 ```
 
 > 这是**轮换式登录 token**：一条 URL 会一直有效，直到 `botmux dashboard rotate` 生成新 token、让旧 URL 失效；token 会持久化、`botmux restart` 后仍有效。裸命令/current 会复用这个 token，尚无 token 时创建第一个。成功访问 `?t=` 只是把同一 token 写进 cookie，不消费/作废它，轮换前同一 URL 可重复登录——所以分享链接≈分享登录态，注意保管。默认端口 `7891`，可用 `BOTMUX_DASHBOARD_PORT` 改。
+
+### 链接里什么时候带 token
+
+| 状态 | 主链接形态 | 为什么 |
+|---|---|---|
+| **已绑定中心化平台**（远程访问开 + 已 bind） | `https://m-<machineId>.<平台域名>/` —— **不带 token** | 走平台子域时身份由平台注入并先过 SSO，`?t=` 会被服务端压制成无效（带上也是 401），token 对访问零贡献、只剩泄漏风险。真人 owner 是被平台认出来的 |
+| 自建反代 `BOTMUX_PUBLIC_URL` / Devbox 短链 | `https://<你的域名>/?t=<token>` —— **带 token** | 这两条只是把请求反代到本机 dashboard，**没有人注入身份**，token 仍是唯一凭证；且平台登录出口在未绑定时不存在，去掉就进不去了 |
+| 未配任何远程基址（纯局域网 `ip:port`） | `http://<lan-ip>:7891/?t=<token>` —— **带 token** | 同上：去掉后只剩一个静态壳 |
+
+⚠️ 判据是「**是否由中心平台托管**」，不是「有没有远程基址」—— 后者会把自建反代和 Devbox 短链一起误判成可以去 token，而那两条路去掉 token 会变成打不开的死链。
+
+这个判据由 **dashboard 进程在 `/__cli/*` 响应里如实标注**（`platformHosted` 字段），CLI 不自己推断：只有 dashboard 知道它实际用了哪条基址，调用方各自推断会与它不一致。字段缺失（旧版 dashboard）或不是严格 `true` 时一律**保留** token —— 少去一次只是维持现状，多去一次可能让 owner 完全进不去。
+
+绑定平台后，那条带 token 的本地直连链接**默认不再打印**（它是平台异常时的兜底）。确实需要用 `ip:port + token` 方式管理时，加一个刻意起得很长的参数即可取回——参数名会在命令输出里提示，只给人看，不进 `--help`：这是为了避免 AI 顺手带上它、把 token 带进思考过程或聊天记录。
+
+⚠️ **Dashboard 链接等同管理员凭证**：只发给 owner 本人，不要在多人群里发带 `?t=` 的链接（聊天记录会长期留存、可被转发截图）。给别人指路时只说「在服务器上运行 `botmux dashboard`」，让对方自己取。命令输出末尾也钉了一段给 AI 读的安全提示，让模型在决定「要不要把这条链接发出去」时就能读到这条规则。怀疑泄漏时 `botmux dashboard rotate`，所有旧链接当场失效。
 
 ![Dashboard Groups 面板](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033300739_dash-groups.png)
 <p class="cap">Groups 面板：chat × bot 矩阵，一眼看清哪个群里有哪些机器人</p>
 
 ## 功能
 
+- **全局搜索（⌘K）**：任意页面按 `⌘K`（macOS）/ `Ctrl+K`（其它平台），或点顶栏搜索框，搜会话（含已关闭）、Skill、Agent、全局设置（可直达具体配置项）、Bot 配置及其分类（常用 / 会话 / 权限与安全 / 消息卡片 / 高级）、分类里的区块和配置项（如「普通群」会话模式，直达并定位到那一行；当前 Bot 不显示该项时停在所属分类并提示）、机器人（按名字或 app id 直达该 Bot 的配置）、页面（含会话监控室、调用日志、团队管理、角色 Profiles、数据洞察各 tab 和插件页）与快捷操作，中英文叫法都能搜。`↑↓` 选择、`↵` 打开、`⌘↵` / `Ctrl+↵` 走次要动作（活跃会话在驾驶舱打开、已关闭会话跳飞书话题）、`Tab` 切换分类，空查询时显示最近使用。Skill / Agent / 机器人只对已认证管理员出现。
 - **Sessions**：跨所有 bot 列出活跃 + 已关闭会话，可按 CLI / 状态 / adopt / 文本过滤。点进 detail 可复制各种 ID、关闭会话、多选批量关闭；「定位话题」会让机器人在原话题发一条 **@会话 owner** 的提醒（纯 @、无其它正文）帮你跳回上下文。chat-scope 的会话行还带一个飞书群 AppLink 直达群聊。
-- **Schedules**：列出所有定时任务，可 Run now / Pause / Resume。
-- **Groups**：一键拉新群（自动 @ 通知被邀请人）、拉 bot 入群、自动转让群主；解散群聊、bot 退群（关联会话自动清理）。
-- **团队 / Roles / Bot Defaults**：团队面板做[跨部署协作](/roles)（邀请别人的部署进团队、跨部署拉群）；Roles 管理各 bot 按群人设；Bot Defaults（Bot 配置）配默认行为（新群 oncall、卡片签名、**默认角色**等）。
+- **Schedules**：新建、编辑和管理定时任务，支持立即运行、暂停/恢复、多个目标群、执行日志，以及可测试的 [Bash 前置条件](/schedule#bash-前置条件dashboard)。
+- **Groups**：一键拉新群（自动 @ 通知被邀请人）、拉 bot 入群、自动转让群主；解散群聊、bot 退群（关联会话自动清理）。群「管理」弹层还能做**授权管理**：多选成员**批量授权**（一次最多 50 人，写入前实时校验仍在群，可选消息额度与有效期）、**整群一键授权**（裸 `/grant` 的 Dashboard 版）、对单个成员**拉黑**，以及按 bot 开关 oncall。
+- **团队 / Roles / Bot Defaults**：团队面板做[跨部署协作](/roles)（邀请别人的部署进团队、跨部署拉群）；Roles 管理各 bot 按群人设；Bot Defaults（Bot 配置）配默认行为（新群 oncall、群聊 @ 策略、**黑名单 `blockedUsers`**、**精简预设**——一次写入关流式卡 / 关思考气泡 / 静默 ✋✅ 反应，非持续绑定、卡片签名、**默认角色**等）。
 - **Workflows 管控面**：Run List 轮询；Run Detail 看 summary / dangling 红区 / node-activity / event timeline / 并发执行 timeline；可直接 **cancel run**。
+- **设置 / 系统与维护**：已认证管理员可管理「开机启动 botmux 后台服务」。
 
 > **两件事在 Dashboard 之外**：v3 workflow 的 **humanGate 批准 / 拒绝** 走**飞书审批卡**（不在 Dashboard 上点）；带参触发 workflow 目前是**接入点（Webhook）** 那条路径（见 [接入点](/webhook)），Dashboard 没有「Workflow Catalog 带参触发」页。Dashboard 的 Workflows 面板专注观测与 cancel。
+
+## 后台服务开机启动
+
+已认证管理员可在「设置 → 系统与维护」中管理 botmux 后台服务的开机自启；匿名用户不能查看或修改这项设置。
+
+该开关复用现有 `botmux autostart` 能力，只管理下次开机/登录时使用的启动项，不会启动、停止或重启当前 daemon。
+
+## 需认证的集成操作
+
+已认证的宿主集成可以指定一个明确的机器人身份更新飞书群名：
+
+```http
+PUT /api/groups/{chatId}/name/{larkAppId}
+Content-Type: application/json
+
+{"name":"新的群名称"}
+```
+
+两个路径参数都必须做 URL 编码。指定机器人必须当前就在该群内；botmux
+不会失败后改用其它已配置机器人。群名遵循飞书的 100 个 Unicode 码点上限，
+并拒绝控制字符与不可见格式字符。请求体上限为 4 KiB，且只接受 `name`
+字段。鉴权沿用下文所述的 Dashboard 管理权限边界；`publicReadOnly` 不会让该
+写操作变成匿名可用。
 
 ## 对外只读查询
 
@@ -103,11 +145,11 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 
 `publicReadOnly` 默认开启。开启时，`GET /api/dashboard/v1/summary`、`GET /api/sessions` 和 `GET /events` 等只读白名单接口在 Dashboard 监听地址上可以**无 token** 访问。summary 只含上述强脱敏聚合；会话名称、标题、后端和 session / event row 中的其它元数据都应按可公开信息对待。
 
-- 全部 POST / PATCH / DELETE 写操作、不在只读白名单中的 GET，以及原始 PTY / 诊断日志，始终需要 `botmux dashboard` 生成的当前 token。白名单是 fail-closed 的：新增 GET 不会因公开只读开启就自动暴露。
+- 全部 POST / PUT / PATCH / DELETE 写操作、不在只读白名单中的 GET，以及原始 PTY / 诊断日志，始终需要 `botmux dashboard` 生成的当前 token。白名单是 fail-closed 的：新增 GET 不会因公开只读开启就自动暴露。
 - 关闭 `publicReadOnly` 后，无 token 的 summary 请求会返回 401；持当前 token 的请求仍可访问，且不受上面的匿名限流。错误或已轮换的旧 token 在公开只读开启时按匿名请求处理。
 - `botmux dashboard` 和 `botmux dashboard current` 会复用当前 token（尚无时创建第一个）；`botmux dashboard rotate` 才会显式替换 token、让之前的链接失效。token 只提供 Dashboard 应用层访问权，不代替主机防火墙、VPN 或反向代理鉴权。
 - 不需要无 token 观测时，在 Dashboard 「设置」中关闭「公开只读」。也可先设 `BOTMUX_DASHBOARD_PUBLIC_READONLY=false`；但设置页一旦保存过该开关，`~/.botmux/config.json` 的持久值会优先于环境变量。
 
 ## 部署细节
 
-dashboard 走单独 pm2 进程 `botmux-dashboard`，跟 daemon 一起起停。每个 daemon 在 `127.0.0.1` 暴露内部 IPC（仅本机），dashboard 进程做反向代理 + HMAC 鉴权：密钥文件 `~/.botmux/.dashboard-secret`（mode 0600），是 daemon↔dashboard 的内部签名密钥，**不下发给浏览器**（浏览器侧走上面的轮换登录 token）。
+dashboard 是内置 supervisor 托管的独立进程 `botmux-dashboard`，跟 daemon 一起起停。每个 daemon 在 `127.0.0.1` 暴露内部 IPC（仅本机），dashboard 进程做反向代理 + HMAC 鉴权：密钥文件 `~/.botmux/.dashboard-secret`（mode 0600），是 daemon↔dashboard 的内部签名密钥，**不下发给浏览器**（浏览器侧走上面的轮换登录 token）。

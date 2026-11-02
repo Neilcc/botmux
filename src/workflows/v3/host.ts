@@ -37,6 +37,7 @@ import {
 import { finalizeSpec, validateSpec, SpecValidationError } from './spec.js';
 import { runArchitect as realRunArchitect, type RunArchitectInput, type RunArchitectResult } from './architect.js';
 import { loadDag } from './dag-loader.js';
+import { DagValidationError } from './dag.js';
 import { isValidRunId } from './ops-projection.js';
 import {
   botToSnapshot,
@@ -363,7 +364,10 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
 
     // Assertion 2: do NOT trust architect's self-claim — host validates the dag.
     try {
-      deps.loadDag(res.dagPath);
+      const dag = deps.loadDag(res.dagPath);
+      if (typeof dag !== 'object' || dag === null || (dag as { schemaVersion?: unknown }).schemaVersion !== 2) {
+        throw new DagValidationError(['architect dag.json must use schemaVersion 2']);
+      }
     } catch (err) {
       const problems = (err as { problems?: string[] }).problems ?? [err instanceof Error ? err.message : String(err)];
       const state = transition(runDir, 'spec_approved', { problems }, now);
@@ -440,6 +444,7 @@ export function authorizeAdHocRun(
   runDir: string,
   bots: BotConfig[],
   now: Date = new Date(),
+  opts: { workingDirOverride?: string } = {},
 ): AdHocRunAuthorizationResult {
   // The outer host lock prevents Gate-2 from racing any grill RMW / architect
   // attempt. The inner envelope lock serializes this producer with all other
@@ -498,6 +503,7 @@ export function authorizeAdHocRun(
       // never the first unrelated entry in bots.json. Standalone/dev runs have
       // no binding and retain the legacy first-supported fallback.
       defaultSelector: cur.chatBinding?.larkAppId,
+      workingDirOverride: opts.workingDirOverride,
     });
 
     const dagPath = join(runDir, 'dag.json');
@@ -688,13 +694,17 @@ export async function cmdWorkflowHost(
     case 'approve-dag': {
       const runId = requireRunId(rest);
       const runDir = guardedRunDir(runId);
+      const workingDirOverride = argValue(rest, '--working-dir');
+      if (rest.includes('--working-dir') && (!workingDirOverride?.trim() || workingDirOverride.startsWith('--'))) {
+        throw new Error('--working-dir requires a non-empty path');
+      }
       const now = new Date();
       // An already-published replay must not depend on today's bots.json just
       // to acknowledge the same Gate-2 decision. The in-lock reader remains
       // authoritative; this read only decides whether bot snapshots are needed.
       const before = readRunEnvelope(runDir, runId);
       const bots = before.kind === 'missing' ? (deps.loadBots ?? loadBotConfigs)() : [];
-      const authorized = authorizeAdHocRun(runDir, bots, now);
+      const authorized = authorizeAdHocRun(runDir, bots, now, { workingDirOverride });
       const { state } = hostApproveDag(runDir, now);
       const dagPath = authorized.dagPath;
       console.log(JSON.stringify({ runId, status: state.status, dagPath }, null, 2));

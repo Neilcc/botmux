@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   tmuxKeyToBytes,
   kdlString,
@@ -15,7 +18,27 @@ import {
 import {
   parseZellijVersion,
   isZellijVersionSupported,
+  zellijEnv,
 } from '../src/setup/ensure-zellij.js';
+
+describe('zellij control namespace', () => {
+  it('keeps daemon and worker clients on the same temp namespace without XDG_RUNTIME_DIR', () => {
+    const daemonEnv = zellijEnv({ HOME: '/home/owner' });
+    const workerEnv = zellijEnv({ HOME: '/home/owner', TMPDIR: '/session/one', TMP: '/session/one', TEMP: '/session/one', ZELLIJ: '1' });
+    expect(workerEnv).toEqual(daemonEnv);
+    expect(workerEnv.TMPDIR).not.toBe('/session/one');
+    expect(workerEnv.ZELLIJ).toBeUndefined();
+  });
+
+  it('preserves XDG runtime and passes session temp only to the CLI pane', () => {
+    const env = { TMPDIR: '/session/two', TMP: '/session/two', TEMP: '/session/two', XDG_RUNTIME_DIR: '/run/user/1000' };
+    expect(zellijEnv(env).XDG_RUNTIME_DIR).toBe('/run/user/1000');
+    expect(zellijEnv(env).TMPDIR).not.toBe(env.TMPDIR);
+    const layout = buildLayoutString('/bin/echo', [], { cwd: '/work', cols: 80, rows: 24, env });
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(layout).toContain(`${key}=/session/two`);
+    expect(env.TMPDIR).toBe('/session/two');
+  });
+});
 
 describe('tmuxKeyToBytes', () => {
   it('maps named keys to terminal byte sequences', () => {
@@ -43,12 +66,31 @@ describe('tmuxKeyToBytes', () => {
 });
 
 describe('kdlString', () => {
+  it('keeps multiline values inside one quoted KDL argument', () => {
+    expect(kdlString('a\nb\rc')).toBe('"a\\nb\\rc"');
+  });
   it('escapes backslashes and quotes', () => {
     expect(kdlString('a"b\\c')).toBe('"a\\"b\\\\c"');
   });
 });
 
 describe('buildLayoutString', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      tmpDir = undefined;
+    }
+  });
+
+  function executableShell(name: string): string {
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-zellij-shell-'));
+    const shell = join(tmpDir, name);
+    writeFileSync(shell, '#!/bin/sh\nexit 0\n');
+    chmodSync(shell, 0o755);
+    return shell;
+  }
+
   it('produces a single command pane with close_on_exit and the CLI args', () => {
     const kdl = buildLayoutString('claude', ['--resume', 'abc'], {
       cwd: '/work/dir',
@@ -66,6 +108,42 @@ describe('buildLayoutString', () => {
     expect(kdl).toContain('"claude"');
     expect(kdl).toContain('"--resume"');
     expect(kdl).toContain('"abc"');
+  });
+
+  it('keeps POSIX layout argv sentinel and wrapper syntax when launch shell is sh', () => {
+    const sh = executableShell('sh');
+    const kdl = buildLayoutString('claude', ['--resume'], {
+      cwd: '/work/dir',
+      cols: 120,
+      rows: 40,
+      env: {},
+      launchShell: sh,
+    });
+
+    expect(kdl).toContain(`"${sh}"`);
+    expect(kdl).toContain('cd -- \\"$1\\" && shift');
+    expect(kdl).toContain('exec /usr/bin/env \\"$@\\"');
+    expect(kdl).toContain('"_" "/work/dir"');
+  });
+
+  it('renders fish layout with fish argv contract and no POSIX argv sentinel', () => {
+    const fish = executableShell('fish');
+    const kdl = buildLayoutString('claude', ['--resume'], {
+      cwd: '/fish/work',
+      cols: 120,
+      rows: 40,
+      env: {},
+      launchShell: fish,
+    });
+
+    expect(kdl).toContain(`"${fish}"`);
+    expect(kdl).toContain('cd -- $argv[1]; or exit');
+    expect(kdl).toContain('set -e argv[1]');
+    expect(kdl).toContain('exec /usr/bin/env $argv');
+    expect(kdl).toContain(`"${fish}" "-i" "-c"`);
+    expect(kdl).not.toContain('"_" "/fish/work"');
+    expect(kdl).not.toContain('shift');
+    expect(kdl).not.toContain('\\"$@\\"');
   });
 });
 

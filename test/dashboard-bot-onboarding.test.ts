@@ -1,18 +1,31 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BotOnboardingManager } from '../src/dashboard/bot-onboarding.js';
 import type { RegisterAppOptions, RegisterAppResult } from '../src/setup/register-app.js';
 import type { OpenPlatformAutomationResult } from '../src/setup/open-platform-automation.js';
+import {
+  runDurableConfigMutation,
+  setDurableConfigCoordinator,
+} from '../src/services/durable-config-mutation.js';
 
-const { userGetMock, batchGetIdMock } = vi.hoisted(() => ({
+const { userGetMock, batchGetIdMock } = {
   userGetMock: vi.fn(),
   batchGetIdMock: vi.fn(),
-}));
+};
+
+/** SDK generic request() — the no-body GET path (larkGet) — routed to the same user lookup mock. */
+function routeContactGet(req: any) {
+  const m = /^\/open-apis\/contact\/v3\/users\/([^/?]+)$/.exec(req?.url ?? '');
+  if (req?.method !== 'GET' || !m || 'data' in req) throw new Error(`unexpected request ${JSON.stringify(req)}`);
+  return userGetMock({ path: { user_id: decodeURIComponent(m[1]) }, params: req.params });
+}
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class {
+    // detectUnusableOwnerEntries probes via the no-body GET (larkGet → request()).
+    request = (req: unknown) => routeContactGet(req);
     contact = {
       v3: {
         user: {
@@ -43,6 +56,8 @@ const autoOk = (): OpenPlatformAutomationResult => ({
   eventModeReady: true,
   eventMode: 4,
   verifiedEventCount: 7,
+  // ok:true 的必填字段：白名单没写上时 bot 一点授权就 20029，默认桩按「写上了」。
+  redirectConfigured: true,
   versionId: 'v1',
 });
 
@@ -50,12 +65,119 @@ const immediateCriticalScopePolling = {
   criticalScopePollIntervalMs: 0,
 };
 
+function installPrimaryBotsMutation(path: string, calls: string[]) {
+  vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+  setDurableConfigCoordinator({
+    run: async input => input.mutation(),
+  });
+  return async <T>(mutation: () => T | Promise<T>): Promise<T> => {
+    calls.push(path);
+    return runDurableConfigMutation({
+      scope: 'bots',
+      path,
+      mutation: async () => mutation(),
+    });
+  };
+}
+
 describe('BotOnboardingManager', () => {
   beforeEach(() => {
     userGetMock.mockReset();
     userGetMock.mockResolvedValue({ code: 99992361, msg: 'user is not visible to this app' });
     batchGetIdMock.mockReset();
     batchGetIdMock.mockResolvedValue({ code: 0, data: { user_list: [] } });
+  });
+
+  afterEach(() => {
+    setDurableConfigCoordinator(undefined);
+    vi.unstubAllEnvs();
+  });
+
+  it('routes a primary-mode onboarding persist through the injected durable bots mutation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-primary-persist-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const durableCalls: string[] = [];
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user: { union_id: 'on_primary_owner', name: 'Primary owner' } },
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      runBotsMutation: installPrimaryBotsMutation(botsJsonPath, durableCalls),
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_primary_persist',
+        appSecret: 'primary-secret',
+        brand: 'feishu',
+        userOpenId: 'ou_primary_owner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+    });
+
+    const job = manager.start({ registrationMode: 'compat' });
+    await job.done;
+
+    expect(manager.get(job.id)).toMatchObject({ status: 'completed', addedBotIndex: 0 });
+    expect(durableCalls).toEqual([botsJsonPath]);
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toMatchObject({
+      larkAppId: 'cli_primary_persist',
+      allowedUsers: ['on_primary_owner'],
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('routes every managed recovery activation transition through durable bots mutation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-primary-managed-recovery-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    const durableCalls: string[] = [];
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_primary_managed_recovery',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      runBotsMutation: installPrimaryBotsMutation(botsJsonPath, durableCalls),
+      criticalScopeStableReads: 1,
+      criticalScopeMaxAttempts: 1,
+      criticalScopePollIntervalMs: 0,
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+      startBotLive: async () => ({ ok: true, message: 'started' }),
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_primary_managed_recovery',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'completed',
+      activationPending: false,
+      liveStarted: true,
+    });
+    expect(durableCalls).toHaveLength(5);
+    expect(new Set(durableCalls)).toEqual(new Set([botsJsonPath]));
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).not.toHaveProperty('activationPending');
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it('publishes a scannable QR status while registration is waiting', async () => {
@@ -725,6 +847,35 @@ describe('BotOnboardingManager', () => {
     });
     // 终态清掉第二个二维码, 不残留在页面.
     expect(status?.platformQrDataUrl).toBeUndefined();
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('把 redirect 白名单状态透传到 permission，并给刚建的 app 放行盲写', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-redirect-'));
+    const calls: Array<{ appJustCreated?: boolean }> = [];
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({ ok: true, appId: 'cli_redirect', appSecret: 's', brand: 'feishu' }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async (opts) => {
+        calls.push({ appJustCreated: opts.appJustCreated });
+        // 权限/事件/发版全绿，唯独白名单没写上——这正是「建好了却一授权就 20029」。
+        return { ...autoOk(), redirectConfigured: false, redirectWarning: '写入 redirect 白名单失败: code=1 msg=rejected' };
+      },
+    });
+
+    const job = manager.start({ cliId: 'claude-code', workingDir: '~' });
+    await job.done;
+
+    // 建应用流程刚创建出这个 app，才允许白名单在读失败时覆盖写。
+    expect(calls).toEqual([{ appJustCreated: true }]);
+    // ok:true 不能把「白名单没配上」盖过去：前端要能单独把这一步讲给用户听。
+    expect(manager.get(job.id)?.permission).toMatchObject({
+      ok: true,
+      redirectConfigured: false,
+      redirectWarning: '写入 redirect 白名单失败: code=1 msg=rejected',
+    });
 
     rmSync(dir, { recursive: true, force: true });
   });
@@ -2292,6 +2443,92 @@ describe('BotOnboardingManager', () => {
       }),
     ]);
     expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).not.toHaveProperty('activationStarting');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('routes startup activation recovery through the durable bots mutation in primary mode', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-primary-startup-recovery-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const durableCalls: string[] = [];
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_primary_recovery',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: join(dir, 'space-agent'),
+      allowedUsers: ['owner@example.com'],
+      activationStarting: {
+        appId: 'cli_primary_recovery',
+        jobId: 'bot_primary_recovery',
+      },
+    }]));
+
+    new BotOnboardingManager({
+      botsJsonPath,
+      runBotsMutation: installPrimaryBotsMutation(botsJsonPath, durableCalls),
+      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(durableCalls).toEqual([botsJsonPath]);
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toMatchObject({
+      larkAppId: 'cli_primary_recovery',
+      activationPending: true,
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('finishes the private activation ledger when the durable marker was already cleared before restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-commit-cleared-restart-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    const jobId = 'botperm_commit_already_cleared';
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_commit_already_cleared',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    writeFileSync(permissionRecoveryStorePath, JSON.stringify({
+      version: 1,
+      jobs: [{
+        id: jobId,
+        status: 'completed',
+        createdAt: 1,
+        updatedAt: 1,
+        appId: 'cli_commit_already_cleared',
+        brand: 'feishu',
+        workingDir,
+        recoveryOfJobId: 'bot_original',
+        recoveryAttempt: 1,
+        criticalScopeActivationRequired: true,
+        activationPending: true,
+        activationCommitting: true,
+        platformQrScanConfirmedAt: 1,
+        managedActivationState: 'activation_committing',
+        managedActivationAck: {
+          eventMode: 4,
+          verifiedEventCount: 7,
+          versionId: 'v1',
+        },
+      }],
+    }));
+    const stopBotLive = vi.fn(async () => ({ ok: false, message: 'must not stop' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      stopBotLive,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(stopBotLive).not.toHaveBeenCalled();
+    expect(manager.get(jobId)).toMatchObject({
+      status: 'completed',
+      activationPending: false,
+      activationCommitting: false,
+      liveStarted: true,
+    });
     rmSync(dir, { recursive: true, force: true });
   });
 

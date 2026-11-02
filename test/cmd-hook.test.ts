@@ -6,9 +6,13 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runHook } from '../src/cli.js';
 import type { AskResult } from '../src/core/ask-types.js';
+import { spawnSyncTsScript } from './helpers/ts-runner.js';
 
 // ── Claude AskUserQuestion payload fixture ─────────────────────────────────────
 
@@ -63,6 +67,30 @@ function makeThrowingStub(msg = 'boom', exitCode?: number): () => Promise<AskRes
 // ── 测试 ───────────────────────────────────────────────────────────────────────
 
 describe('runHook', () => {
+  it('freezes the live turn and attempt across Ask reconnect retries', async () => {
+    const resolveOrigin = vi.fn(() => ({ turnId: 'om_current', dispatchAttempt: 3 }));
+    const requests: Record<string, unknown>[] = [];
+    const post = async (body: Record<string, unknown>): Promise<AskResult> => {
+      requests.push({ ...body });
+      if (requests.length === 1) {
+        resolveOrigin.mockReturnValue({ turnId: 'om_next', dispatchAttempt: 4 });
+        throw Object.assign(new Error('restarting'), { retryable: true });
+      }
+      return makeAnsweredStub([['继续']])();
+    };
+    await runHook(claudeAskPayload, FULL_ENV, post, 'claude-code', undefined, undefined, resolveOrigin);
+    expect(resolveOrigin).toHaveBeenCalledExactlyOnceWith(FULL_ENV.BOTMUX_SESSION_ID);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toEqual(requests[1]);
+    expect(requests[0]).toMatchObject({ originTurnId: 'om_current', originDispatchAttempt: 3 });
+  });
+
+  it('does not bind an Ask to the stale turn inherited in CLI environment', async () => {
+    const post = vi.fn(async (_body: Record<string, unknown>) => makeAnsweredStub([['继续']])());
+    await runHook(claudeAskPayload, { ...FULL_ENV, BOTMUX_TURN_ID: 'om_old' }, post,
+      'claude-code', undefined, undefined, () => null);
+    expect(post.mock.calls[0]?.[0]).not.toHaveProperty('originTurnId');
+  });
   describe('(a) Claude AskUserQuestion + answered stub → stdout 含答案', () => {
     it('formatAnswer 结果写入 stdout', async () => {
       const stub = makeAnsweredStub([['继续']]);
@@ -72,6 +100,32 @@ describe('runHook', () => {
       const directive = JSON.parse(result.stdout);
       // Claude directive 应包含 hookSpecificOutput
       expect(JSON.stringify(directive)).toContain('继续');
+    });
+  });
+
+  describe('(a1) DSH user-questions + answered stub → stdout 为 AskUserQuestionAnswer', () => {
+    it('formatAnswer 结果可直接返回给 DSH userQuestions', async () => {
+      const payload = {
+        hook_event_name: 'user-questions/request',
+        tool_input: {
+          questions: [{
+            id: 'confirm',
+            question: '继续吗？',
+            options: [{ label: '继续' }, { label: '取消' }],
+          }],
+        },
+        sessionId: 'spoofed-session',
+        chatId: 'spoofed-chat',
+      };
+      let posted: Record<string, unknown> | undefined;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_user1', comment: null, timedOut: false };
+      };
+      const result = await runHook(payload, FULL_ENV, stub, 'dsh');
+      expect(posted?.sessionId).toBe(FULL_ENV.BOTMUX_SESSION_ID);
+      expect(posted?.chatId).toBe(FULL_ENV.BOTMUX_CHAT_ID);
+      expect(JSON.parse(result.stdout)).toEqual({ answers: [{ id: 'confirm', selected: ['继续'] }] });
     });
   });
 
@@ -150,6 +204,154 @@ describe('runHook', () => {
       const result = await runHook(claudePreToolPayload, FULL_ENV, stub, 'claude-code');
       // 应为 passthrough（stub 不应被调用）
       expect(result.stdout).toBe('');
+    });
+  });
+
+  describe('(d) OpenCode 原生会话 id 显式反查（托管 service 场景，P1 回归）', () => {
+    const openCodeAskPayload = {
+      hook_event_name: 'question.asked',
+      question_id: 'que_1',
+      session_id: 'ses_abc123',
+      tool_input: { questions: [{ question: '继续？', options: [{ label: '继续' }, { label: '取消' }] }] },
+    };
+    const EXPLICIT_ROUTE = {
+      sessionId: 'sess_real_target',
+      chatId: 'oc_real_chat',
+      larkAppId: 'cli_real_app',
+      rootMessageId: 'oc_real_root',
+    };
+    // env 指向首个启动 service 的会话（错投目标），必须被显式反查覆盖。
+    const STALE_ENV = {
+      ...FULL_ENV,
+      BOTMUX_SESSION_ID: 'sess_first_service_owner',
+      BOTMUX_CHAT_ID: 'oc_wrong_chat',
+      BOTMUX_LARK_APP_ID: 'cli_wrong_app',
+    };
+
+    it('反查命中 → 按反查结果路由（覆盖 ambient env，防跨会话错投）', async () => {
+      let posted: Record<string, unknown> | undefined;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, stub, 'opencode2',
+        async () => null,                       // adopt 兜底不应被触达
+        async (cliSessionId) => {
+          expect(cliSessionId).toBe('ses_abc123');
+          return EXPLICIT_ROUTE;
+        },
+      );
+      expect(result.stdout).toBeTruthy();
+      expect(posted?.sessionId).toBe('sess_real_target');
+      expect(posted?.chatId).toBe('oc_real_chat');
+      expect(posted?.larkAppId).toBe('cli_real_app');
+      expect(posted?.rootMessageId).toBe('oc_real_root');
+    });
+
+    it('opencode2 反查未命中（独立终端会话 + 陈旧完整 env）→ fail closed，postAsk 未调用且 stdout 为空', async () => {
+      // 独立终端会话的 ses_* 不属于任何 active daemon → 反查必然 null；
+      // 若回落 STALE_ENV 会把问题投到首个启动 service 的 botmux 会话（泄露路径）。
+      // 共享 service hook 必须 fail closed：不发卡、问题留给原生终端。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => null,                       // 反查未命中
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode2 反查超时（budget 耗尽 / daemon 不可达 → 返回 null）→ fail closed passthrough', async () => {
+      // 1.5s budget 耗尽、daemon 短暂不可达、cliSessionId 刚产生尚未上报时反查同样
+      // 返回 null——与未命中同一安全语义：直接 passthrough，绝不回落陈旧 ambient env。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => null,                       // 反查超时未返回结果
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode（进程私有 hook）不走反查 → 直接按 ambient env 路由', async () => {
+      // 反查只对共享 service hook（opencode2）启用：V1 hook 的 ambient env 是
+      // 当前进程的可信归属，让反查覆盖反而可能被另一重复绑定的命中错投。
+      let posted: Record<string, unknown> | undefined;
+      let resolved = 0;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, stub, 'opencode',
+        async () => null,
+        async () => { resolved++; return EXPLICIT_ROUTE; },
+      );
+      expect(resolved).toBe(0);
+      expect(result.stdout).toBeTruthy();
+      expect(posted?.sessionId).toBe('sess_first_service_owner');
+      expect(posted?.chatId).toBe('oc_wrong_chat');
+    });
+
+    it('opencode2 反查 resolver 抛错 → fail closed（结果未知，绝不回落 env）', async () => {
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => { throw new Error('ipc down'); },
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode2 session_id 非 ses_* 形状 → fail closed passthrough（不落 env 路由）', async () => {
+      // 共享 service 的 ambient env 永远不可信：无法验证 native identity 时
+      // 直接 passthrough，绝不把问题投到首个启动 service 的 botmux 会话。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      let resolved = 0;
+      const payload = { ...openCodeAskPayload, session_id: 'some-other-format' };
+      const result = await runHook(
+        payload, FULL_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => { resolved++; return EXPLICIT_ROUTE; },
+      );
+      expect(resolved).toBe(0);
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode2 session_id 缺失 → fail closed passthrough（不落 env 路由）', async () => {
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const payload = { ...openCodeAskPayload };
+      delete (payload as Record<string, unknown>).session_id;
+      const result = await runHook(
+        payload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => EXPLICIT_ROUTE,
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('反查命中后 adopt 兜底分支不被触达（env 即使缺失也直接路由）', async () => {
+      let posted: Record<string, unknown> | undefined;
+      let adoptCalls = 0;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const env = { BOTMUX_ASK_TIMEOUT_MS: '5000' }; // 全缺 env（托管 service 真实场景）
+      const result = await runHook(
+        openCodeAskPayload, env, stub, 'opencode2',
+        async () => { adoptCalls++; return null; },
+        async () => EXPLICIT_ROUTE,
+      );
+      expect(result.stdout).toBeTruthy();
+      expect(adoptCalls).toBe(0);
+      expect(posted?.sessionId).toBe('sess_real_target');
     });
   });
 
@@ -318,43 +520,39 @@ describe('runHook', () => {
     });
   });
 
-  // 语义③（Codex 建议）：workflow subagent 里 `botmux ask` 必须被拒绝——审批走
-  // humanGate/decision 进 event log，不能用 ad-hoc ask 绕过。cmdAsk 用 process.exit(2)
-  // 拒绝，未导出、无法直接单测，这里用源码断言钉住该 gate，防被静默移除。
-  describe('语义③：workflow 里 botmux ask 拒绝（源码 gate 守卫）', () => {
-    it('cmdAsk 含 BOTMUX_WORKFLOW gate + exit 2 拒绝', () => {
-      const src = readFileSync(
-        new URL('../src/cli.ts', import.meta.url),
-        'utf-8',
-      );
-      const cmdAskIdx = src.indexOf('async function cmdAsk(');
-      expect(cmdAskIdx).toBeGreaterThanOrEqual(0);
-      // gate 在 cmdAsk 函数体起始处
-      const region = src.slice(cmdAskIdx, cmdAskIdx + 1500);
-      expect(region).toContain("process.env.BOTMUX_WORKFLOW === '1'");
-      expect(region).toContain('process.exit(2)');
-      expect(region.toLowerCase()).toContain('refused');
-    });
-  });
+  // 语义③：workflow subagent 里 `botmux ask` 必须被拒绝——审批走 humanGate/decision 进
+  // event log，不能用 ad-hoc ask 绕过；举手已并入 `botmux send --attention`，由 send 自身的
+  // workflow gate 覆盖。两者都通过真实 CLI 入口验证，并以同参数、无 BOTMUX_WORKFLOW 作对照。
+  describe('workflow subagent 里 ask / send --attention 被拒绝（真实 CLI）', () => {
+    const repo = fileURLToPath(new URL('..', import.meta.url));
+    const runCli = (args: string[], workflow: string) => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-workflow-gate-'));
+      try {
+        return spawnSyncTsScript(join(repo, 'src', 'cli.ts'), args, {
+          cwd: repo,
+          encoding: 'utf8',
+          timeout: 30_000,
+          env: {
+            PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: join(root, 'data'),
+            BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: 'sid_workflow_gate',
+            BOTMUX_WORKFLOW: workflow, BOTMUX_WORKFLOW_RUN_ID: 'run-1', BOTMUX_WORKFLOW_NODE_ID: 'node-1',
+          },
+        });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    };
 
-  describe('workflow 里举手走 send 自身的 gate（attention 已并入 send，不再是独立命令）', () => {
-    it('cmdAttention 已移除，send --attention 由 send 的 BOTMUX_WORKFLOW gate 覆盖', () => {
-      const src = readFileSync(
-        new URL('../src/cli.ts', import.meta.url),
-        'utf-8',
-      );
-      // 旧的独立举手入口已删除——举手并入 `botmux send --attention`。
-      expect(src.includes('async function cmdAttention(')).toBe(false);
-      // send 顶部已有 workflow-subagent gate（subagent 里 send 直接 refused），
-      // --attention 是 send 的一个 flag，因此天然被同一道 gate 覆盖。
-      const cmdSendIdx = src.indexOf('async function cmdSend(');
-      expect(cmdSendIdx).toBeGreaterThanOrEqual(0);
-      // cmdSend also performs live VC-origin verification before reaching the
-      // workflow gate; inspect a bounded function prefix without coupling this
-      // source-contract test to the exact size of that verification block.
-      const region = src.slice(cmdSendIdx, cmdSendIdx + 5000);
-      expect(region).toContain("process.env.BOTMUX_WORKFLOW === '1'");
-      expect(region).toContain('process.exit(2)');
-    });
+    it.each([
+      ['ask', ['ask', '--options', '继续,取消', '继续还是取消？']],
+      ['send --attention', ['send', '--attention', '--no-mention', '我卡住了']],
+    ])('%s exits 2 inside a workflow subagent', (name, args) => {
+      const gated = runCli(args, '1');
+      expect(gated.status, String(gated.stderr)).toBe(2);
+      expect(String(gated.stderr)).toContain(`botmux ${name.split(" ")[0]} refused inside workflow subagent`);
+
+      const control = runCli(args, '');
+      expect(String(control.stderr)).not.toContain('refused inside workflow subagent');
+    }, 60_000);
   });
 });

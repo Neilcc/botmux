@@ -12,13 +12,14 @@
  * import cycle with each other.
  */
 import { getBot } from '../bot-registry.js';
+import { isRemoteBackendId, reconcilePairedBackendId } from './remote-cli-ids.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
+import { zmxEnv } from '../setup/ensure-zmx.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
-import type { Session } from '../types.js';
 
 export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
 
@@ -90,24 +91,48 @@ export function resolveSpawnBackendType(
 }
 
 /**
- * Enforce the `cliId === 'riff' ⇔ backendType === 'riff'` pairing invariant at
- * the ONE spawn chokepoint, so every config entry point (dashboard, `/config
+ * CLIs that are NOT local processes: they have an empty `resolvedBin` and their
+ * backend translates write() into remote API / headless-CLI calls. For each of
+ * these the cliId and the backendType share a name and must stay paired.
+ *
+ * Adding a remote CLI means adding it here — the alternative (another
+ * hardcoded `=== 'riff'` chain in every helper below) is exactly what made this
+ * generalization necessary.
+ */
+// The set itself now lives in the dependency-free core/remote-cli-ids leaf so
+// light consumers (e.g. the Lark card builder) can share it without pulling in
+// every PTY backend class through this module.
+
+/** True for a backend that runs the agent off-box (no local PTY to own). */
+export function isRemoteBackendType(type: BackendType): boolean {
+  return isRemoteBackendId(type);
+}
+
+export { isRemoteCliId } from './remote-cli-ids.js';
+
+/**
+ * Enforce the `cliId === <remote> ⇔ backendType === <remote>` pairing invariant
+ * at the ONE spawn chokepoint, so every config entry point (dashboard, `/config
  * set cli|backendType`, `botmux setup`, hand-edited bots.json) converges:
- *   - riff CLI on a local backend → force 'riff' (a pty/tmux spawn would fail
- *     on the empty resolvedBin);
- *   - non-riff CLI on the riff backend → fall back to the daemon default (the
- *     CLI's PTY chunked writes would otherwise fan out into riff tasks).
- * Manual pty/tmux/herdr/zellij overrides for non-riff CLIs pass through.
+ *   - a remote CLI on a local backend → force its own backend (a pty/tmux spawn
+ *     would fail on the empty resolvedBin);
+ *   - a non-remote CLI on a remote backend → fall back to the daemon default
+ *     (the CLI's PTY chunked writes would otherwise fan out into remote tasks).
+ * Manual pty/tmux/herdr/zellij overrides for local CLIs pass through.
+ *
+ * NOTE: kept under its historical name `reconcileRiffBackendType` on purpose —
+ * it is imported by name in several modules and renaming it would bloat this
+ * behaviour-preserving refactor into a cross-cutting rename.
  */
 export function reconcileRiffBackendType(
   cliId: string,
   resolved: BackendType,
   defaultType: BackendType,
 ): BackendType {
-  if (cliId === 'riff') return 'riff';
-  // defaultType 本身被误配成 riff 时兜底到确定可用的本地后端（pty 无外部依赖）。
-  if (resolved === 'riff') return defaultType !== 'riff' ? defaultType : 'pty';
-  return resolved;
+  // A remote CLI dictates its own backend (same name by construction);
+  // defaultType 本身被误配成远端后端时兜底到确定可用的本地后端（pty 无外部依赖）。
+  // 规则本体在无依赖的 remote-cli-ids，Dashboard 判断零注入时复用同一份。
+  return reconcilePairedBackendId(cliId, resolved, defaultType) as BackendType;
 }
 
 /** Resolve the frozen/live/default backend precedence and then enforce the
@@ -134,6 +159,18 @@ export function isRiffBackendSession(ds: DaemonSession): boolean {
   return (ds.initConfig?.backendType ?? ds.session.backendType) === 'riff';
 }
 
+/** Whether the live/persisted session is frozen onto ANY remote backend.
+ *  Same frozen-stamp rule as isRiffBackendSession. Used by the guards that
+ *  must reject BEFORE mutating persisted state (e.g. /cd repin): killWorker
+ *  refuses unprepared live retirement for every remote backend, so a caller
+ *  that mutates first and retires after would report success while the live
+ *  generation keeps running against the old state — the split-brain the riff
+ *  guard has always prevented, now needed for mojo too. */
+export function isRemoteBackendSession(ds: DaemonSession): boolean {
+  const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
+  return frozen !== undefined && isRemoteBackendType(frozen);
+}
+
 /**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:
@@ -143,11 +180,14 @@ export function isRiffBackendSession(ds: DaemonSession): boolean {
  * Freezing here stops a live backendType edit from changing how a running session
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
-export function shutdownBackendDisposition(ds: DaemonSession): 'riff-drain-detach' | 'detach' | 'close' {
-  // Riff 不能落进普通 detach 的直接 SIGTERM：create/follow-up 最长 10s 才返回
-  // task id，而 worker SIGTERM 会立即 exit，丢掉唯一血缘。独立 disposition 迫使
-  // daemon 先走 drain → durable ACK → commit 协议；类型检查防止未来回归。
-  if (isRiffBackendSession(ds)) return 'riff-drain-detach';
+export function shutdownBackendDisposition(ds: DaemonSession): 'remote-drain-detach' | 'detach' | 'close' {
+  const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
+  // Every remote backend must publish its exact final lineage before the local
+  // worker exits. Riff may wait for create/follow-up HTTP; Mojo may wait for the
+  // first `system/init`. Their backend-specific implementations stay behind the
+  // common prepare/abort/commit interface, while the daemon owns one atomic
+  // fleet transaction. Detach never cancels the remote session.
+  if (frozen && isRemoteBackendType(frozen)) return 'remote-drain-detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
 }
 
@@ -171,10 +211,17 @@ export function resolvePersistentBackendTarget(
 ): PersistentBackendTarget {
   if (persisted?.backendType === backendType && persisted.sessionName.trim()) {
     if (persisted.backendType !== 'herdr' || persisted.agentName === undefined || persisted.agentName.trim()) {
-      return persisted;
+      // Herdr's old exclusive host carries no agent identity. Keep the complete
+      // owner beside the resolved (ephemeral) target so destructive lifecycle
+      // work can distinguish `bmx-<sid8>` from shared/custom host sessions.
+      return persisted.backendType === 'herdr' && persisted.agentName === undefined
+        ? { ...persisted, sessionId }
+        : persisted;
     }
   }
-  return { backendType, sessionName: persistentSessionName(backendType, sessionId) };
+  const sessionName = persistentSessionName(backendType, sessionId);
+  if (backendType === 'herdr') return { backendType, sessionName, sessionId };
+  return { backendType, sessionName };
 }
 
 export function persistentBackendTargetForSession(ds: DaemonSession): PersistentBackendTarget | undefined {
@@ -187,25 +234,37 @@ export function persistentBackendTargetForSession(ds: DaemonSession): Persistent
   );
 }
 
-/** Exact managed resources to remove when a single-bot CLI changes.
- * Adopted panes are user-owned; machine-wide Herdr agents must be returned as
- * agent-scoped targets rather than collapsing to the shared host session. */
-export function managedTargetsForCliChange(
-  backendType: PersistentBackendType,
-  sessions: readonly Pick<Session, 'sessionId' | 'adoptedFrom' | 'persistentBackendTarget'>[],
-): PersistentBackendTarget[] {
-  return sessions
-    .filter(session => !session.adoptedFrom)
-    .map(session => resolvePersistentBackendTarget(
-      backendType,
-      session.sessionId,
-      session.persistentBackendTarget,
-    ));
+/**
+ * The only agent-less Herdr target that Botmux may own as a whole session is
+ * its deterministic legacy host. Shared `botmux` / custom hosts and malformed
+ * rows stay fail-closed even when their names merely resemble a managed name.
+ */
+function isExclusiveAgentlessHerdrTarget(
+  target: Extract<PersistentBackendTarget, { backendType: 'herdr' }>,
+): boolean {
+  return target.agentName === undefined
+    && typeof target.sessionId === 'string'
+    && target.sessionId.length > 0
+    && target.sessionId === target.sessionId.trim()
+    && target.sessionName === persistentSessionName('herdr', target.sessionId);
 }
 
 export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
-  if (target.backendType === 'herdr' && target.agentName) {
-    return HerdrBackend.probeAgent(target.sessionName, target.agentName);
+  if (target.backendType === 'tmux' && target.socketName !== undefined) {
+    return TmuxBackend.probeSession(target.sessionName, target.socketName);
+  }
+  if (target.backendType === 'zmx' && target.socketDir !== undefined) {
+    return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
+  }
+  if (target.backendType === 'herdr') {
+    if (target.agentName?.trim()) {
+      return HerdrBackend.probeAgent(target.sessionName, target.agentName);
+    }
+    // Legacy exclusive hosts are safe to probe as a whole session only with
+    // complete ownership proof. Shared/custom/malformed targets stay unknown.
+    return isExclusiveAgentlessHerdrTarget(target)
+      ? HerdrBackend.probeSession(target.sessionName)
+      : 'unknown';
   }
   return probePersistentSession(target.backendType, target.sessionName);
 }
@@ -220,8 +279,25 @@ export function killPersistentBackendTarget(
   target: PersistentBackendTarget,
   sessionId?: string,
 ): void {
-  if (target.backendType === 'herdr' && target.agentName) {
-    HerdrBackend.killAgent(target.sessionName, target.agentName);
+  if (target.backendType === 'zmx' && target.socketDir !== undefined) {
+    if (!sessionId) throw new Error('ZMX teardown requires the complete owning session id');
+    ZmxBackend.killManagedSession(target.sessionName, sessionId, undefined, zmxEnv(process.env, target.socketDir));
+    return;
+  }
+  if (target.backendType === 'herdr') {
+    if (target.agentName?.trim()) {
+      HerdrBackend.killAgent(target.sessionName, target.agentName);
+      return;
+    }
+    if (!isExclusiveAgentlessHerdrTarget(target)
+      || (sessionId !== undefined && sessionId !== target.sessionId)) {
+      throw new Error('Herdr whole-session teardown requires an exact exclusive owner target');
+    }
+    HerdrBackend.killSession(target.sessionName);
+    return;
+  }
+  if (target.backendType === 'tmux' && target.socketName !== undefined) {
+    TmuxBackend.killSession(target.sessionName, target.socketName);
     return;
   }
   killPersistentSession(target.backendType, target.sessionName, sessionId);
@@ -245,12 +321,15 @@ export function probePersistentSession(backendType: PersistentBackendType, name:
 export function probePersistentSessions(
   backendType: PersistentBackendType,
   names: Iterable<string>,
+  socketDir?: string,
 ): ReadonlyMap<string, SessionProbe> {
   const uniqueNames = [...new Set(names)];
   const result = new Map<string, SessionProbe>();
 
   if (backendType === 'zmx') {
-    const snapshot = ZmxBackend.probeSessions();
+    const snapshot = socketDir === undefined
+      ? ZmxBackend.probeSessions()
+      : ZmxBackend.probeSessions(zmxEnv(process.env, socketDir));
     for (const name of uniqueNames) {
       result.set(
         name,
@@ -280,6 +359,59 @@ export function probePersistentSessions(
   return result;
 }
 
+/** Address identity for caches/batches; ownership still requires the session UUID. */
+export function persistentBackendTargetKey(target: PersistentBackendTarget): string {
+  return JSON.stringify([
+    target.backendType,
+    target.sessionName,
+    target.backendType === 'herdr' ? target.agentName ?? '' : '',
+    target.backendType === 'herdr' && target.agentName === undefined ? target.sessionId ?? '' : '',
+    target.backendType === 'zmx' ? target.socketDir ?? '' : '',
+    // Appended only when set so default-server keys stay byte-identical to the
+    // keys older code computed (caches/batches compare them across call sites).
+    ...(target.backendType === 'tmux' && target.socketName !== undefined ? [target.socketName] : []),
+  ]);
+}
+
+/** One list per backend namespace, shared by CLI display and daemon restore. */
+export function probePersistentBackendTargets(
+  targets: Iterable<PersistentBackendTarget>,
+): ReadonlyMap<string, SessionProbe> {
+  const result = new Map<string, SessionProbe>();
+  const groups = new Map<string, Map<string, PersistentBackendTarget>>();
+  for (const target of targets) {
+    const key = persistentBackendTargetKey(target);
+    // Both agent-scoped and legacy exclusive Herdr targets require the same
+    // ownership-aware single-target classifier. Never downgrade either kind to
+    // the name-only batch probe used by whole-session backends.
+    if (target.backendType === 'herdr') {
+      if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
+      continue;
+    }
+    if (target.backendType === 'tmux' && target.socketName !== undefined) {
+      if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
+      continue;
+    }
+    const socketDir = target.backendType === 'zmx' ? target.socketDir : undefined;
+    const groupKey = JSON.stringify([target.backendType, socketDir ?? '']);
+    const group = groups.get(groupKey) ?? new Map<string, PersistentBackendTarget>();
+    group.set(target.sessionName, target);
+    groups.set(groupKey, group);
+  }
+  for (const group of groups.values()) {
+    const target = group.values().next().value!;
+    const probes = probePersistentSessions(
+      target.backendType,
+      group.keys(),
+      target.backendType === 'zmx' ? target.socketDir : undefined,
+    );
+    for (const [name, item] of group) {
+      result.set(persistentBackendTargetKey(item), probes.get(name) ?? 'unknown');
+    }
+  }
+  return result;
+}
+
 /**
  * Kill a backing session. ZMX additionally requires the complete botmux UUID:
  * its public name contains only eight UUID characters, so name-only deletion
@@ -297,4 +429,49 @@ export function killPersistentSession(
     ZmxBackend.killManagedSession(name, sessionId);
   }
   else HerdrBackend.killSession(name);
+}
+
+/**
+ * {@link probePersistentBackendTarget} for verifying a kill that just went
+ * through. Killing the last session on a tmux server makes that server exit,
+ * and a probe that connects while it is still going down reads "server exited
+ * unexpectedly" — a server-level error, so 'unknown' — although tmux gives its
+ * own answer a moment later. Only 'unknown' is re-probed, with the same short
+ * backoff as {@link TmuxBackend.probeSessionWithRetry} (at most ~0.75s of
+ * sleep over the default three attempts, on top of each probe's own deadline
+ * — 3s for tmux); 'exists' / 'missing' return at once, and a backing that
+ * stays indeterminate is still 'unknown' for the caller to fail closed on.
+ * A target that is unknown by construction is not re-probed at all.
+ */
+export function probePersistentBackendTargetAfterKill(
+  target: PersistentBackendTarget,
+  opts: {
+    attempts?: number;
+    baseDelayMs?: number;
+    /** Test seams. */
+    probe?: (target: PersistentBackendTarget) => SessionProbe;
+    sleep?: (ms: number) => void;
+  } = {},
+): SessionProbe {
+  const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+  const baseDelayMs = Math.max(0, Math.floor(opts.baseDelayMs ?? 150));
+  // A shared/custom agentless herdr target is never asked (see
+  // probePersistentBackendTarget): waiting cannot change its answer.
+  if (target.backendType === 'herdr' && !target.agentName?.trim() && !isExclusiveAgentlessHerdrTarget(target)) {
+    return 'unknown';
+  }
+  const probe = opts.probe ?? probePersistentBackendTarget;
+  const sleep = opts.sleep ?? ((ms: number) => {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+  });
+  let result = probe(target);
+  for (let completed = 1; result === 'unknown' && completed < attempts; completed += 1) {
+    const backoff = baseDelayMs * (2 ** (completed - 1));
+    const jitter = baseDelayMs > 0 ? Math.floor(Math.random() * baseDelayMs) : 0;
+    sleep(backoff + jitter);
+    result = probe(target);
+  }
+  return result;
 }

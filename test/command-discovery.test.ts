@@ -78,6 +78,15 @@ describe('discoverSlashCommands', () => {
   it('returns empty when nothing is installed', () => {
     expect(discoverSlashCommands(join(root, 'empty'))).toEqual([]);
   });
+
+  it('ignores indented nested keys in frontmatter (schema-style metadata)', () => {
+    write(
+      join(claudeHome, 'skills', 'schema-skill', 'SKILL.md'),
+      '---\ndescription: top-level\nmetadata:\n  input_schema:\n    properties:\n      repo_dir:\n        description: nested\n---',
+    );
+    const found = discoverSlashCommands(join(root, 'proj'));
+    expect(found.find((c) => c.name === '/schema-skill')?.description).toBe('top-level');
+  });
 });
 
 describe('discoverSlashCommandsForAdapter', () => {
@@ -154,11 +163,11 @@ describe('parseBotConfigsFromText · customPassthroughCommands', () => {
     expect(cfg.customPassthroughCommands).toEqual(['/status', '/export']);
   });
 
-  it('drops malformed entries (spaces, bad chars, non-strings)', () => {
+  it('joins internal whitespace with "-" and drops bad chars / non-strings', () => {
     const [cfg] = parseBotConfigsFromText(
-      JSON.stringify([{ ...base, customPassthroughCommands: ['/ok-cmd', '/bad cmd', '/!nope', 42, '/UPPER:lower'] }]),
+      JSON.stringify([{ ...base, customPassthroughCommands: ['/ok-cmd', '/Ultra Goal', '/bad@cmd', 42, '/UPPER:lower'] }]),
     );
-    expect(cfg.customPassthroughCommands).toEqual(['/ok-cmd', '/upper:lower']);
+    expect(cfg.customPassthroughCommands).toEqual(['/ok-cmd', '/ultra-goal', '/upper:lower']);
   });
 
   it('is undefined when unset or all-invalid', () => {

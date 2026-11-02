@@ -103,12 +103,15 @@ function assertBundleInputsAllowed(metafile) {
   // module means adding it to this set on purpose — that review is the point.
   const allowedSourceInputs = new Set([
     'src/utils/canonical-input-hash.ts',
+    'src/utils/proc-stat.ts',        // leaf: no imports (pure /proc/<pid>/stat parsing)
+    'src/utils/process-alive.ts',    // leaf: no imports (kill(pid, 0) predicates)
     'src/utils/file-lock.ts',
     'src/utils/fs-durability.ts',
     'src/utils/logger.ts',
     'src/utils/process-identity.ts',
     'src/workflows/shared/idempotency-key.ts',
     'src/workflows/v3/artifact-contract.ts',
+    'src/workflows/v3/artifact-contract-declarations.ts',
     'src/workflows/v3/attempt-ledger.ts',
     'src/workflows/v3/contract.ts',
     'src/workflows/v3/core-control.ts',
@@ -204,6 +207,7 @@ async function assertTypeBoundary() {
   const typeRoot = join(distDir, 'types');
   const allowedSourceDeclarations = new Set([
     'src/workflows/v3/artifact-contract.d.ts',
+    'src/workflows/v3/artifact-contract-declarations.d.ts',
     'src/workflows/v3/core-control.d.ts',
     'src/workflows/v3/dag.d.ts',
     'src/workflows/v3/event-contract.d.ts',

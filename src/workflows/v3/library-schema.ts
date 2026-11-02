@@ -24,7 +24,7 @@ import { assertSavedWorkflowTemplateBindings } from './template-bindings.js';
 export { canonicalJsonStringify } from '../../utils/canonical-json.js';
 
 export const SAVED_WORKFLOW_METADATA_SCHEMA_VERSION = 1 as const;
-export const SAVED_WORKFLOW_REVISION_SCHEMA_VERSION = 1 as const;
+export const SAVED_WORKFLOW_REVISION_SCHEMA_VERSION = 2 as const;
 
 export const SAVED_WORKFLOW_ID_RE = /^wf_[0-9a-f]{32}$/;
 export const SAVED_WORKFLOW_REVISION_ID_RE = /^rev_[0-9a-f]{64}$/;
@@ -87,6 +87,8 @@ export type SavedWorkflowBuiltinContextRef =
   | 'initiatorOpenId';
 
 export interface V3DagTemplate {
+  /** Missing/1 is a legacy selector-based template; new revisions require 2. */
+  schemaVersion?: 1 | 2;
   nodes: V3Node[];
 }
 
@@ -400,7 +402,11 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   }
   let nodes: V3Node[];
   try {
-    nodes = validateDag({ runId: 'saved-template', nodes: raw.nodes }).nodes;
+    nodes = validateDag({
+      ...(raw.schemaVersion !== undefined ? { schemaVersion: raw.schemaVersion } : {}),
+      runId: 'saved-template',
+      nodes: raw.nodes,
+    }).nodes;
   } catch (err) {
     if (err instanceof DagValidationError) throw new SavedWorkflowSchemaError(err.problems.map((p) => `dagTemplate: ${p}`));
     throw err;
@@ -412,10 +418,15 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   // validateDagTemplate is the structural deserializer shared by the READ path
   // (loadSavedWorkflowRevision → validateSavedWorkflowRevisionPayload), so
   // gating it would retroactively brick already-saved revisions that were legal
-  // before the lint existed. The policy check runs only at authoring boundaries
-  // (buildSavedWorkflowRevisionBaseline / validateSavedWorkflowRevisionDraft /
-  // v2 migration) via assertNoSavedWorkflowChatSideEffects.
-  return { nodes };
+  // before the lint existed. The policy check runs only at authoring boundaries:
+  // validateSavedWorkflowRevisionDraft and v2 migration throw via
+  // assertNoSavedWorkflowChatSideEffects, while exact save
+  // (buildSavedWorkflowRevisionBaseline) surfaces the same findings as
+  // lintWarnings for an explicit --ack-unsafe acknowledgement.
+  return {
+    ...(raw.schemaVersion !== undefined ? { schemaVersion: raw.schemaVersion as 1 | 2 } : {}),
+    nodes,
+  };
 }
 
 function validateDirectBotSelectors(
@@ -462,10 +473,10 @@ function gateProjection(nodes: V3Node[], prefix = ''): unknown[] {
 
 const CHAT_SIDE_EFFECT_PATTERNS: Array<{ kind: string; re: RegExp }> = [
   { kind: 'botmux-send', re: /\bbotmux\s+(?:send|reply)\b/i },
-  { kind: 'bytedcli-feishu', re: /\bbytedcli\s+feishu\b.*\b(?:send|reply|message|im|chat)\b/i },
-  { kind: 'lark-cli-im', re: /\blark-cli\b.*\b(?:send|reply|message|im|chat)\b/i },
+  { kind: 'bytedcli-feishu', re: /\bbytedcli\s+feishu\b.*?\b(?:send|reply|message|im|chat)\b(?:[ \t]+(?:send|reply|message|im|chat)\b)*/i },
+  { kind: 'lark-cli-im', re: /\blark-cli\b.*?\b(?:send|reply|message|im|chat)\b(?:[ \t]+(?:send|reply|message|im|chat)\b)*/i },
   { kind: 'feishu-openapi-message', re: /\/open-apis\/im\/v1\/(?:messages|chats)\b/i },
-  { kind: 'feishu-openapi-message', re: /\b(?:feishu|lark)\b.*\bopenapi\b.*\b(?:send|reply|message)\b/i },
+  { kind: 'feishu-openapi-message', re: /\b(?:feishu|lark)\b.*?\bopenapi\b.*?\b(?:send|reply|message)\b/i },
   { kind: 'feishu-openapi-message', re: /\bim\.v1\.message\.(?:create|reply|patch)\b/i },
 ];
 
@@ -485,6 +496,33 @@ function collectStrings(value: unknown, path: string, out: Array<{ path: string;
   }
 }
 
+function findAffirmativeChatSideEffect(text: string): string | undefined {
+  const commands = CHAT_SIDE_EFFECT_PATTERNS.flatMap(({ kind, re }) =>
+    [...text.matchAll(new RegExp(`(?=(${re.source}))`, `${re.flags}g`))].map((match) => ({
+      start: match.index,
+      end: match.index + match[1]!.length,
+      kind,
+    })))
+    .sort((a, b) => a.start - b.start || b.end - a.end)
+    // A broad CLI pattern must not swallow a separately named command.
+    .filter((command, index, matches) => command.end <= (matches[index + 1]?.start ?? Infinity));
+  let previousEnd: number | undefined;
+  for (const command of commands) {
+    const prefix = text.slice(previousEnd ?? 0, command.start);
+    // Only bare list connectors inherit a preceding command's prohibition.
+    const continuesList = previousEnd !== undefined &&
+      /^[ \t`"'“”‘’]*(?:(?:\/|、|和|或(?:者)?|以及|与|\b(?:and|or)\b)[ \t`"'“”‘’]*)+$/i.test(prefix);
+    // Command spans are excluded; keep word-internal slashes and decimal points intact.
+    const clausePrefix = prefix
+      .split(/(?<!\d)\.|\.(?!\d)|[。；;，,\r\n!?！？]|(?<![A-Za-z0-9])\/|\/(?![A-Za-z0-9])|但是|但|然而|\b(?:but|however)\b/i).at(-1)!;
+    if (!continuesList && !/(?:不要|禁止|不得|严禁|勿|\b(?:never|do\s+not|don['’]t|no)\b)/i.test(clausePrefix)) {
+      return command.kind;
+    }
+    previousEnd = command.end;
+  }
+  return undefined;
+}
+
 function pushChatSideEffectProblems(
   node: V3Node,
   nodeId: string,
@@ -502,19 +540,17 @@ function pushChatSideEffectProblems(
     strings,
   );
   for (const item of strings) {
-    for (const pattern of CHAT_SIDE_EFFECT_PATTERNS) {
-      if (!pattern.re.test(item.value)) continue;
-      problems.push({
-        nodeId,
-        path: item.path,
-        kind: pattern.kind,
-        guidance:
-          `Move chat notification out of goal node "${nodeId}": split it into ` +
-          'businessTask (write result.json/final_message.md) plus a hostExecutor ' +
-          'feishu-send/feishu-reply node that reads the upstream result.',
-      });
-      break;
-    }
+    const kind = findAffirmativeChatSideEffect(item.value);
+    if (!kind) continue;
+    problems.push({
+      nodeId,
+      path: item.path,
+      kind,
+      guidance:
+        `Move chat notification out of goal node "${nodeId}": split it into ` +
+        'businessTask (write result.json/final_message.md) plus a hostExecutor ' +
+        'feishu-send/feishu-reply node that reads the upstream result.',
+    });
   }
 }
 
@@ -555,10 +591,12 @@ export function formatSavedWorkflowChatSideEffectProblems(
  * (validateSavedWorkflowRevisionPayload): those are traversed when LOADING an
  * already-saved revision, and gating them would retroactively brick revisions
  * that were legal before the lint existed. Callers on the write/compile/publish
- * side (buildSavedWorkflowRevisionBaseline, validateSavedWorkflowRevisionDraft,
- * v2→v3 migration) invoke this so a fresh authored definition must be
- * lint-clean, while old revisions stay loadable/show-able/appendable (and can
- * be fixed by appending a clean revision).
+ * side (validateSavedWorkflowRevisionDraft, v2→v3 migration) invoke this so a
+ * fresh authored definition must be lint-clean, while old revisions stay
+ * loadable/show-able/appendable (and can be fixed by appending a clean
+ * revision). Exact save (buildSavedWorkflowRevisionBaseline) does not throw:
+ * it reports the same findings as lintWarnings so the user can acknowledge
+ * them explicitly with --ack-unsafe.
  */
 export function assertNoSavedWorkflowChatSideEffects(dagTemplate: V3DagTemplate): void {
   const chatEffects = formatSavedWorkflowChatSideEffectProblems(
@@ -717,6 +755,11 @@ export function validateSavedWorkflowRevisionDraft(raw: unknown): SavedWorkflowR
   // validateSavedWorkflowRevisionPayload so the READ path (loadSavedWorkflowRevision)
   // never applies the policy to already-saved revisions.
   assertNoSavedWorkflowChatSideEffects(normalized.dagTemplate);
+  if (normalized.dagTemplate.schemaVersion !== 2) {
+    throw new SavedWorkflowSchemaError([
+      'new Saved Workflow revision requires dagTemplate.schemaVersion=2 and stable outputs/output keys',
+    ]);
+  }
   const {
     workflowId: _workflowId,
     humanVersion: _humanVersion,
@@ -751,7 +794,11 @@ type RevisionMigration = (payload: unknown) => unknown;
  * Read migrations are pure and one-way. Immutable files are never rewritten;
  * future schema bumps add `N: payload => payloadV(N+1)` entries here.
  */
-const REVISION_MIGRATIONS: Readonly<Partial<Record<number, RevisionMigration>>> = Object.freeze({});
+const REVISION_MIGRATIONS: Readonly<Partial<Record<number, RevisionMigration>>> = Object.freeze({
+  // v2 changes the authoring boundary, not historical bytes. Old revisions
+  // remain selector-based and executable; no output contracts are invented.
+  1: (payload) => payload,
+});
 
 export function migrateSavedWorkflowRevisionPayload(
   schemaVersion: number,

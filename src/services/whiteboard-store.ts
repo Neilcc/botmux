@@ -6,6 +6,12 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
+import { findOnlineDaemon } from '../utils/daemon-discovery.js';
+import { loadAllSessionsSnapshot } from './session-store.js';
+import { applySessionCommandAsHost } from './session-command-host.js';
+import { SESSION_ROW_MISSING_APP_ID, formatStoreHoldMessage, formatUnmigratedMessage } from './session-store-copy.js';
+import { knownBotAppIds } from './known-bot-app-ids.js';
 
 export type WhiteboardScope = 'chat' | 'project' | 'custom';
 
@@ -112,10 +118,6 @@ function readIndex(): WhiteboardIndex {
 function writeIndex(index: WhiteboardIndex): void {
   ensureRoot();
   atomicWriteFileSync(indexPath(), JSON.stringify(index, null, 2) + '\n');
-}
-
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 // Locks reuse the cross-process file-lock primitive (utils/file-lock.ts): it
@@ -403,9 +405,7 @@ export function writeWhiteboard(id: string, content: string, opts?: { actor?: st
     if (opts?.expectedUpdatedAt && existing.updatedAt !== opts.expectedUpdatedAt) {
       throw new Error('whiteboard_cas_mismatch');
     }
-    const tmp = `${whiteboardBoardPath(clean)}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(tmp, content.endsWith('\n') ? content : content + '\n', 'utf-8');
-    renameSync(tmp, whiteboardBoardPath(clean));
+    atomicWriteFileSync(whiteboardBoardPath(clean), content.endsWith('\n') ? content : content + '\n', { followTargetSymlink: false });
     appendLog(clean, { kind: opts?.kind ?? 'write', actor: opts?.actor, content: `[overwrite ${content.length} chars]` });
     return touchWhiteboard(clean);
   });
@@ -420,31 +420,133 @@ export function appendLog(id: string, entry: { kind: string; actor?: string; to?
   });
 }
 
-function clearSessionWhiteboardRefs(id: string): number {
-  let cleared = 0;
-  let files: string[] = [];
-  try { files = readdirSync(config.session.dataDir); } catch { return 0; }
-  for (const file of files) {
-    if (!file.startsWith('sessions') || !file.endsWith('.json')) continue;
-    const fp = join(config.session.dataDir, file);
-    let data: Record<string, any>;
-    try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { continue; }
-    let dirty = false;
-    for (const session of Object.values(data)) {
-      if (session && typeof session === 'object' && session.whiteboardId === id) {
-        delete session.whiteboardId;
-        dirty = true;
-        cleared++;
-      }
+type SessionWhiteboardRef = {
+  sessionId: string;
+  larkAppId?: string;
+  whiteboardId?: string;
+};
+
+/** A loopback daemon that answers its heartbeat but not its socket must not
+ *  hold the caller's HTTP request open. Generous for a same-host call, short
+ *  enough that a wedged daemon degrades to the offline path. */
+const UNBIND_IPC_TIMEOUT_MS = 5_000;
+
+/** `cleared` — this call removed the binding. `already_changed` — the row no
+ *  longer pointed at this board (someone rebound it first); nothing to do.
+ *  `unresolved` — the row was deliberately left alone: the owning daemon was
+ *  visible but unusable (writing behind its live cache is not allowed), or the
+ *  row was gone by the time the write ran. */
+type UnbindOutcome = 'cleared' | 'already_changed' | 'unresolved';
+type UnbindResult = { status: UnbindOutcome; reason?: string };
+
+/**
+ * Clear one session's binding to a board that is being deleted.
+ *
+ * Daemon up: send the command, so the row that persists is the daemon's own.
+ * Daemon down: apply the same command here, under the store's write exclusion
+ * and the occupancy re-check in {@link applySessionCommandAsHost}.
+ *
+ * Both paths are compare-and-set against `boardId`. Deletion has already
+ * removed the board from the index by the time this runs, so the daemon's
+ * `ensureSessionWhiteboard` will mint a REPLACEMENT board for the session on
+ * its very next turn — an unconditional clear would drop that fresh binding
+ * and orphan the board the daemon just created.
+ */
+async function unbindSessionWhiteboard(
+  session: SessionWhiteboardRef,
+  boardId: string,
+  dataDir: string,
+): Promise<UnbindResult> {
+  const larkAppId = session.larkAppId;
+  // Snapshot rows always carry the store's appId (loadAllSessionsSnapshot
+  // stamps it); a row without one names no store and is left alone.
+  if (!larkAppId) return { status: 'unresolved', reason: SESSION_ROW_MISSING_APP_ID };
+  try {
+    const daemon = findOnlineDaemon(larkAppId, dataDir);
+    if (daemon) {
+      const res = await fetchDaemonIpc(
+        daemon.ipcPort,
+        `/api/sessions/${encodeURIComponent(session.sessionId)}/whiteboard`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ whiteboardId: null, expectWhiteboardId: boardId }),
+          signal: AbortSignal.timeout(UNBIND_IPC_TIMEOUT_MS),
+        },
+        loadDaemonIpcSecret(),
+      );
+      // Any HTTP answer is terminal — the daemon is alive and authoritative.
+      if (res.status === 409) return { status: 'already_changed' };
+      if (res.ok) return { status: 'cleared' };
+      return { status: 'unresolved' };
     }
-    if (dirty) atomicWriteFileSync(fp, JSON.stringify(data, null, 2) + '\n');
+  } catch { /* connection failed: the re-probe below decides whether we may write */ }
+  const published = applySessionCommandAsHost(
+    { sessionId: session.sessionId, larkAppId },
+    { type: 'whiteboard', whiteboardId: null, expectWhiteboardId: boardId },
+    { dataDir },
+  );
+  switch (published.outcome) {
+    case 'applied': return { status: 'cleared' };
+    case 'noop':
+    case 'refused': return { status: 'already_changed' };
+    case 'owned':
+      return { status: 'unresolved', reason: formatStoreHoldMessage(published.heldBy) };
+    case 'unmigrated':
+      return { status: 'unresolved', reason: formatUnmigratedMessage() };
+    case 'missing':
+    case 'contended':
+      return { status: 'unresolved' };
   }
-  return cleared;
 }
 
-export function deleteWhiteboard(id: string): { ok: true; id: string; clearedSessions: number } {
+/**
+ * Drop a deleted board's id from every session row that still points at it.
+ *
+ * Used to enumerate `sessions*.json` and rewrite whole files — a second writer
+ * outside the store gate, and a no-op once rows moved into SQLite. Now it goes
+ * through {@link unbindSessionWhiteboard} per row. A store this process cannot
+ * read skips that one session.
+ */
+async function clearSessionWhiteboardRefs(
+  id: string,
+): Promise<{ cleared: number; unresolved: number; reasons: string[] }> {
+  const dataDir = config.session.dataDir;
+  let snapshot: ReturnType<typeof loadAllSessionsSnapshot>;
+  try {
+    snapshot = loadAllSessionsSnapshot({ dataDir, knownAppIds: knownBotAppIds({ dataDir }) });
+  } catch { return { cleared: 0, unresolved: 0, reasons: [] }; }
+  const reasons: string[] = [];
+  if (snapshot.unmigratedAppIds.length > 0) {
+    reasons.push(formatUnmigratedMessage());
+  }
+  let cleared = 0;
+  let unresolved = 0;
+  for (const session of snapshot.values()) {
+    if (session?.whiteboardId !== id) continue;
+    let result: UnbindResult;
+    try { result = await unbindSessionWhiteboard(session as unknown as SessionWhiteboardRef, id, dataDir); }
+    catch { result = { status: 'unresolved' }; }
+    if (result.reason && !reasons.includes(result.reason)) reasons.push(result.reason);
+    if (result.status === 'cleared') cleared++;
+    else if (result.status === 'unresolved') unresolved++;
+  }
+  return { cleared, unresolved, reasons };
+}
+
+/**
+ * `unresolvedSessions` counts rows this call could NOT clear — the owning
+ * daemon was visible but its IPC was unusable, or the row vanished between the
+ * snapshot and the write. Those rows are not corrupt: the binding points at a
+ * board that no longer exists, and the daemon's `ensureSessionWhiteboard`
+ * replaces it on the session's next turn. The count exists so a caller can say
+ * that instead of reporting a bare `clearedSessions: 0`.
+ */
+export async function deleteWhiteboard(
+  id: string,
+): Promise<{ ok: true; id: string; clearedSessions: number; unresolvedSessions: number; reasons?: string[] }> {
   const clean = safeId(id);
-  return withIndexLock(() => {
+  withIndexLock(() => {
     const index = readIndex();
     delete index.boards[clean];
     for (const [key, boardId] of Object.entries(index.bindings)) {
@@ -458,10 +560,18 @@ export function deleteWhiteboard(id: string): { ok: true; id: string; clearedSes
     // sessions at a missing board.md. Index-first means a crash can at worst
     // leave an orphaned dir with no index entry (harmless), never a ghost.
     writeIndex(index);
-    const clearedSessions = clearSessionWhiteboardRefs(clean);
     rmSync(boardDir(clean), { recursive: true, force: true });
-    return { ok: true, id: clean, clearedSessions };
   });
+  // Outside the index lock: unbinding awaits daemon IPC, and the lock is
+  // synchronous. Nothing here reads the index.
+  const { cleared, unresolved, reasons } = await clearSessionWhiteboardRefs(clean);
+  return {
+    ok: true,
+    id: clean,
+    clearedSessions: cleared,
+    unresolvedSessions: unresolved,
+    ...(reasons.length > 0 ? { reasons } : {}),
+  };
 }
 
 export function whiteboardPath(id: string): { dir: string; board: string; log: string; meta: string } {

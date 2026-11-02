@@ -8,15 +8,21 @@
  *
  * Run: pnpm vitest run test/slash-commands-doc-sync.test.ts
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+// app-slash-commands 只为飞书 client 引 bot-registry；doc-sync 只读清单，不碰凭证。
+vi.mock('../src/bot-registry.js', () => ({ formatLarkError: () => null, getBotClient: vi.fn() }));
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } from '../src/core/passthrough-commands.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 import { messages as en } from '../src/i18n/en.js';
 import { messages as zh } from '../src/i18n/zh.js';
+import { buildAppSlashCommandCatalog, APP_SLASH_COMMAND_SCOPES } from '../src/im/lark/app-slash-commands.js';
+import { COMMANDS } from '../src/core/command-schema.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const docPath = (loc: 'en' | 'zh') => join(repoRoot, 'docs-site', 'docs', loc, 'slash-commands.md');
@@ -33,7 +39,10 @@ const ALIAS_EXEMPT = new Set(['/g', '/slash', '/disconnect']);
  * 传 mock 路径避免 eager probe(见 cli-adapters.test.ts 同款用法)。这样新 adapter
  * 加默认命令、或改了 /goal,guard 自动跟着变红,不靠手抄。
  */
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'riff'];
+// This block's own docstring promised "不靠手抄", but the list right below WAS
+// hand-copied and had gone stale (missing mojo and reasonix, still carrying a
+// retired entry). Derive it from the registry so the promise actually holds.
+const ALL_CLI_IDS: readonly CliId[] = REGISTRY_ALL_CLI_IDS;
 function adapterDefaultPassthrough(): Set<string> {
   const out = new Set<string>();
   for (const id of ALL_CLI_IDS) {
@@ -53,7 +62,7 @@ function adapterDefaultPassthrough(): Set<string> {
  */
 const PREROUTING_COMMANDS = new Set([
   '/reply-mode', '/substitute', '/grant', '/revoke', '/introduce',
-  '/summary', '/t', '/topic', '/workflow', '/template',
+  '/summary', '/t', '/topic', '/th', '/tw', '/workflow', '/template', '/tabs', '/tab',
 ]);
 
 /** 命令在 markdown 里是否作为一个 token 出现(命令语法允许尾随 : _ - ,须全部排除以免 /mcp 误配 /mcp:server)。 */
@@ -94,4 +103,26 @@ describe('i18n help.* 对称', () => {
     const zhOnly = [...zhKeys].filter(k => !enKeys.has(k));
     expect({ enOnly, zhOnly }).toEqual({ enOnly: [], zhOnly: [] });
   });
+});
+
+describe('飞书原生命令面板清单 ↔ 文档', () => {
+  // 原生面板的候选清单从 command-schema 推导；它注册到飞书的每一条命令，用户在
+  // slash-commands.md 里都必须查得到，否则就是「面板里有、文档里搜不到」。
+  // cliId 限定项支持数组（如 /effort ∈ [codex-app, codex]）：逐个 cliId 构建目录并求并集，
+  // 确保每个 CLI 面板里的命令都在文档中查得到。
+  const cliIds = [
+    undefined,
+    ...new Set(COMMANDS.flatMap(spec =>
+      Array.isArray(spec.cliId) ? spec.cliId : spec.cliId ? [spec.cliId] : [])),
+  ] as (string | undefined)[];
+  const catalogNames = new Set(cliIds.flatMap(cliId => buildAppSlashCommandCatalog({ cliId }).map(c => `/${c.command}`)));
+
+  for (const loc of ['en', 'zh'] as const) {
+    it(`${loc}/slash-commands.md 覆盖原生面板候选清单，并说明两个可选权限`, () => {
+      const doc = readDoc(loc);
+      const missing = [...catalogNames].filter(cmd => !docMentions(doc, cmd));
+      expect(missing, `${loc} 文档缺这些原生面板命令`).toEqual([]);
+      for (const scope of APP_SLASH_COMMAND_SCOPES) expect(doc).toContain(scope);
+    });
+  }
 });

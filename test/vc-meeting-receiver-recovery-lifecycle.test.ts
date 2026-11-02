@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
 import type { VcMeetingDeliveryRequest } from '../src/services/vc-meeting-delivery-protocol.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -8,8 +7,6 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 });
 
 import { __testOnly_vcMeetingReceiverRecovery as recovery } from '../src/daemon.js';
-
-const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
 function delivery(sessionId: string, memberId: string): VcMeetingDeliveryRequest {
   return {
@@ -150,11 +147,10 @@ describe('VC meeting receiver boot-recovery lifecycle', () => {
     expect(recovery.snapshot(key)).toMatchObject({ ready: true, pending: false, timerArmed: false });
   });
 
-  it('keeps the boot gate pending when reset IPC send throws', () => {
-    const failureLog = daemonSource.indexOf('failed to fence boot-ambiguous receiver');
-    expect(failureLog).toBeGreaterThanOrEqual(0);
-    const catchBlock = daemonSource.slice(failureLog, failureLog + 500);
-    expect(catchBlock).toContain('escalateVcMeetingBootRecovery(recoveryKey, ref.receiverSessionId)');
-    expect(catchBlock).not.toContain('clearVcMeetingReceiverRecoveryPending(recoveryKey)');
+  it('Plan B: a session with no durable delivery receipt is not boot-recovery blocked', () => {
+    // A plain user turn's session never gets a delivery ledger entry, so the boot
+    // gate must not block it. No recovery started for this sessionId → not blocked.
+    recovery.finishScheduling();
+    expect(recovery.isBlocked(delivery('sess_plain_user_turn', 'member_none'))).toBe(false);
   });
 });

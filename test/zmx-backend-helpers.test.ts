@@ -1,14 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:child_process')>();
+vi.mock('node:child_process', () => {
+  // `require` inside the factory, not the vitest-only `importOriginal` argument
+  // (bun passes none) and not a top-level import (vitest hoists this call above
+  // the imports, so a top-level namespace would be read before initialisation).
+  const actual = require('node:child_process') as typeof import('node:child_process');
   return {
     ...actual,
     execFileSync: vi.fn(),
   };
 });
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
   buildFreshAttachArgs,
   buildZmxLaunchFiles,
@@ -18,16 +24,23 @@ import {
   parseZmxShortList,
   tmuxKeyToBytes,
   zmxControlEnv,
+  zmxFreshSessionEnv,
   ZmxBackend,
 } from '../src/adapters/backend/zmx-backend.js';
 import {
   parseZmxVersion,
+  parseZmxSocketDir,
+  resolveZmxSocketDir,
   probeZmxFunctional,
   probeZmxVersion,
   zmxEnv,
 } from '../src/setup/ensure-zmx.js';
 
+import { selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
+
 const execFileSyncMock = vi.mocked(execFileSync);
+const tempDirs: string[] = [];
+const realFishShell = ['/bin/fish', '/usr/bin/fish'].find(path => existsSync(path));
 
 beforeEach(() => {
   execFileSyncMock.mockReset();
@@ -35,9 +48,120 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
+function makeExecutableShell(name: 'fish' | 'sh'): string {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-zmx-shell-'));
+  tempDirs.push(dir);
+  const shellPath = join(dir, name);
+  writeFileSync(shellPath, '#!/bin/sh\nexit 0\n');
+  chmodSync(shellPath, 0o755);
+  return shellPath;
+}
+
+function waitForFileContent(path: string, expected: string, timeoutMs: number): Promise<void> {
+  const startedAt = Date.now();
+  let lastObserved = '<missing>';
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      try {
+        const value = readFileSync(path, 'utf8');
+        lastObserved = JSON.stringify(value);
+        if (value === expected) {
+          resolve();
+          return;
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          lastObserved = `<read error: ${err instanceof Error ? err.message : String(err)}>`;
+        }
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        reject(new Error(
+          `Timed out waiting for ${path} to contain ${JSON.stringify(expected)}; last observed ${lastObserved}`,
+        ));
+        return;
+      }
+      setTimeout(poll, 10);
+    };
+    poll();
+  });
+}
+
+function waitForExit(
+  child: ReturnType<typeof spawn>,
+  timeoutMs: number,
+): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> {
+  let stdout = '';
+  let stderr = '';
+  child.stdout?.setEncoding('utf8');
+  child.stderr?.setEncoding('utf8');
+  child.stdout?.on('data', chunk => { stdout += chunk; });
+  child.stderr?.on('data', chunk => { stderr += chunk; });
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(
+        `Timed out after ${timeoutMs}ms waiting for generated ZMX launch to exit; ` +
+        `stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`,
+      ));
+    }, timeoutMs);
+    child.once('error', err => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.once('close', code => {
+      clearTimeout(timeout);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
 describe('zmx env/probe helpers', () => {
+  it('records the native socket directory once and preserves it across selection in another environment', () => {
+    execFileSyncMock.mockReturnValue('zmx\t\t0.7.1\nsocket_dir\t/tmp/created zmx\n' as never);
+    const first = selectSessionBackend({
+      sessionId: 'abcdef12-1111-2222-3333-444444444444', backendType: 'zmx', hasExistingSession: false,
+    });
+    expect(first.persistentBackendTarget).toEqual({
+      backendType: 'zmx', sessionName: 'bmx-abcdef12', socketDir: '/tmp/created zmx',
+    });
+    vi.stubEnv('ZMX_DIR', '/tmp/other-zmx');
+    const resumed = selectSessionBackend({
+      sessionId: 'abcdef12-1111-2222-3333-444444444444', backendType: 'zmx', hasExistingSession: true,
+      persistentBackendTarget: first.persistentBackendTarget,
+    });
+    expect(resumed.persistentBackendTarget).toEqual(first.persistentBackendTarget);
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses new targets when zmx does not report an absolute socket directory', () => {
+    expect(parseZmxSocketDir('socket_dir\t/tmp/zmx with spaces\n')).toBe('/tmp/zmx with spaces');
+    for (const output of ['zmx 0.7.1', 'zmx 0.7.1\nsocket_dir relative', 'zmx 0.7.1\nsocket_dir /tmp/bad\0dir']) {
+      execFileSyncMock.mockReturnValue(output as never);
+      expect(() => resolveZmxSocketDir()).toThrow(/socket_dir/);
+    }
+  });
+
+  it('applies the stored socket address after payload stripping without changing TMPDIR', () => {
+    const opts = {
+      cwd: '/tmp', cols: 80, rows: 24,
+      env: { TMPDIR: '/tmp/caller', TMP: '/tmp/caller', TEMP: '/tmp/caller', ZMX_DIR: '/tmp/caller-zmx', ZMX_SESSION: 'outer' },
+      injectEnv: { ZMX_DIR: '/tmp/payload-zmx' },
+    };
+    const env = zmxControlEnv(opts, '/tmp/recorded-zmx');
+    expect(env.ZMX_DIR).toBe('/tmp/recorded-zmx');
+    expect(env.TMPDIR).toBe('/tmp/caller');
+    expect(env.TMP).toBe('/tmp/caller');
+    expect(env.TEMP).toBe('/tmp/caller');
+    expect(env.ZMX_SESSION).toBeUndefined();
+    expect(opts.env.ZMX_DIR).toBe('/tmp/caller-zmx');
+    expect(zmxFreshSessionEnv(opts, '/tmp/recorded-zmx').ZMX_DIR).toBe('/tmp/recorded-zmx');
+  });
+
   it('strips inherited session vars but preserves the socket dir', () => {
     const env = zmxEnv({
       PATH: '/bin',
@@ -367,6 +491,7 @@ describe('zmx backend pure helpers', () => {
         ZMX_SESSION_PREFIX: 'evil-',
         SAFE_FLAG: "yes ' quoted",
       },
+      launchShell: makeExecutableShell('sh'),
     };
     const bootstrapPath = '/tmp/private/bootstrap.sh';
     const payloadPath = '/tmp/private/payload.sh';
@@ -425,4 +550,159 @@ describe('zmx backend pure helpers', () => {
     expect(controlEnv.ZMX_SESSION).toBeUndefined();
     expect(controlEnv.PATH).toContain('/bin');
   });
+
+  it('pins TERM in the fresh-session create client env (zmx sessions inherit it verbatim)', () => {
+    const opts = {
+      cwd: '/tmp/work',
+      cols: 80,
+      rows: 24,
+      env: { PATH: '/bin', BOTMUX_SESSION_ID: 'session-secret' },
+    };
+    // No TERM inherited (the pm2-boundary scrub removed it from the
+    // daemon/worker env): the pin supplies the constant instead of leaving
+    // the whole session TERM-less — CLIs would fail supports-color detection
+    // and render colorless.
+    const env = zmxFreshSessionEnv(opts);
+    expect(env.TERM).toBe('xterm-256color');
+    // Still a control-env superset: payload-delivered keys stay stripped.
+    expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+    // An inherited invoker TERM is overridden by the same constant every
+    // other backend PTY already forces — deterministic, invoker-independent.
+    expect(zmxFreshSessionEnv({ ...opts, env: { PATH: '/bin', TERM: 'xterm-ghostty' } }).TERM)
+      .toBe('xterm-256color');
+    // That only the create client spawns with this env (control clients keep
+    // zmxControlEnv) is covered behaviorally in zmx-backend-recovery.test.ts.
+  });
+
+  it('keeps the POSIX ZMX payload path sourced through the user shell with the argv sentinel', () => {
+    const shShell = makeExecutableShell('sh');
+    const opts = {
+      cwd: '/tmp/posix-work',
+      cols: 80,
+      rows: 24,
+      env: { PATH: '/bin' },
+      launchShell: shShell,
+    };
+    const payloadPath = '/tmp/private/payload.sh';
+
+    const files = buildZmxLaunchFiles(
+      'codex',
+      ['--flag', 'private prompt'],
+      opts,
+      payloadPath,
+      '/tmp/private/ready',
+      '0123456789abcdef0123456789abcdef',
+      '/tmp/private/release',
+      'fedcba9876543210fedcba9876543210',
+    );
+
+    expect(files.payload).toContain('set -- ');
+    expect(files.payload).toContain('private prompt');
+    expect(files.bootstrap).toContain('. "$payload" || exit 126');
+    expect(files.bootstrap).toContain(payloadPath);
+  });
+
+  it('renders a fish-compatible ZMX payload without POSIX source or argv sentinel', () => {
+    const fishShell = makeExecutableShell('fish');
+    const opts = {
+      cwd: '/tmp/fish work',
+      cols: 80,
+      rows: 24,
+      env: {
+        PATH: '/bin',
+        BOTMUX_SESSION_ID: 'fish-session-secret',
+      },
+      injectEnv: {
+        SAFE_FLAG: "yes ' quoted",
+      },
+      launchShell: fishShell,
+    };
+    const payloadPath = '/tmp/private/payload.fish';
+
+    const files = buildZmxLaunchFiles(
+      'codex',
+      ['--flag', 'private prompt'],
+      opts,
+      payloadPath,
+      '/tmp/private/ready',
+      '0123456789abcdef0123456789abcdef',
+      '/tmp/private/release',
+      'fedcba9876543210fedcba9876543210',
+    );
+
+    expect(files.payload).toContain('set -g __botmux_zmx_argv ');
+    expect(files.payload).toContain('private prompt');
+    expect(files.payload).toContain('fish-session-secret');
+    expect(files.payload).not.toContain('set -- ');
+    expect(files.bootstrap).toContain(fishShell);
+    expect(files.bootstrap).toContain('cd -- $argv[1]; or exit');
+    expect(files.bootstrap).toContain('set argv $payload_argv');
+    expect(files.bootstrap).toContain('set -e argv[1]');
+    expect(files.bootstrap).toContain('exec /usr/bin/env $argv');
+    expect(files.bootstrap).not.toContain('. "$payload" || exit 126');
+    expect(files.bootstrap).not.toContain(`_ '${payloadPath}'`);
+  });
+
+  it.skipIf(!realFishShell)('executes generated fish launch files with cwd/env/argv from the payload', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-zmx-fish-live-'));
+    tempDirs.push(root);
+    const workDir = join(root, 'work dir');
+    const launchDir = join(root, 'launch');
+    mkdirSync(workDir);
+    mkdirSync(launchDir);
+    const bootstrapPath = join(launchDir, 'bootstrap.sh');
+    const payloadPath = join(launchDir, 'payload.fish');
+    const readyPath = join(launchDir, 'ready');
+    const releasePath = join(launchDir, 'release');
+    const releaseTempPath = join(launchDir, 'release.tmp');
+    const outputPath = join(root, 'cli-output.txt');
+    const readyNonce = '0123456789abcdef0123456789abcdef';
+    const releaseToken = 'fedcba9876543210fedcba9876543210';
+    const files = buildZmxLaunchFiles(
+      '/bin/sh',
+      [
+        '-c',
+        `printf 'PWD:%s\nSAFE:%s\nARG:%s\n' "$PWD" "$SAFE_FLAG" "$1" > '${outputPath}'`,
+        'cli-zero',
+        'fish-arg',
+      ],
+      {
+        cwd: workDir,
+        cols: 80,
+        rows: 24,
+        env: { PATH: '/usr/bin:/bin' },
+        injectEnv: { SAFE_FLAG: 'fish-safe' },
+        launchShell: realFishShell,
+      },
+      payloadPath,
+      readyPath,
+      readyNonce,
+      releasePath,
+      releaseToken,
+    );
+    writeFileSync(payloadPath, files.payload, { mode: 0o600 });
+    writeFileSync(bootstrapPath, files.bootstrap, { mode: 0o700 });
+
+    const child = spawn('/bin/sh', [bootstrapPath], {
+      cwd: root,
+      env: { PATH: '/usr/bin:/bin', HOME: root },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    // Starts at spawn: 5s readiness + 3s history grace + 2s execution/scheduler slack.
+    // The outer 12s test deadline leaves roughly 2s for assertions and cleanup.
+    const exitPromise = waitForExit(child, 10_000);
+    try {
+      await waitForFileContent(readyPath, `${readyNonce}\n`, 5000);
+      writeFileSync(releaseTempPath, `${releaseToken}\n`, { mode: 0o600, flag: 'wx' });
+      renameSync(releaseTempPath, releasePath);
+      const result = await exitPromise;
+
+      expect(result).toMatchObject({ code: 0 });
+      expect(result.stderr).not.toContain(payloadPath);
+      expect(readFileSync(outputPath, 'utf8')).toBe(`PWD:${workDir}\nSAFE:fish-safe\nARG:fish-arg\n`);
+      expect(existsSync(payloadPath)).toBe(false);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  }, 12_000);
 });

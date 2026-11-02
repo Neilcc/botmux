@@ -54,6 +54,10 @@ export interface FsPolicy {
    *  merge (fail-closed). Empty/absent otherwise. The worker LOGS these so a
    *  silently-suppressed grant is diagnosable (codex: "至少要记录被抑制项"). */
   suppressedAuthorityPaths?: string[];
+  /** Caller allow paths suppressed because they fall inside a daemon-owned
+   *  host-only root. Unlike ordinary mandatory denies, these roots permit no
+   *  deeper carve-out: a sandbox must never read or mutate their contents. */
+  suppressedHostOnlyPaths?: string[];
 }
 
 export interface FsPolicyUserPaths {
@@ -95,19 +99,41 @@ export interface FsPolicyContext {
   execPaths?: readonly string[];
   /** Trusted runtime read-only roots (skill/plugin dirs, botmux dist). */
   readonlyRoots?: readonly string[];
+  /** Read-only roots the daemon generated for THIS session under
+   *  sessionDataDir (runtime skill delivery dirs, Pi initial-prompt dir).
+   *  Unlike readonlyRoots they are NOT dropped for a no-transport turn, but only
+   *  when they pass the containment check in buildFsPolicy (inside
+   *  sessionDataDir, with a segment equal to this session's id). Never put
+   *  user-configured paths here — those belong in userPaths. */
+  sessionOwnedReadonlyRoots?: readonly string[];
   /** The botmux install/checkout root (dir containing dist/ + node_modules).
    *  Exposed readOnly so the agent's `botmux` CLI and the claude hooks (which
    *  exec `node <checkout>/dist/cli.js …`) can load — without this a sandboxed
    *  `botmux send` / SessionStart+AskUserQuestion hooks EPERM on cli.js. */
   botmuxInstallRoot?: string;
+  /** Paths under botmuxInstallRoot that are not part of the code (untracked /
+   *  ignored entries of a git checkout: `.env`, bots configs, login state,
+   *  `.git`, …; see install-root-masks.ts). Denied as MANDATORY rules unless
+   *  the caller itself grants that part of the checkout (a workingDir or user
+   *  path at/inside the install root — a bot working ON the checkout). */
+  botmuxInstallRootMaskPaths?: readonly string[];
   /** Daemon-mediated relay outbox (Linux) — readWrite. */
   outbox?: string;
   /** Extra writable roots (resolved TMPDIR, admin extras). */
   extraWritePaths?: readonly string[];
   /** Per-bot user config (bots.json sandboxPaths) — highest precedence. */
   userPaths?: FsPolicyUserPaths;
+  /** Per-adapter exact service-credential files. They are mandatory read-only
+   *  for normal turns, but no-transport turns suppress entries inside Feishu
+   *  authority roots before merge. Kept separate from mandatoryReadOnlyPaths:
+   *  capability/attestation/MCP grants in that channel may legitimately live
+   *  under botmux authority roots and must not be filtered wholesale. */
+  serviceCredentialReadOnlyPaths?: readonly string[];
   /** Host-owned boundaries that user policy may not override. */
   mandatoryDenyPaths?: readonly string[];
+  /** Host-only authority roots. Every allow path at or below one of these is
+   *  suppressed before longest-prefix merging, then the root is denied. */
+  hostOnlyDenyPaths?: readonly string[];
   mandatoryDenyRegexes?: readonly string[];
   mandatoryReadOnlyPaths?: readonly string[];
   net?: boolean;
@@ -126,7 +152,8 @@ export interface FsPolicyContext {
    *  authPaths (`~/.codex` etc.) are NOT Feishu creds and stay granted readWrite.
    *  Absent/true = normal behavior. */
   larkTransportEnabled?: boolean;
-  /** No-transport ONLY: the SECOND botmux authority root to freeze, when the
+  /** The SECOND botmux root to deny (transport sessions: as the botmux-root
+   *  ceiling; no-transport: as an authority root), when the
    *  daemon runs with a custom SESSION_DATA_DIR so `configuredBotmuxHome`
    *  (= dirname(dataDir), passed as `botmuxHome`) differs from the default
    *  `~/.botmux`. BOTH must be denied wholesale — the default root still holds
@@ -135,14 +162,40 @@ export interface FsPolicyContext {
    *  when equal to `botmuxHome`. MUST be canonical + host-frozen (never derived
    *  from agent-controllable env). */
   defaultBotmuxHome?: string;
-  /** No-transport ONLY: the ACTUAL loaded bots-config path, frozen by the daemon
+  /** Whether `botmuxHome` (dirname of the data dir) is a real botmux home —
+   *  false for a degenerate parent such as $HOME or / (SESSION_DATA_DIR=$HOME/data
+   *  or /data), decided by the worker with plausibleConfiguredBotmuxHome. Transport
+   *  sessions then deny only `<botmuxHome>/bots` + the data dir instead of the
+   *  whole parent. Absent = true. */
+  botmuxHomePlausible?: boolean;
+  /** The ACTUAL loaded bots-config path, frozen by the daemon
    *  (`getLoadedConfigPath()`), NOT guessed from BOTS_CONFIG env by the worker.
+   *  Transport sessions deny it by exact path. For no-transport turns:
    *  When it lives INSIDE a frozen authority root the parent mask already covers
    *  it (no extra rule needed). When it lives OUTSIDE every authority root,
    *  buildFsPolicy THROWS {@link FsPolicyConfigError} — a no-transport turn must
    *  not silently mask an arbitrary parent dir (`/tmp`, `/etc`, a project root),
    *  which would break the core CLI (codex P1). Absent = default `~/.botmux/bots.json`. */
   loadedBotsConfigPath?: string;
+  /** LINUX ONLY: the CANONICAL lark-cli data store dir that holds EVERY bot's
+   *  `appsecret_<appId>.enc` + the shared `master.key` (the Linux analogue of the
+   *  macOS `~/Library/Application Support/lark-cli` keystore). lark-cli resolves it
+   *  to `${LARKSUITE_CLI_DATA_DIR}/lark-cli` (when that env var is ABSOLUTE) else
+   *  `$HOME/.local/share/lark-cli` — it does NOT consult XDG_DATA_HOME (verified by
+   *  strace on v1.0.76). So it is NOT purely a function of homeDir. The worker
+   *  resolves it from the FROZEN host env (`resolveLarkCliLinuxStoreDir`) and
+   *  canonicalizes it (this fn stays pure — it must never read env). Under the
+   *  baseline `ro(~/.local/share)` grant the whole store is otherwise exposed
+   *  read-only → a sandboxed bot could read its SIBLINGS' ciphertext + the shared
+   *  master key and impersonate them (the pre-refactor cross-bot leak macOS already
+   *  closes). buildFsPolicy DENIES the store and, for a transport-enabled turn,
+   *  re-opens ONLY this bot's own `master.key` + `appsecret_<currentAppId>.enc`
+   *  read-only at a deeper path (longest-prefix-wins), mirroring the darwin carve-out.
+   *  A no-transport turn freezes it as an authority root with NO carve-out. Absent on
+   *  Linux → falls back to the default `${homeDir}/.local/share/lark-cli` (correct
+   *  whenever LARKSUITE_CLI_DATA_DIR is unset/relative — the common case — and still
+   *  protective otherwise). Ignored on darwin. */
+  larkCliLinuxStore?: string;
 }
 
 /** Normalize: require absolute, strip trailing slashes, reject `..` segments.
@@ -328,7 +381,16 @@ function commonHomeBaseline(h: string): FsRule[] {
     // Scratch/caches every CLI + spawned tool needs.
     rw(`${h}/.cache`), rw(`${h}/.npm`), rw(`${h}/.local/state`),
     // The daemon-written botmux wrapper (head of PATH) + skill plugin dir.
-    ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`),
+    ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`), ro(`${h}/.botmux/cursor-plugin`),
+    // Installed-plugin registry. Secret-free BY CONTRACT: `assertPublicPluginRegistry`
+    // refuses to persist a record carrying `command`/`env`/`url`/`headers`, and a
+    // plugin's real MCP descriptor lives in its own `private/mcp.json` — which stays
+    // denied with the rest of `~/.botmux`. Without this hole a sandboxed bot cannot
+    // answer "which plugins am I running": `botmux plugin list` EPERMs before it reads
+    // anything, because the registry read serializes on a lock file next to the
+    // registry (`plugins-registry.json.lock`) under a deny-by-default `~/.botmux`.
+    // Read-only is the whole grant — install/enable stay host-side operations.
+    ro(`${h}/.botmux/plugins-registry.json`),
     // Crown jewels — most are already unreachable via deny-by-default; these
     // explicit denies guard the ones that could fall under an allowed tree
     // (workingDir = $HOME, a broad user readOnly, …). Defence-in-depth.
@@ -387,6 +449,16 @@ function linuxBaseline(h: string): FsRule[] {
   ];
 }
 
+/** Host credential trees the baseline preset DENIES for `homeDir` (crown jewels:
+ *  ~/.ssh, ~/.aws, ~/.netrc, toolchain tokens, ~/.lark-cli, macOS keychains …).
+ *  Exported so daemon-side code that COPIES host content into a sandbox-readable
+ *  place (session skill snapshots, core/skills/snapshot.ts) refuses the very same
+ *  trees — one source of truth for "what is a host secret". Pure. */
+export function baselineDeniedHostPaths(platform: 'darwin' | 'linux', homeDir: string): string[] {
+  const base = platform === 'darwin' ? darwinBaseline(homeDir) : linuxBaseline(homeDir);
+  return base.filter(rule => rule.access === 'deny').map(rule => rule.path);
+}
+
 // ───────────────────────────── policy assembly ───────────────────────────────
 
 /**
@@ -399,12 +471,123 @@ function linuxBaseline(h: string): FsRule[] {
  * fail-closed, never fail-open (codex P1). Carries `.kind` so callers/tests can
  * branch without string-matching the message. */
 export class FsPolicyConfigError extends Error {
-  readonly kind: 'external-bots-config' | 'working-dir-is-authority' | 'bots-config-in-carveout';
+  readonly kind:
+    | 'external-bots-config'
+    | 'working-dir-is-authority'
+    | 'working-dir-in-botmux-home'
+    | 'working-dir-is-host-only'
+    | 'bots-config-in-carveout';
   constructor(kind: FsPolicyConfigError['kind'], message: string) {
     super(message);
     this.name = 'FsPolicyConfigError';
     this.kind = kind;
   }
+}
+
+/**
+ * The Linux lark-cli keystore dir. lark-cli stores keys at
+ * `${LARKSUITE_CLI_DATA_DIR}/lark-cli` (absolute) else `$HOME/.local/share/lark-cli`.
+ * The worker resolves the real (env-aware, cleaned) path via
+ * resolveLarkCliLinuxStoreDir + a nearest-existing-ancestor canonicalize, passing
+ * it as `override`; when absent this falls back to the default under homeDir. PURE
+ * — never reads env (that would break single-testability). Exported so the worker's
+ * real assembly and the unit matrix share ONE resolver.
+ *
+ * `override` is expected to already be lexically clean (resolveLarkCliLinuxStoreDir
+ * Cleans it); a defensive normalizeFsPath still rejects a `..`-bearing value — but
+ * that must NEVER silently fall back to the default store (the pitfall this guards: the
+ * default gets denied while the real `..`-cleaned store lark-cli reads stays exposed).
+ * So a non-null-but-unnormalizable override returns null → the caller (buildFsPolicy)
+ * emits NO Linux carve-out, and the store stays denied-by-default rather than
+ * mis-anchored. In practice the worker always Cleans first, so this path is defensive.
+ */
+export function larkCliLinuxStorePath(homeDir: string, override?: string): string | null {
+  if (override) return normalizeFsPath(override); // may be null → no carve-out (never silent default fallback)
+  return normalizeFsPath(`${homeDir}/.local/share/lark-cli`);
+}
+
+/**
+ * The CANONICAL lark-cli data root to pin into the sandbox child as
+ * LARKSUITE_CLI_DATA_DIR, given the fully-canonical keystore dir the policy protects
+ * (`canonStore` = worker's larkCliLinuxStore, leaf symlinks already followed). The
+ * in-sandbox lark-cli opens `<pin>/lark-cli`, so the pin must be `dirname(canonStore)`
+ * — but that is same-source with the policy-protected store ONLY when the canonical
+ * store's basename is still `lark-cli` (the common case, incl. a symlink that resolves
+ * to another dir also named `lark-cli`). If the `lark-cli` leaf was a symlink to a
+ * DIFFERENTLY-named dir (basename !== 'lark-cli'), `<dirname>/lark-cli` would NOT equal
+ * canonStore, so pinning it would point the child at an unbound/foreign path. There is
+ * no leak either way (the policy denies the real store, and both candidate stores are
+ * locked), so return null → the worker pins nothing and the child falls back to the
+ * default store (also locked). Pure + total. (handles the symlinked keystore leaf case.)
+ */
+export function larkCliChildDataRoot(canonStore: string | null | undefined): string | null {
+  const s = canonStore ? normalizeFsPath(canonStore) : null;
+  if (!s || s === '/') return null;
+  const lastSlash = s.lastIndexOf('/');
+  const base = s.slice(lastSlash + 1);
+  if (base !== 'lark-cli') return null; // symlinked-leaf to a different name → degrade safely
+  return s.slice(0, lastSlash) || '/';
+}
+
+/**
+ * Lexically clean an ABSOLUTE POSIX path the way Go's `filepath.Clean` does
+ * (resolve `.`/`..` segments, collapse `//`, drop trailing `/`, clamp `..` at root)
+ * — WITHOUT touching the filesystem. Returns null for a non-absolute input or one
+ * containing NUL / control chars (lark-cli's `SafeEnvDirPath` rejects those). This
+ * mirrors lark-cli's own env-path handling so the policy anchors the SAME dir the
+ * in-sandbox CLI will open (a `..`-bearing `LARKSUITE_CLI_DATA_DIR` is
+ * Clean'd by lark-cli to a real store, but an un-cleaned policy path was rejected by
+ * normalizeFsPath and silently fell back to the default — leaving the real store
+ * exposed). Pure + total.
+ */
+export function cleanPosixAbsPath(p: string): string | null {
+  if (!p || typeof p !== 'string' || !p.startsWith('/')) return null;
+  // Reject control chars (0x00–0x1F, 0x7F) — lark-cli's validator treats them as
+  // invalid → falls back to $HOME; matching keeps policy == CLI.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(p)) return null;
+  const out: string[] = [];
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { out.pop(); continue; } // clamp at root (Go filepath.Clean semantics)
+    out.push(seg);
+  }
+  return '/' + out.join('/');
+}
+
+/**
+ * Resolve the lark-cli Linux store dir BEFORE canonicalization, replicating
+ * lark-cli's OWN resolution (`internal/keychain/keychain_other.go::StorageDir` +
+ * `SafeEnvDirPath`, verified by strace against v1.0.76): the keystore dir is
+ * `<clean(LARKSUITE_CLI_DATA_DIR)>/lark-cli` when `LARKSUITE_CLI_DATA_DIR` is a VALID
+ * ABSOLUTE path (lexically Cleaned — `..`/`.`/`//` resolved, control chars rejected),
+ * else `$HOME/.local/share/lark-cli`. lark-cli does NOT consult `XDG_DATA_HOME` for
+ * the keystore at all (strace: setting it has zero effect), and it IGNORES a relative
+ * / tilde / empty / control-char `LARKSUITE_CLI_DATA_DIR` (spec-invalid → falls back
+ * to $HOME). PURE (exported so the "absolute-cleaned / relative-ignored / unset /
+ * `..`-cleaned / control-char-rejected" matrix is unit-locked against strace).
+ *
+ * CRITICAL: the `..` Clean must happen HERE, lexically, so the returned
+ * path is already normalized (no `..`) — otherwise the worker's realpath throws on a
+ * not-yet-existent store leaf, keeps the raw `..` path, normalizeFsPath rejects it,
+ * and the policy silently anchors the DEFAULT store while lark-cli (which Cleans)
+ * opens the real one → the real store stays exposed.
+ *
+ * The worker passes `process.env.LARKSUITE_CLI_DATA_DIR` + the (lexical) home, then
+ * nearest-existing-ancestor `canonical()`s the result (a full-path realpath would
+ * throw on the nonexistent leaf), and hands it to buildFsPolicy as `larkCliLinuxStore`.
+ * This is the AUTHORITATIVE value the in-sandbox lark-cli reads: bwrap has NO
+ * `--clearenv`, so the sandboxed child INHERITS `LARKSUITE_CLI_DATA_DIR` from the
+ * worker's process env (redactChildEnv doesn't strip it), and the sandbox pins the
+ * child's value to the SAME cleaned resolution (`--setenv`/`--unsetenv` in sandbox.ts)
+ * so policy == CLI by construction.
+ */
+export function resolveLarkCliLinuxStoreDir(rawDataDir: string | undefined, homeDir: string): string {
+  const cleaned = rawDataDir ? cleanPosixAbsPath(rawDataDir) : null;
+  const base = cleaned ?? `${homeDir}/.local/share`;
+  // Strip a trailing slash so a root base ('/') doesn't yield '//lark-cli' (the only
+  // case that produces one — cleanPosixAbsPath returns '/' when all segments pop).
+  return `${base === '/' ? '' : base}/lark-cli`;
 }
 
 /**
@@ -418,7 +601,10 @@ export class FsPolicyConfigError extends Error {
  *    HMAC + bots.json, so denying only one leaves the sibling-daemon escalation
  *    open (codex P1).
  *  - freezes the lark-cli identity/key stores: bare `~/.lark-cli` (repo marks it
- *    sensitive), `~/.lark-cli-bots`, macOS lark-cli store.
+ *    sensitive), `~/.lark-cli-bots`, macOS lark-cli store, AND the Linux lark-cli
+ *    keystore (`$HOME/.local/share/lark-cli` or `<LARKSUITE_CLI_DATA_DIR>/lark-cli` — every bot's
+ *    appsecret ciphertext + the shared master key; on Linux a no-transport turn
+ *    must get NO carve-out into it, unlike the transport-enabled own-key carve-out).
  *  - the loaded bots-config path: OUTSIDE every root → THROW here (fail-closed);
  *    never mask its parent dir. Being INSIDE a root is necessary but NOT
  *    sufficient — a deeper trusted carve-out (own BOT_HOME / bin / attachments /
@@ -427,10 +613,12 @@ export class FsPolicyConfigError extends Error {
  *    to `deny`, else throws `bots-config-in-carveout` (codex P1).
  */
 export function computeNoTransportAuthorityRoots(input: {
+  platform: 'darwin' | 'linux';
   homeDir: string;
   botmuxHome: string;
   defaultBotmuxHome?: string;
   loadedBotsConfigPath?: string;
+  larkCliLinuxStore?: string;
 }): string[] {
   const roots = [...new Set([
     input.botmuxHome,
@@ -438,6 +626,19 @@ export function computeNoTransportAuthorityRoots(input: {
     `${input.homeDir}/.lark-cli`,
     `${input.homeDir}/.lark-cli-bots`,
     `${input.homeDir}/Library/Application Support/lark-cli`,
+    // Linux keystore — BOTH candidate stores frozen (no own-key carve-out; transport-only).
+    // lark-cli opens either `<resolved>/lark-cli` (custom LARKSUITE_CLI_DATA_DIR accepted) or
+    // the default `$HOME/.local/share/lark-cli` (rejected/unset); a no-transport turn must
+    // deny WHICHEVER, without depending on matching lark-cli's env-value validator.
+    // LINUX-ONLY: macOS lark-cli uses the `Library/Application Support/lark-cli` store above,
+    // NOT `~/.local/share/lark-cli`. Freezing the Linux paths on darwin is NOT a no-op — it
+    // adds an authority root that would change darwin behavior (e.g. a no-transport
+    // workingDir=~/.local/share/lark-cli would newly fail `working-dir-is-authority`). So
+    // gate strictly on platform to keep darwin byte-identical to pre-refactor.
+    ...(input.platform === 'linux' ? [
+      `${input.homeDir}/.local/share/lark-cli`,
+      ...(() => { const s = larkCliLinuxStorePath(input.homeDir, input.larkCliLinuxStore); return s ? [s] : []; })(),
+    ] : []),
   ])].map(normalizeFsPath).filter((r): r is string => !!r);
   const cfg = input.loadedBotsConfigPath ? normalizeFsPath(input.loadedBotsConfigPath) : null;
   if (cfg && !roots.some(root => coversPath(root, cfg))) {
@@ -459,9 +660,33 @@ export function computeNoTransportAuthorityRoots(input: {
  */
 export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
+  const hostOnlyRoots = [
+    `${ctx.sessionDataDir}/link-refs`,
+    ...(ctx.hostOnlyDenyPaths ?? []),
+  ]
+    .map(normalizeFsPath)
+    .filter((p): p is string => p !== null);
+  const suppressedHostOnlyPaths: string[] = [];
+  const insideHostOnlyRoot = (p: string): boolean => hostOnlyRoots.some(root => coversPath(root, p));
   const push = (paths: readonly string[] | undefined, access: FsAccess, source: FsRuleSource) => {
-    for (const p of paths ?? []) candidates.push({ path: p, access, source });
+    for (const p of paths ?? []) {
+      const normalized = normalizeFsPath(p);
+      if (access !== 'deny' && normalized && insideHostOnlyRoot(normalized)) {
+        suppressedHostOnlyPaths.push(normalized);
+        continue;
+      }
+      candidates.push({ path: p, access, source });
+    }
   };
+
+  const hostOnlyWorkingDir = normalizeFsPath(ctx.workingDir);
+  if (hostOnlyWorkingDir && insideHostOnlyRoot(hostOnlyWorkingDir)) {
+    throw new FsPolicyConfigError(
+      'working-dir-is-host-only',
+      `sandbox refuses workingDir ${hostOnlyWorkingDir}: it is inside daemon-owned host-only root `
+      + `${hostOnlyRoots.join(', ')}`,
+    );
+  }
 
   // No-Lark-transport credential profile: a core-only (apiOnly) bot or HTTP
   // virtual session must never be handed any Feishu credential, even under a
@@ -479,15 +704,27 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // computeNoTransportAuthorityRoots freezes BOTH the configured + default botmux
   // roots and THROWS on an external bots-config (fail-closed, never silent-mask).
   const authorityRoots = larkTransport ? [] : computeNoTransportAuthorityRoots({
+    platform: ctx.platform,
     homeDir: ctx.homeDir,
     botmuxHome: ctx.botmuxHome,
     defaultBotmuxHome: ctx.defaultBotmuxHome,
     loadedBotsConfigPath: ctx.loadedBotsConfigPath,
+    larkCliLinuxStore: ctx.larkCliLinuxStore,
   });
-  // A path is authority-restricted when it's inside an authority root but NOT
-  // inside the bot's own BOT_HOME (which is legitimately re-allowed).
+  // A path is authority-restricted when SOME authority root covers it — EXCEPT the
+  // bot's own BOT_HOME carve-out (legitimately re-allowed deeper, minus send-cred).
+  // That exception is scoped PER-ROOT: it fires only for a root that is an ANCESTOR
+  // of BOT_HOME (the botmux root, of which BOT_HOME is a re-allowed subtree). An
+  // authority root NESTED INSIDE BOT_HOME — e.g. the lark-cli keystore when a
+  // deployment sets LARKSUITE_CLI_DATA_DIR into BOT_HOME so the store resolves to
+  // `<BOT_HOME>/lark-cli` — is MORE SPECIFIC than the BOT_HOME carve-out and must
+  // STILL restrict, or a deeper hostile user RW under the nested store escapes
+  // dropAuthority and re-opens `master.key`/sibling appsecrets. So for
+  // each root the BOT_HOME exception applies only when that root is an ancestor of
+  // BOT_HOME AND p is inside BOT_HOME; a root at/under BOT_HOME keeps restricting.
   const insideAuthority = (p: string): boolean =>
-    authorityRoots.some(root => coversPath(root, p)) && !coversPath(ctx.botHome, p);
+    authorityRoots.some(root =>
+      coversPath(root, p) && !(root !== ctx.botHome && coversPath(root, ctx.botHome) && coversPath(ctx.botHome, p)));
   // Dropped caller allow paths are RECORDED so the worker can log the suppression
   // (codex: a silently-dropped grant is a diagnosability hole).
   const suppressedAuthorityPaths: string[] = [];
@@ -498,6 +735,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       if (insideAuthority(n)) { suppressedAuthorityPaths.push(n); return false; }
       return true;
     });
+  const serviceCredentialReadOnlyPaths = dropAuthority(ctx.serviceCredentialReadOnlyPaths);
 
   // workingDir is the CLI's cwd — it MUST be granted, so we cannot silently drop
   // it. A workingDir that IS (or is inside) a Feishu-authority root — own BOT_HOME
@@ -518,15 +756,68 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     }
   }
 
+  // Transport-enabled sessions: the botmux roots are a CEILING, not merely
+  // "uncovered". With a project workingDir they are unreachable anyway
+  // (deny-by-default), but a workingDir (or another broad grant) that is an
+  // ANCESTOR of a root — workingDir=~, the default when none is configured —
+  // used to re-open the whole tree readWrite: bots.json, .dashboard-secret,
+  // sibling BOT_HOMEs and their send-cred.json. The roots are denied as
+  // MANDATORY rules below and every legitimate surface (own BOT_HOME, bin,
+  // plugin dirs, own session files, …) is re-allowed at a deeper path exactly
+  // as in the uncovered case, so the agent sees the same ~/.botmux either way.
+  // A workingDir AT or INSIDE a denied region (other than inside its own
+  // BOT_HOME) would sit beside or below the deny with nothing left to protect
+  // it — refuse that layout instead of half-confining it.
+  //
+  // `botmuxHome` is dirname(SESSION_DATA_DIR), which is a real botmux home only
+  // in the standard / custom-instance layouts. With SESSION_DATA_DIR=$HOME/data
+  // or /data it is $HOME or /, and with <checkout>/data it is the install root
+  // itself (whose read-only grant a same-path deny would override). For such a
+  // degenerate parent the ceiling narrows to the two botmux-owned entries in
+  // it: `<parent>/bots` (BOT_HOMEs) and the session data dir. The default
+  // `~/.botmux` is a botmux home by definition and always gets the full ceiling.
+  const installRootPath = ctx.botmuxInstallRoot ? normalizeFsPath(ctx.botmuxInstallRoot) : null;
+  const configuredHome = normalizeFsPath(ctx.botmuxHome);
+  const defaultHome = ctx.defaultBotmuxHome ? normalizeFsPath(ctx.defaultBotmuxHome) : null;
+  const configuredIsHome = configuredHome !== null
+    && (configuredHome === defaultHome
+      || (ctx.botmuxHomePlausible !== false && configuredHome !== installRootPath));
+  const botmuxRoots = larkTransport
+    ? [...new Set([configuredIsHome ? configuredHome : null, defaultHome].filter((p): p is string => p !== null))]
+    : [];
+  // A narrowed entry that contains the default botmux home (a data dir AT
+  // $HOME, as some test harnesses set) is not botmux-owned either: denying it
+  // would hide the whole home, CLI binaries and auth dirs included. The
+  // default home under it keeps its own full ceiling.
+  const narrowedBotmuxDenies = larkTransport && configuredHome !== null && !configuredIsHome
+    ? [`${configuredHome === '/' ? '' : configuredHome}/bots`, normalizeFsPath(ctx.sessionDataDir)]
+      .filter((p): p is string => p !== null
+        && !botmuxRoots.some(root => coversPath(root, p))
+        && !(defaultHome !== null && coversPath(p, defaultHome)))
+    : [];
+  if (larkTransport) {
+    const wd = normalizeFsPath(ctx.workingDir);
+    const ownHome = normalizeFsPath(ctx.botHome);
+    const denied = [...botmuxRoots, ...narrowedBotmuxDenies];
+    if (wd !== null && denied.some(root => coversPath(root, wd)) && !(ownHome && coversPath(ownHome, wd))) {
+      throw new FsPolicyConfigError(
+        'working-dir-in-botmux-home',
+        `sandbox refuses workingDir ${wd}: it lives inside the botmux data directory `
+        + `(${denied.join(', ')}), which holds every bot's credentials; choose a project `
+        + `directory outside it (or the bot's own BOT_HOME).`,
+      );
+    }
+  }
+
   // Hoisted into a named const (vs the upstream inline `candidates.push(...)`)
   // because roleLibAccess() below inspects baseline's DENY entries.
   const baseline = ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir);
-  candidates.push(...baseline);
+  for (const rule of baseline) push([rule.path], rule.access, rule.source);
 
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
   // authPaths = the model CLI's OWN login/state surface (~/.codex, ~/.claude
-  // credentials, Seed/bytedcli SSO, Gemini OAuth, OpenCode DB, …) — NOT Feishu.
+  // credentials, Seed/bytedcli SSO, Antigravity OAuth, OpenCode DB, …) — NOT Feishu.
   // These MUST stay granted even for a no-transport turn, else the CLI can't
   // authenticate and the core functionality breaks. The no-Lark-transport gate
   // only denies Feishu-authority paths (below), never the CLI's own auth.
@@ -607,13 +898,61 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
   push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
-  // Own routing metadata (`botmux send` reply routing) — read-only.
-  push([`${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`], 'readOnly', 'internal');
+  // Session-owned read-only roots: directories the daemon generated for THIS
+  // session under the botmux data dir (runtime skill delivery, Pi's long
+  // initial prompt). They carry no Feishu credential, so they skip
+  // dropAuthority — a no-transport turn would otherwise drop them and the CLI
+  // could not read its own skills / prompt. Defense in depth: a path is exempt
+  // only if it sits strictly inside sessionDataDir AND one of its segments is
+  // this session's id; anything else falls back to the ordinary readonlyRoots
+  // treatment (fail-closed for no-transport).
+  const sessionRoot = normalizeFsPath(ctx.sessionDataDir);
+  const isSessionOwned = (raw: string): boolean => {
+    const p = normalizeFsPath(raw);
+    if (!ctx.sessionId || !p || !sessionRoot || p === sessionRoot || !coversPath(sessionRoot, p)) return false;
+    return p.slice(sessionRoot.length + 1).split('/').includes(ctx.sessionId);
+  };
+  const sessionOwned = ctx.sessionOwnedReadonlyRoots ?? [];
+  push(sessionOwned.filter(isSessionOwned), 'readOnly', 'internal');
+  push(dropAuthority(sessionOwned.filter(p => !isSessionOwned(p))), 'readOnly', 'internal');
+  // Own routing metadata (`botmux send` reply routing) — read-only. The store
+  // is SQLite in its own per-bot DIRECTORY: the dir grant is deliberate — a
+  // single-file bwrap bind pins the inode, and SQLite deletes/recreates
+  // -wal/-shm across daemon restarts, so a persistent pane with file binds
+  // would keep reading the dead WAL forever. A directory bind resolves names
+  // live. Sibling bots' store dirs stay uncovered (deny-by-default).
+  //
+  push([
+    `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
+  ], 'readOnly', 'internal');
   // Own upload bucket — readWRITE: `botmux quoted` / downloadResources writes the
   // downloaded attachment under attachments/<self>/<messageId>/… (not just reads
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
   // existence-filter and gets bound rw. Siblings' buckets stay uncovered.
   push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], 'readWrite', 'internal');
+  // Own per-turn hook context（UserPromptSubmit sidecar，#794）——read-only。
+  // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
+  // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
+  if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
+  // Trigger-user CLI identity surface (this session ONLY).
+  //
+  // In the proven model the daemon keeps token material in its own memory and
+  // hands it to the wrapper over the loopback process-proof channel, so this
+  // directory holds no tokens at all — only the wrapper binaries, shell shims
+  // and the active-turn marker. In the single-snapshot model it additionally
+  // holds the one per-tool `<tool>.env` file the daemon overwrites each turn.
+  //
+  // Granted per session directory, never the `cli-identity/` parent: that
+  // directory holds every concurrent session's identity surface. A parent
+  // grant would let one session read another's — the exact cross-person leak
+  // this feature exists to prevent — and it would fail OPEN for sessions
+  // created after spawn.
+  //
+  // Read-only by construction: the daemon writes here, the CLI must never be
+  // able to. Writable would let an agent publish its own identity.
+  if (ctx.sessionId && larkTransport) {
+    push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
+  }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.
   if (larkTransport) push([`${ctx.homeDir}/.lark-cli-bots/${ctx.currentAppId}`], 'readWrite', 'internal');
@@ -637,6 +976,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/.dashboard-port`,    // dashboard port (owner term-link; harmless port int)
     `${bh}/bin`,                // the daemon-written `botmux` wrapper (head of PATH)
     `${bh}/claude-plugin`,      // skill/plugin dir (claude --plugin-dir); no secrets
+    `${bh}/cursor-plugin`,      // skill/plugin dir (cursor --plugin-dir); no secrets
+    `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
+    `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets
     `${bh}/lark-scopes.json`,   // static scope catalog
     // dashboard-daemons (sibling IPC port table) is the discovery half of the
     // trusted-host escalation — a no-transport turn must NOT get it (paired with
@@ -645,7 +987,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     ...(larkTransport ? [`${sd}/dashboard-daemons`] : []),
     `${sd}/bots-info.json`,     // bot display names / avatars for <available_bots> + recipient rendering
     `${sd}/bot-openids-${app}.json`,  // OWN routing cross-ref (sibling ones stay denied)
-    // own sessions-<self>.json + attachments/<self> already pushed above (readOnly)
+    // own session-stores/<self> + attachments/<self> already pushed above (readOnly)
   ], 'readOnly', 'internal');
   // turn-sends: the CLI APPENDS its OWN dedup marker to
   // `turn-sends/<sessionId>.jsonl` (write, not read). Grant the SINGLE file, not
@@ -655,6 +997,29 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // worker PRE-CREATES this file before spawn so it survives the existence
   // filter and bwrap can bind it (bwrap cannot bind a nonexistent source).
   if (ctx.sessionId) push([`${sd}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+  // ready-signal 诊断轨迹（dsh-tui wrapper 插件在沙盒内 append）：同 turn-sends 形态，
+  // 只授本会话的**单个文件**（路径常量见 services/ready-signal-log.ts，此处按本模块的
+  // "no imports / pure" 约定内联）。append-only + 写满时 in-place 截断（保 inode），所以
+  // 单文件 bind 有效；worker 预创建文件与父目录（bwrap 不能 bind 不存在的源）。共享根与
+  // 兄弟会话保持 deny-by-default —— 这份轨迹含会话标识与派发结果，不该跨会话可读可写。
+  if (ctx.sessionId) push([`${sd}/ready-signal/${ctx.sessionId}.log`], 'readWrite', 'internal');
+  // Cursor stop hook appends only its own usage journal (no sibling writes).
+  if (ctx.sessionId) push([`${sd}/cursor-usage/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+  // statusline: `botmux statusline` (Claude's statusLine.command, run INSIDE the
+  // sandbox) atomically writes `statusline/<sessionId>/latest.json`. Atomic
+  // write = tmp + rename in the parent dir, so a single-file grant (as for
+  // turn-sends) cannot work — grant the per-session DIRECTORY instead. Still
+  // session-scoped: sibling sessions' dirs are not exposed. The worker
+  // pre-creates the dir so bwrap has a bind source.
+  if (ctx.sessionId) push([`${sd}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
+  // turn-send-ledger: `botmux send` keeps its per-turn final-answer fence in
+  // `turn-send-ledger/<sessionId>/<hash>.json` (atomic tmp+rename plus a
+  // sibling `.lock`), so — like statusline — grant the per-session DIRECTORY.
+  // Never the shared root: it holds every session's fence, and write access
+  // there would let one session forge "final already sent" for another (its
+  // answer is then refused) or delete a record (its retry then duplicates).
+  // The worker pre-creates the dir so bwrap has a bind source.
+  if (ctx.sessionId) push([`${sd}/turn-send-ledger/${ctx.sessionId}`], 'readWrite', 'internal');
   // (schedules: stored PER BOT inside each BOT_HOME — the owner's dir is
   // already readWrite above and siblings' stores are denied by construction,
   // so the old shared data/schedules.json grant (and the cross-bot task-prompt
@@ -668,12 +1033,47 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // operation not permitted"). Re-allow ONLY those two, read-only, at a DEEPER
   // path than the deny so longest-prefix-wins. Siblings' `appsecret_*.enc` and
   // user tokens stay denied → the master key alone can't decrypt what it can't
-  // read (verified: sibling ciphertext still DENIED). Linux keeps its keys in the
-  // per-bot `.lark-cli-bots/<self>` dir (already readWrite above), so this is
-  // darwin-only.
+  // read (verified: sibling ciphertext still DENIED).
   if (ctx.platform === 'darwin' && larkTransport) {
     const larkStore = `${ctx.homeDir}/Library/Application Support/lark-cli`;
     push([`${larkStore}/master.key.file`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+  }
+  // LINUX lark-cli key store — SAME cross-bot leak, SAME carve-out (was missing).
+  // lark-cli on Linux writes keys to `<LARKSUITE_CLI_DATA_DIR>/lark-cli` (when that env
+  // var is a valid absolute path) else `$HOME/.local/share/lark-cli` — NOT the per-bot
+  // `.lark-cli-bots/<self>` dir (that only holds config.json; secrets land in the shared
+  // data store — verified on lark-cli 1.0.56/1.0.76). The linuxBaseline `ro(~/.local/share)`
+  // grant exposed EVERY bot's `appsecret_*.enc` + the shared `master.key` read-only to any
+  // sandboxed bot — a cross-bot impersonation hole macOS already closed. Mirror the darwin
+  // fix: DENY the whole store (deeper than `~/.local/share` so longest-prefix wins), then
+  // re-open ONLY this bot's own `master.key` (Linux name — NOT darwin's `master.key.file`)
+  // + `appsecret_<self>.enc` read-only at a deeper path.
+  //
+  // TWO candidate stores, BOTH locked (lark-cli's env-value validator —
+  // control chars / bidi / BOM rejection — is not perfectly replicable, so we do NOT try
+  // to predict WHICH store it picks). lark-cli opens EITHER `<clean(env)>/lark-cli` (value
+  // accepted) OR the default `$HOME/.local/share/lark-cli` (value rejected/unset/relative).
+  // Denying both + carving own keys in both means: whichever lark-cli opens, siblings +
+  // master stay denied (no leak) and this bot's own keys are readable (auth works) — with
+  // ZERO dependence on matching lark-cli's char validator. Deduped when equal (common case:
+  // no custom LARKSUITE_CLI_DATA_DIR → resolved == default → one store). `deny` tagged
+  // `mandatory` (not `baseline` like darwin's): see the rank-collision note in the loop.
+  // No-transport denies both stores wholesale via authorityRoots and gets NO carve-out.
+  if (ctx.platform === 'linux' && larkTransport) {
+    const stores = new Set<string>();
+    const resolved = larkCliLinuxStorePath(ctx.homeDir, ctx.larkCliLinuxStore);
+    if (resolved) stores.add(resolved);
+    const dflt = normalizeFsPath(`${ctx.homeDir}/.local/share/lark-cli`);
+    if (dflt) stores.add(dflt);
+    for (const larkStore of stores) {
+      // `mandatory` (not `baseline`): if a deployment wires the store onto BOT_HOME
+      // itself (store === botHome — e.g. appId 'lark-cli' + LARKSUITE_CLI_DATA_DIR=<botmuxHome>/bots),
+      // the internal BOT_HOME readWrite grant lands on the SAME path and would otherwise
+      // outrank this deny by source rank (internal 2 > baseline 0), re-opening the whole
+      // keystore rw. mandatory (4) keeps the ceiling; the deeper own-key carve-outs still win by depth.
+      push([larkStore], 'deny', 'mandatory');
+      push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+    }
   }
 
   // User config — highest precedence.
@@ -685,7 +1085,43 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(dropAuthority(ctx.userPaths?.readOnly), 'readOnly', 'user');
   push(ctx.userPaths?.deny, 'deny', 'user');
   push(ctx.mandatoryDenyPaths, 'deny', 'mandatory');
+  // Botmux-root ceiling for transport sessions (see botmuxRoots above). The
+  // loaded bots config is denied by exact path too: BOTS_CONFIG may point
+  // outside the roots (e.g. into the botmux checkout or a project dir).
+  push(botmuxRoots, 'deny', 'mandatory');
+  push(narrowedBotmuxDenies, 'deny', 'mandatory');
+  if (larkTransport && ctx.loadedBotsConfigPath) push([ctx.loadedBotsConfigPath], 'deny', 'mandatory');
+  // Non-code entries of the install root. The read-only install-root grant
+  // exists only so the CLI can load dist/ + node_modules/; it must not expose
+  // what a developer keeps beside the code. Only a workingDir AT or INSIDE the
+  // install root lifts the masks under it (that bot is working on the checkout
+  // itself); a sandboxPaths grant of the checkout, or any ancestor grant, does
+  // not — it means "let the agent read this tree", not "develop botmux".
+  const installRoot = installRootPath;
+  if (installRoot && ctx.botmuxInstallRootMaskPaths?.length) {
+    const wd = normalizeFsPath(ctx.workingDir);
+    const checkoutWorkingDir = wd !== null && coversPath(installRoot, wd) ? wd : null;
+    push(ctx.botmuxInstallRootMaskPaths.filter(p => {
+      const n = normalizeFsPath(p);
+      return n !== null && n !== installRoot && coversPath(installRoot, n)
+        && !(checkoutWorkingDir && coversPath(checkoutWorkingDir, n));
+    }), 'deny', 'mandatory');
+  }
+  push(serviceCredentialReadOnlyPaths, 'readOnly', 'mandatory');
+  push(hostOnlyRoots, 'deny', 'mandatory');
   push(ctx.mandatoryReadOnlyPaths, 'readOnly', 'mandatory');
+
+  // Seatbelt re-emits these paths after every ordinary rule so they can carve
+  // a narrow read-only exception out of a broader deny. Never carry a path
+  // inside a host-only root into that final pass, or it would undo the
+  // daemon-owned boundary that `push()` enforced above.
+  const finalReadOnlyPaths = [
+    ...serviceCredentialReadOnlyPaths,
+    ...(ctx.mandatoryReadOnlyPaths ?? []),
+  ].filter((path) => {
+    const normalized = normalizeFsPath(path);
+    return !normalized || !insideHostOnlyRoot(normalized);
+  });
 
   // No-Lark-transport HOST-AUTHORITY denies + minimal carve-out (codex escalation
   // fix). We DENY THE WHOLE authority ROOT(s) — not exact credential files, which
@@ -706,7 +1142,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     //    own-app-scoped — NOT the shared secret/port table).
     push([
       `${ctx.sessionDataDir}/bots-info.json`,               // display names for <available_bots> (public-ish)
-      `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`,
+      `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
       `${ctx.sessionDataDir}/bot-openids-${ctx.currentAppId}.json`,
       // Core-only writes its `botmux` wrapper into <dataDir>/bin (dedicated, NOT
       // the shared ~/.botmux/bin) and prepends it to the worker PATH — read-only
@@ -715,6 +1151,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       `${ctx.sessionDataDir}/bin`,
     ], 'readOnly', 'internal');
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/cursor-usage/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+    // statusline snapshot dir (see the larkTransport branch for why a dir, not a file).
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
+    // Own turn-send-ledger session dir (see the larkTransport branch).
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-send-ledger/${ctx.sessionId}`], 'readWrite', 'internal');
     // NOTE: dashboard-daemons (sibling IPC port table) and .dashboard-secret/-token
     // are deliberately NOT re-allowed — a no-transport turn has no business
     // reaching sibling daemons, and the secret is the escalation vector.
@@ -758,9 +1199,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     net: ctx.net !== false,
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    finalReadOnlyPaths: [...(ctx.mandatoryReadOnlyPaths ?? [])],
+    finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
+      : undefined,
+    suppressedHostOnlyPaths: suppressedHostOnlyPaths.length
+      ? [...new Set(suppressedHostOnlyPaths)].sort()
       : undefined,
   };
 }
@@ -873,6 +1317,65 @@ export function compileToSeatbelt(policy: FsPolicy): string {
 }
 
 // ───────────────────────────── bwrap compiler ────────────────────────────────
+
+export interface SymlinkProbe {
+  /** lstat(path).isSymbolicLink(); false when absent. */
+  isSymlink(path: string): boolean;
+  /** realpath(path); undefined when it cannot be resolved (dangling). */
+  realpath(path: string): string | undefined;
+}
+
+/**
+ * Baseline directories are candidates written lexically (`/opt`, `/usr`,
+ * `/etc`, `~/.cache` …). On hosts where one of them is a symlink (`/opt ->
+ * /data00/opt` on some devboxes) bwrap resolves the bind source to the real
+ * directory but the mount target `/opt` is then a mountpoint for a different
+ * path — MEASURED in a user report: `bwrap: Can't bind mount /oldroot/data00
+ * on /newroot/opt`. Handle it the way usrmerge `/bin` is handled: recreate the
+ * link inside the fresh root (`--symlink <real> <path>`, via
+ * CompileBwrapOpts.symlinks) and bind the REAL path instead.
+ *
+ * Rules (any source) below the lexical link are moved under the real path too,
+ * so longest-prefix still decides. A rule already naming the real path wins
+ * over the relocated baseline (an explicit grant/deny is never widened or
+ * narrowed by a baseline candidate). A dangling baseline link is dropped —
+ * nothing to expose. Only a link whose PARENT is already canonical is
+ * rebuilt; deeper aliasing is left untouched (as before). Pure given `io`.
+ */
+export function relocateSymlinkedBaselineRules(
+  rules: readonly FsRule[],
+  io: SymlinkProbe,
+): { rules: FsRule[]; symlinks: { path: string; target: string }[] } {
+  const symlinks: { path: string; target: string }[] = [];
+  const moves: { from: string; to: string }[] = [];
+  const dropped = new Set<string>();
+  for (const r of rules) {
+    if (r.source !== 'baseline' || r.access === 'deny' || r.path === '/') continue;
+    if (!io.isSymlink(r.path)) continue;
+    const parent = r.path.slice(0, r.path.lastIndexOf('/')) || '/';
+    if (io.realpath(parent) !== parent) continue;
+    const target = io.realpath(r.path);
+    if (!target) { dropped.add(r.path); continue; }
+    if (target === r.path || coversPath(r.path, target) || coversPath(target, r.path)) continue;
+    if (symlinks.some(l => l.path === r.path)) continue;
+    symlinks.push({ path: r.path, target });
+    moves.push({ from: r.path, to: target });
+  }
+  if (!moves.length && !dropped.size) return { rules: [...rules], symlinks };
+  const byPath = new Map<string, FsRule>();
+  for (const r of rules) {
+    if (dropped.has(r.path)) continue;
+    const move = moves.find(m => coversPath(m.from, r.path));
+    if (!move) { byPath.set(r.path, r); continue; }
+    const path = move.to + r.path.slice(move.from.length);
+    // A rule already naming the real path wins whichever order it comes in: an
+    // earlier one is kept here, a later one overwrites below via set().
+    if (!byPath.has(path)) byPath.set(path, { ...r, path });
+  }
+  const out = [...byPath.values()].sort((a, b) =>
+    pathDepth(a.path) - pathDepth(b.path) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { rules: out, symlinks };
+}
 
 export interface CompileBwrapOpts {
   /** Top-level symlinks to replicate inside the tmpfs root (usrmerge /bin →
@@ -1044,7 +1547,7 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
 // ───────────────────────────── legacy config migration ───────────────────────
 
 export interface LegacySandboxFields {
-  sandbox?: boolean;
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   readIsolation?: boolean;
   sandboxReadonlyPaths?: readonly string[];
   sandboxHidePaths?: readonly string[];
@@ -1052,7 +1555,9 @@ export interface LegacySandboxFields {
 }
 
 export interface MigratedSandboxFields {
-  sandbox: boolean;
+  // Tri-state preserved: a scratch bot carrying legacy path fields must NOT
+  // be silently downgraded to oncall(boolean true) by the migration.
+  sandbox: boolean | 'oncall' | 'scratch';
   sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
 }
 
@@ -1069,7 +1574,14 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0
     || (entry.readDenyExtraPaths?.length ?? 0) > 0;
-  const sandbox = entry.sandbox === true || entry.readIsolation === true;
+  // Preserve the tri-state: only oncall representations collapse to boolean
+  // true; 'scratch' passes through unchanged (the old path lists are irrelevant
+  // to scratch's full-root COW, but the mode itself must not be downgraded).
+  const sandbox: boolean | 'oncall' | 'scratch' = entry.sandbox === 'scratch'
+    ? 'scratch'
+    : (entry.sandbox === true
+      || entry.sandbox === 'oncall'
+      || entry.readIsolation === true);
   if (!hasLegacy) return null; // plain `sandbox: true` needs no path migration
   const readOnly = [...(entry.sandboxReadonlyPaths ?? [])];
   const deny = [...(entry.sandboxHidePaths ?? []), ...(entry.readDenyExtraPaths ?? [])];

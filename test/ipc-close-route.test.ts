@@ -3,21 +3,27 @@
 // caller may only close the exact live session whose rotating capability it owns.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  setDurableSessionLifecycleHandler,
   setIpcAuthSecret,
   startIpcServer,
   type IpcServerHandle,
 } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 const CAP = 'c0ffee12'.repeat(8);
 const HOST_SECRET = 'test-ipc-close-host-secret';
 let handle: IpcServerHandle | null = null;
+const ORIGINAL_COORDINATION_MODE = process.env.BOTMUX_COORDINATION_MODE;
 
 afterEach(async () => {
   if (handle) await handle.close();
   handle = null;
   setIpcAuthSecret(null);
+  setDurableSessionLifecycleHandler(null);
+  if (ORIGINAL_COORDINATION_MODE === undefined) delete process.env.BOTMUX_COORDINATION_MODE;
+  else process.env.BOTMUX_COORDINATION_MODE = ORIGINAL_COORDINATION_MODE;
   vi.restoreAllMocks();
 });
 
@@ -25,6 +31,7 @@ async function postClose(sessionId: string, opts: {
   auth?: 'capability' | 'signed' | 'none';
   authRequired?: boolean;
   capability?: string;
+  rootId?: string;
 } = {}): Promise<Response> {
   if (!handle) {
     if (opts.authRequired) setIpcAuthSecret(HOST_SECRET);
@@ -38,6 +45,7 @@ async function postClose(sessionId: string, opts: {
   const path = `/api/sessions/${sessionId}/close`;
   const body: Record<string, unknown> = {};
   if (auth === 'capability') body.originCapability = opts.capability ?? CAP;
+  if (opts.rootId) body.rootId = opts.rootId;
   const headers: HeadersInit = auth === 'signed'
     ? daemonIpcAuthHeaders({
       secret: HOST_SECRET,
@@ -55,6 +63,81 @@ async function postClose(sessionId: string, opts: {
 }
 
 describe('POST /api/sessions/:sessionId/close', () => {
+  it('routes a trusted-host close through durable lifecycle control in primary mode', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-primary' },
+      larkAppId: 'app-1',
+    } as any);
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+    const durableClose = vi.fn(async () => ({
+      ok: true as const,
+      outcome: 'closed' as const,
+    }));
+    setDurableSessionLifecycleHandler(durableClose);
+
+    const res = await postClose('s-primary', {
+      auth: 'signed',
+      authRequired: true,
+      rootId: 'om_primary_root',
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, outcome: 'closed' });
+    expect(durableClose).toHaveBeenCalledWith({
+      sessionId: 's-primary',
+      action: 'close',
+      rootId: 'om_primary_root',
+    });
+    expect(closeSpy).not.toHaveBeenCalled();
+  });
+
+  it('forwards a trusted routing anchor when the upgraded replica has no local row', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+    const durableClose = vi.fn(async () => ({
+      ok: true as const,
+      outcome: 'closed' as const,
+    }));
+    setDurableSessionLifecycleHandler(durableClose);
+
+    const res = await postClose('s-primary-remote', {
+      auth: 'signed',
+      authRequired: true,
+      rootId: 'om_primary_remote_root',
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, outcome: 'closed' });
+    expect(durableClose).toHaveBeenCalledWith({
+      sessionId: 's-primary-remote',
+      action: 'close',
+      rootId: 'om_primary_remote_root',
+    });
+    expect(closeSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not let an in-session capability mint trusted-host primary control', async () => {
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-primary-cap' },
+      managedTurnOrigin: { capability: CAP },
+      larkAppId: 'app-1',
+    } as any);
+    const durableClose = vi.fn();
+    setDurableSessionLifecycleHandler(durableClose);
+
+    const res = await postClose('s-primary-cap', { authRequired: true });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: 'durable_primary_requires_host_control',
+    });
+    expect(durableClose).not.toHaveBeenCalled();
+  });
+
   it('accepts the exact live session capability and delegates to canonical closeSession', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 's-close' },
@@ -62,13 +145,13 @@ describe('POST /api/sessions/:sessionId/close', () => {
       larkAppId: 'app-1',
     } as any);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: false });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: false });
 
     const res = await postClose('s-close', { authRequired: true });
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, alreadyClosed: false });
-    expect(closeSpy).toHaveBeenCalledWith('s-close');
+    expect(await res.json()).toEqual({ ok: true, outcome: 'closed', alreadyClosed: false });
+    expect(closeSpy).toHaveBeenCalledWith('s-close', expect.objectContaining({ onCodexCleanupRelease: expect.any(Function) }));
   });
 
   it('rejects a missing or stale capability without closing anything', async () => {
@@ -78,7 +161,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
       larkAppId: 'app-1',
     } as any);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: false });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: false });
 
     const missing = await postClose('s-close-denied', {
       auth: 'none',
@@ -98,7 +181,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
   it('does not reveal whether an unproven target session exists', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: true });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: true });
 
     const res = await postClose('missing', { authRequired: true });
 
@@ -110,7 +193,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
   it('keeps trusted-host close idempotent for an already missing session', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: true });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: true });
 
     const res = await postClose('missing', {
       auth: 'signed',
@@ -118,8 +201,40 @@ describe('POST /api/sessions/:sessionId/close', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, alreadyClosed: true });
-    expect(closeSpy).toHaveBeenCalledWith('missing');
+    expect(await res.json()).toEqual({ ok: true, outcome: 'closed', alreadyClosed: true });
+    expect(closeSpy).toHaveBeenCalledWith('missing', expect.objectContaining({ onCodexCleanupRelease: expect.any(Function) }));
+  });
+
+  it('replays the residual for an already-closed row instead of a bare success', async () => {
+    // The closed-row fast path short-circuits before closeSession(). A closed row
+    // can still carry an UNCANCELLED remote session (a quarantined lineage is
+    // parked, not cancelled), so a client that lost the first response — or simply
+    // retries — must still learn about it.
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    // A CLOSED durable row still carrying a parked (uncancelled) lineage.
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({
+      sessionId: 's-closed-residual',
+      status: 'closed',
+      backendType: 'mojo',
+      larkAppId: 'app-residual',
+      mojoQuarantinedLineage: 'mojo-parked-9',
+    } as never);
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+
+    const res = await postClose('s-closed-residual', {
+      auth: 'signed',
+      authRequired: true,
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: true,
+    });
+    // Fast path: the authoritative close is not re-run for an already-closed row.
+    expect(closeSpy).not.toHaveBeenCalled();
   });
 
   it('denies receiver-session self-close through the ordinary capability aperture', async () => {
@@ -129,7 +244,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
       larkAppId: 'app-1',
     } as any);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: false });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: false });
 
     const res = await postClose('s-receiver', { authRequired: true });
 

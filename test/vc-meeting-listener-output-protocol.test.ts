@@ -1,11 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import {
   parseVcMeetingListenerOutput,
+  VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT,
   VC_MEETING_LISTENER_OUTPUT_CONTRACT,
   vcMeetingListenerOutputProtocolForInstructionVersion,
 } from '../src/services/vc-meeting-listener-output-protocol.js';
 
 describe('VC meeting listener output protocol', () => {
+  it('requires a publish envelope only for an opted-in final summary', () => {
+    expect(vcMeetingListenerOutputProtocolForInstructionVersion('meeting-consumer-v2', true)).toBe('final_summary_v1');
+    expect(vcMeetingListenerOutputProtocolForInstructionVersion('meeting-consumer-v1', true)).toBe('plain');
+    expect(parseVcMeetingListenerOutput('{"decision":"skip"}', true).ok).toBe(false);
+    expect(parseVcMeetingListenerOutput('{"decision":"skip"}', false).ok).toBe(true);
+    expect(parseVcMeetingListenerOutput('{"decision":"publish","content":"Decisions and actions"}', true))
+      .toEqual({ ok: true, decision: 'publish', content: 'Decisions and actions' });
+  });
+
   it('accepts only the minimal skip envelope', () => {
     expect(parseVcMeetingListenerOutput('{"decision":"skip"}')).toEqual({
       ok: true,
@@ -44,6 +54,11 @@ describe('VC meeting listener output protocol', () => {
     expect(VC_MEETING_LISTENER_OUTPUT_CONTRACT).toContain('time, owner, scope, status, or conclusion');
     expect(VC_MEETING_LISTENER_OUTPUT_CONTRACT).not.toContain('fingerprint');
     expect(VC_MEETING_LISTENER_OUTPUT_CONTRACT).not.toContain('debounce');
+  });
+
+  it('keeps direct listener-chat questions out of the automatic JSON transport protocol', () => {
+    expect(VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT).toContain('direct human question');
+    expect(VC_MEETING_HUMAN_IM_OUTPUT_CONTRACT).toContain('natural-language Markdown only');
   });
 
   it('keeps pre-upgrade deliveries on plain output while enabling the v2 contract', () => {

@@ -23,6 +23,7 @@ import type { DaemonSession } from '../src/core/types.js';
 
 const {
   tmuxKill,
+  tmuxList,
   herdrKill,
   herdrKillAgent,
   herdrKillAgents,
@@ -33,6 +34,7 @@ const {
   getBotMock,
 } = vi.hoisted(() => ({
   tmuxKill: vi.fn(),
+  tmuxList: vi.fn(() => [] as string[]),
   herdrKill: vi.fn(),
   herdrKillAgent: vi.fn(),
   herdrKillAgents: vi.fn(),
@@ -44,7 +46,11 @@ const {
 }));
 
 vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
-  TmuxBackend: { sessionName: (id: string) => `bmx-${id.slice(0, 8)}`, killSession: tmuxKill },
+  TmuxBackend: {
+    sessionName: (id: string) => `bmx-${id.slice(0, 8)}`,
+    killSession: tmuxKill,
+    listBotmuxSessions: tmuxList,
+  },
 }));
 vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
   HerdrBackend: {
@@ -94,11 +100,16 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import { config } from '../src/config.js';
 import { managedHerdrAgentName } from '../src/adapters/backend/session-backend-selector.js';
+import type { SessionWorkerProcessRuntime } from '../src/core/session-worker-identity.js';
 import {
   killStalePids,
   killWorker,
+  sweepStaleSessionWorkerPids,
+  setActiveSessionSafe,
+  setActiveSessionIfActive,
   teardownAuthoritativePersistentBackingBeforeClose,
 } from '../src/core/worker-pool.js';
+import { activeSessionKey } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 const SID = 'abcd1234-0000-0000-0000-000000000000';
@@ -119,12 +130,104 @@ const ds = (over: Partial<DaemonSession> = {}, initOver: any = {}): DaemonSessio
 
 beforeEach(() => {
   vi.clearAllMocks();
+  tmuxList.mockReturnValue([]);
   herdrList.mockReturnValue([]);
   zmxList.mockReturnValue([]);
   getBotMock.mockReturnValue({ resolvedAllowedUsers: [], config: {} } as any);
 });
 
+describe('workspace retirement registration guard', () => {
+  it.each(['sync', 'locked'] as const)('rejects active retired rows at the %s gate and preserves a newer occupant', async gate => {
+    const register = async (map: Map<string, DaemonSession>, key: string, incoming: DaemonSession) => gate === 'sync'
+      ? setActiveSessionIfActive(map, key, incoming)
+      : (await setActiveSessionSafe(map, key, incoming)).accepted;
+    const { logger } = await import('../src/utils/logger.js');
+    const incoming = ds();
+    incoming.session.status = 'active';
+    incoming.session.workspaceRetirement = { operationId: 'recycle-registration', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    const key = activeSessionKey(incoming);
+    const map = new Map([[key, incoming]]);
+    expect(await register(map, key, incoming)).toBe(false);
+    expect(map.size).toBe(0);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('workspace-retired session (status=active, operationId=recycle-registration)'));
+    const winner = ds({ session: { ...incoming.session, sessionId: 'new-session', workspaceRetirement: undefined } });
+    map.set(key, winner);
+    expect(await register(map, key, incoming)).toBe(false);
+    expect(map.get(key)).toBe(winner);
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('inactive session (status=active)'));
+  });
+});
+
 describe('killStalePids — ZMX CLI-change cleanup', () => {
+  it('closes the recorded ZMX namespace before committing the logical close', () => {
+    const target = {
+      sessionId: SID, status: 'active', backendType: 'zmx',
+      persistentBackendTarget: { backendType: 'zmx', sessionName: 'bmx-recorded', socketDir: '/tmp/close-zmx' },
+    } as any;
+    teardownAuthoritativePersistentBackingBeforeClose(target);
+    expect(zmxKill).toHaveBeenCalledWith('bmx-recorded', SID, undefined,
+      expect.objectContaining({ ZMX_DIR: '/tmp/close-zmx' }));
+  });
+
+  it('protects active ZMX targets while cleaning same-named orphans in another directory', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-zmx-directories-'));
+    const previousDataDirEnv = process.env.SESSION_DATA_DIR;
+    const previousBackendType = config.daemon.backendType;
+    const active = {
+      sessionId: SID, status: 'active', backendType: 'zmx',
+      persistentBackendTarget: { backendType: 'zmx', sessionName: EXPECTED_NAME, socketDir: '/tmp/active-zmx' },
+    } as any;
+    const orphan = {
+      sessionId: 'abcd1234-1111-2222-3333-444444444444', status: 'closed', backendType: 'zmx',
+      persistentBackendTarget: { backendType: 'zmx', sessionName: EXPECTED_NAME, socketDir: '/tmp/orphan-zmx' },
+    } as any;
+    try {
+      config.session.dataDir = dataDir;
+      config.daemon.backendType = 'zmx';
+      sessionStore.init('zmx-directory-cleanup-test');
+      sessionStore.updateSession(active);
+      sessionStore.updateSession(orphan);
+      zmxList.mockReturnValue([EXPECTED_NAME, 'bmx-foreign']);
+
+      killStalePids([active]);
+
+      expect(zmxList).toHaveBeenCalledTimes(2);
+      expect(zmxKill).toHaveBeenCalledTimes(1);
+      expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME, orphan.sessionId, undefined,
+        expect.objectContaining({ ZMX_DIR: '/tmp/orphan-zmx' }));
+    } finally {
+      sessionStore.init('zmx-directory-cleanup-test');
+      config.daemon.backendType = previousBackendType;
+      if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDirEnv;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('signals only the stale worker PID for an existing App Server share', () => {
+    const sharedPid = 42_424;
+    const kill = vi.fn();
+    // The recorded worker is still running: same birth identity, worker entry.
+    const runtime: SessionWorkerProcessRuntime = {
+      readIdentity: () => 'boot:4242',
+      readCommandLine: () => '/usr/bin/bun /opt/botmux/dist/worker.js',
+      readSystemdUnit: () => undefined,
+      pidExists: () => true,
+      kill,
+    };
+
+    sweepStaleSessionWorkerPids([{
+      sessionId: SID,
+      pid: sharedPid,
+      pidProcStart: 'boot:4242',
+      backendType: 'pty',
+      existingAppServerEndpoint: 'unix:///tmp/codex-app-server.sock',
+    } as any], undefined, runtime);
+
+    expect(kill).toHaveBeenCalledWith(sharedPid, 'SIGTERM');
+    expect(kill).not.toHaveBeenCalledWith(-sharedPid, 'SIGTERM');
+  });
+
   it('keeps the complete owning session identity and does not issue a second name-only kill', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-zmx-cli-change-'));
     const previousDataDirEnv = process.env.SESSION_DATA_DIR;
@@ -147,7 +250,7 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
       expect(zmxKill).toHaveBeenCalledTimes(1);
       expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME, SID);
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -183,7 +286,7 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
       expect(zmxKill).toHaveBeenNthCalledWith(1, 'bmx-33333333', firstId);
       expect(zmxKill).toHaveBeenNthCalledWith(2, 'bmx-44444444', secondId);
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -242,7 +345,7 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
       expect(zmxKill).toHaveBeenNthCalledWith(1, 'bmx-11111111', firstId);
       expect(zmxKill).toHaveBeenNthCalledWith(2, 'bmx-22222222', secondId);
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -368,7 +471,7 @@ describe('killStalePids — shared Herdr orphan cleanup', () => {
       );
       expect(herdrKill).not.toHaveBeenCalledWith('botmux');
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -437,7 +540,7 @@ describe('killStalePids — shared Herdr orphan cleanup', () => {
         ]),
       );
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -534,6 +637,78 @@ describe('killWorker — with a live worker (unchanged path)', () => {
     expect(tmuxKill).not.toHaveBeenCalled();
     expect(d.worker).toBeNull();
     expect(d.managedTurnOrigin).toBeUndefined();
+  });
+
+  it('REFUSES unprepared live retirement for EVERY remote backend, not just riff (P0-2)', () => {
+    // The guard used to hard-code `closeFrozenType === 'riff'`, so a live Mojo
+    // worker hit the generic path: a request-less `close` IPC whose worker-side
+    // legacy handler answered with destroySession() — `mojo session cancel` —
+    // silently and irreversibly cancelling the remote session on /cd cold
+    // restarts, crash-loops, collision losers and restore/upgrade.
+    for (const remote of ['riff', 'mojo'] as const) {
+      vi.clearAllMocks();
+      const send = vi.fn();
+      const d = ds({ worker: { killed: false, send, once: vi.fn() } as any }, { backendType: remote });
+      killWorker(d);
+      expect(send, remote).not.toHaveBeenCalled();
+      // Worker and remote-task lineage are preserved for a prepared close.
+      expect(d.worker, remote).not.toBeNull();
+    }
+  });
+
+  it('collision loser: a REMOTE loser is retired process-only, never orphaned (gate 2)', async () => {
+    // The loser's registry entry is deleted right after retirement, so a
+    // killWorker refusal (correct for lineage) left a live credential-carrying
+    // mojo worker unreachable — the P0-new orphan shape through another door.
+    // A remote loser must die as a PROCESS: SIGTERM + backstop, no close IPC
+    // (which the worker refuses request-less), no remote cancel.
+    const send = vi.fn();
+    const kill = vi.fn();
+    const loser = ds({
+      worker: { killed: false, send, kill, once: vi.fn() } as any,
+      session: {
+        sessionId: 'aaaa1111-0000-0000-0000-000000000000',
+        status: 'active',
+        backendType: 'mojo',
+        riffParentTaskId: 'mojo-task-loser',
+      } as any,
+    }, { backendType: 'mojo' });
+    const winner = ds({
+      session: { sessionId: 'bbbb2222-0000-0000-0000-000000000000', status: 'active' } as any,
+    }, { backendType: 'mojo' });
+    const key = activeSessionKey(winner);
+    const map = new Map([[activeSessionKey(loser), loser]]);
+
+    const result = await setActiveSessionSafe(map, key, winner);
+
+    expect(result.accepted).toBe(true);
+    // Process-only retirement: SIGTERM sent, no close IPC, worker slot cleared.
+    expect(kill).toHaveBeenCalledWith('SIGTERM');
+    expect(send).not.toHaveBeenCalled();
+    expect(loser.worker).toBeNull();
+    expect(map.get(key)).toBe(winner);
+    // The remote lineage was NOT cancelled — it stays for manual cleanup, and
+    // the warn log NAMES it so an operator can actually find it (the
+    // visibility surface, round-5 zero-coverage item).
+    expect(loser.session.riffParentTaskId).toBe('mojo-task-loser');
+    const { logger } = await import('../src/utils/logger.js');
+    expect(vi.mocked(logger.warn).mock.calls.map(c => String(c[0])).join('\n'))
+      .toContain('mojo-task-loser');
+  });
+
+  it('still retires a live remote worker when the prepare/commit requestId is carried (P0-2)', () => {
+    for (const remote of ['riff', 'mojo'] as const) {
+      vi.clearAllMocks();
+      const send = vi.fn();
+      const d = ds({
+        worker: { killed: false, send, once: vi.fn() } as any,
+        remoteCloseState: { requestId: 'req-1' } as any,
+      }, { backendType: remote });
+      killWorker(d, { remoteCloseCommitRequestId: 'req-1' });
+      expect(send, remote).toHaveBeenCalledWith({ type: 'close_commit', requestId: 'req-1' });
+      expect(d.worker, remote).toBeNull();
+      expect(d.remoteCloseState, remote).toBeUndefined();
+    }
   });
 
 });

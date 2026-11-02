@@ -59,12 +59,35 @@ export interface PluginServiceContribution extends PluginRuntimeEntrypoint {
   mode: PluginServiceMode;
 }
 
+/** Public, install-time allowlist for card actions handled by a plugin service. */
+export interface PluginCardActionsContribution {
+  schemaVersion: 1;
+  actions?: string[];
+  actionPrefixes?: string[];
+  endpoint: string;
+}
+
+/** One Lark slash command a plugin service handles (`/work-bind`). */
+export interface PluginCommandEntry {
+  name: string;
+  description?: string;
+}
+
+/** Public, install-time declaration of Lark slash commands routed to a plugin service. */
+export interface PluginCommandsContribution {
+  schemaVersion: 1;
+  endpoint: string;
+  commands: PluginCommandEntry[];
+}
+
 export interface PluginContributions {
   skills?: PluginSkillEntry[];
   dashboard?: PluginDashboardEntry[];
   mcp?: PluginMcpContribution;
   cli?: PluginCliContribution;
   service?: PluginServiceContribution;
+  cardActions?: PluginCardActionsContribution;
+  commands?: PluginCommandsContribution;
 }
 
 /** Installation-time scan result before MCP details are moved to private
@@ -141,4 +164,6 @@ export interface PluginMaterializedFile {
   cli?: Array<{ name: string }>;
   dashboard?: Array<{ id: string; entry: string }>;
   service?: Array<{ name: string }>;
+  cardActions?: PluginCardActionsContribution;
+  commands?: PluginCommandsContribution;
 }

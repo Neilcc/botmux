@@ -7,7 +7,7 @@ the conversation anchored to the chat where the work started.
 
 **Agent CLI**:
 An AI coding command-line tool that botmux can run on behalf of a chat, such as
-Claude Code, Codex, Gemini, Cursor, or OpenCode.
+Claude Code, Codex, Cursor, OpenCode, or Antigravity.
 _Avoid_: agent cli, CLI bot
 
 **Bot**:
@@ -18,6 +18,14 @@ _Avoid_: agent, app
 **Session**:
 A continuing conversation between one chat anchor and one **Agent CLI**.
 _Avoid_: thread, task
+
+**Sender Identity**:
+The best-effort identity of the person or Bot that authored one inbound chat
+message. It follows each message turn rather than being fixed to a **Session**;
+multiple senders may therefore appear in one Session. Human sender identity may
+include an app-scoped open ID, display name, and email when the chat platform
+makes them available. Missing optional fields never block message delivery.
+_Avoid_: session owner, card recipient
 
 **Token Usage**:
 Token counts reported by an **Agent CLI** or its persisted transcript for a

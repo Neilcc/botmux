@@ -20,7 +20,7 @@
 
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 import type { V3Dag } from './dag.js';
@@ -36,6 +36,7 @@ import {
 } from './contract.js';
 import { readJournal } from './journal.js';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
+import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import {
   botToSnapshot,
   freezeDagBotSnapshots,
@@ -298,6 +299,13 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Machine-wide workflow kill-switch: the v3 dogfood runner launches a real
+  // ephemeral run, so refuse it when the feature is off.
+  if (!isWorkflowFeatureEnabled()) {
+    console.error('⛔ 本机已关闭「工作流(Workflow)」功能，`botmux v3 run` 不可用。如需开启，请在 Dashboard 设置页打开「工作流功能」开关，或设置 BOTMUX_WORKFLOW_ENABLED=true。');
+    process.exit(2);
+  }
+
   let args: V3RunArgs;
   try {
     args = parseArgs(rest);
@@ -342,7 +350,7 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
     return botToSnapshot(bot, args.workingDir);
   };
 
-  const { runNode } = createEphemeralPool({ resolveLarkAppSecret });
+  const { runNode } = createEphemeralPool({ resolveLarkAppSecret, resolveBot: appId => bots.find(bot => bot.larkAppId === appId) });
   const resolveGate = createFileGate({ awaitDecision: makeAwaitDecision(args.autoApproveGates) });
 
   let dag: V3Dag;

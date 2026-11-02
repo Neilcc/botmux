@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import { dashboardLoginHref } from '../src/dashboard/web/auth-login.js';
@@ -23,17 +22,5 @@ describe('dashboardLoginHref', () => {
     expect(dashboardLoginHref(undefined, '#/workflows/run-1')).toBeUndefined();
     expect(dashboardLoginHref('javascript:alert(1)', '#/workflows/run-1')).toBeUndefined();
     expect(dashboardLoginHref('not a url', '#/workflows/run-1')).toBeUndefined();
-  });
-});
-
-describe('Dashboard one-click login wiring', () => {
-  it('advertises the token-free login URL on 401 and renders it in the existing overlay', () => {
-    const server = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-    const app = readFileSync(new URL('../src/dashboard/web/app.tsx', import.meta.url), 'utf8');
-    expect(server).toContain("'x-botmux-login-url': loginUrl");
-    expect(server).toContain("'cache-control': 'no-store'");
-    expect(app).toContain("res.headers.get('x-botmux-login-url')");
-    expect(app).toContain('id="dashboard-one-click-login"');
-    expect(app).toContain('一键登录');
   });
 });

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,12 +14,12 @@ import {
   getVcMeetingDeliveryReceipt,
   getVcMeetingMemberProjection,
   getVcMeetingReceiverStream,
+  latestVcMeetingDeliveryForSession,
   listActiveVcMeetingDeliveriesForSession,
   listVcMeetingActiveProjectionsForReceiverSession,
   listVcMeetingMemberProjections,
   markVcMeetingDeliveryAmbiguous,
   markVcMeetingDeliveryDispatched,
-  pruneVcMeetingDeliveryState,
   reconcileVcMeetingDeliveriesOnBoot,
   type VcMeetingDeliveryAcceptInput,
   type VcMeetingMemberProjectionInput,
@@ -1093,6 +1093,47 @@ describe('vc meeting delivery store', () => {
     });
   });
 
+  describe('latestVcMeetingDeliveryForSession', () => {
+    beforeEach(() => {
+      applyVcMeetingMemberProjection(dir, projection());
+      applyVcMeetingMemberProjection(dir, projection({ meetingId: 'meeting-2' }));
+      acceptVcMeetingDelivery(dir, delivery());
+      acceptVcMeetingDelivery(dir, delivery({ meetingId: 'meeting-2', deliveryKey: 'dk-2' }));
+    });
+
+    it('returns a just-COMPLETED receipt (the idle-gap case listActive skips)', () => {
+      // The whole point: after the delivery turn goes idle the receipt is
+      // `completed` (terminal). listActive returns [] for it; the in-meeting
+      // output CLI needs THIS so it can still supply an authorizable origin.
+      const rk = { ...KEY, meetingId: 'meeting-2', deliveryKey: 'dk-2' };
+      markVcMeetingDeliveryDispatched(dir, rk, { receiverBootId: 'boot-rx-1', workerGeneration: 3 });
+      completeVcMeetingDelivery(dir, rk, { workerGeneration: 3, dispatchAttempt: 1 });
+
+      const latest = latestVcMeetingDeliveryForSession(dir, 'sess-1');
+      expect(latest).toMatchObject({
+        receiverSessionId: 'sess-1',
+        receipt: { deliveryKey: 'dk-2', status: 'completed', dispatchAttempt: 1 },
+      });
+      // listActive skips it (terminal) — this is exactly the gap this helper fills.
+      expect(listActiveVcMeetingDeliveriesForSession(dir, 'sess-1').map(e => e.receipt.deliveryKey))
+        .toEqual(['dk-1']);
+    });
+
+    it('prefers the most-recent authorizable receipt and never returns failed/abandoned', () => {
+      // dk-1 dispatched (authorizable). dk-2 abandoned (not). Latest authorizable
+      // is dk-1.
+      markVcMeetingDeliveryDispatched(dir, { ...KEY, deliveryKey: 'dk-1' }, { receiverBootId: 'boot-rx-1', workerGeneration: 1 });
+      abandonVcMeetingDeliveryStream(dir, { listenerAppId: LISTENER, meetingId: 'meeting-2', memberId: MEMBER, memberEpoch: 1 });
+      const latest = latestVcMeetingDeliveryForSession(dir, 'sess-1');
+      expect(latest?.receipt.deliveryKey).toBe('dk-1');
+      expect(latest?.receipt.status).toBe('dispatched');
+    });
+
+    it('returns undefined for an unknown session', () => {
+      expect(latestVcMeetingDeliveryForSession(dir, 'no-such-session')).toBeUndefined();
+    });
+  });
+
   // ─── 按 receiverSessionId 反查当前有效 projection（botmux send 拒发面）────
 
   describe('listVcMeetingActiveProjectionsForReceiverSession', () => {
@@ -1151,21 +1192,6 @@ describe('vc meeting delivery store', () => {
       expect(r.ok).toBe(true);
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('corrupt state'));
       expect(readdirSync(storeDir).some((f) => f.includes('.corrupt.'))).toBe(true);
-    });
-
-    it('prunes whole meetings past TTL and keeps fresh ones', () => {
-      applyVcMeetingMemberProjection(dir, projection(), 1_000);
-      applyVcMeetingMemberProjection(
-        dir,
-        projection({ meetingId: 'meeting-fresh' }),
-        50_000,
-      );
-
-      const removed = pruneVcMeetingDeliveryState(dir, { ttlMs: 10_000 }, 60_000);
-      expect(removed).toBe(1);
-      expect(getVcMeetingMemberProjection(dir, KEY)).toBeUndefined();
-      expect(getVcMeetingMemberProjection(dir, { ...KEY, meetingId: 'meeting-fresh' })).toBeDefined();
-      expect(existsSync(join(dir, 'vc-meeting-delivery'))).toBe(true);
     });
   });
 });

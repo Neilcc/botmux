@@ -1,7 +1,9 @@
 import * as pty from 'node-pty';
 import xtermHeadless from '@xterm/headless';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { createServer } from 'node:http';
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -10,7 +12,9 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished } from 'vitest';
+import { isBunRuntime, nodeTsRunnerPrefix } from './helpers/ts-runner.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const { Terminal } = xtermHeadless;
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
@@ -82,7 +86,13 @@ function makeTerminal(cols: number, modern = false): InstanceType<typeof Termina
   return terminal;
 }
 
-function makeFixture(multiBot: boolean, titleFor?: (index: number) => string, adoptTmuxTarget?: string): { root: string; dataDir: string } {
+function makeFixture(
+  multiBot: boolean,
+  titleFor?: (index: number) => string,
+  adoptTmuxTarget?: string,
+  dormantTmux = false,
+  wakeDaemonPort?: number,
+): { root: string; dataDir: string } {
   const root = mkdtempSync(join(tmpdir(), 'botmux-picker-responsive-'));
   tempDirs.push(root);
   const dataDir = join(root, 'data');
@@ -125,17 +135,53 @@ function makeFixture(multiBot: boolean, titleFor?: (index: number) => string, ad
       originalCliPid: process.pid,
     };
   }
-  writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify(sessions));
+  if (dormantTmux) {
+    const selectedId = `48000000-1111-2222-3333-444444444444`;
+    const selected = sessions[selectedId] as Record<string, unknown>;
+    selected.backendType = 'tmux';
+    delete selected.pid;
+    selected.lastCliInput = 'resume this conversation';
+    if (wakeDaemonPort !== undefined) {
+      selected.larkAppId = 'cli_test_wake';
+      const daemonDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(daemonDir, { recursive: true });
+      writeFileSync(join(daemonDir, 'cli_test_wake.json'), JSON.stringify({
+        larkAppId: 'cli_test_wake',
+        ipcPort: wakeDaemonPort,
+        lastHeartbeat: Date.now(),
+      }));
+      const configDir = join(root, '.botmux');
+      mkdirSync(configDir, { recursive: true });
+      const secretPath = join(configDir, '.dashboard-secret');
+      writeFileSync(secretPath, 'picker-wake-test-secret');
+      // The host credential loader (secure-host-file) fail-closes unless the
+      // secret is EXACTLY 0600; writeFileSync's mode is umask-masked, so set it
+      // explicitly or fetchDaemonIpc can't sign and the wake never leaves the CLI.
+      chmodSync(secretPath, 0o600);
+    }
+  }
+  // The picker (`botmux list`) enumerates per-bot SQLite stores.
+  seedPersistedSessionRows(dataDir, 'picker-app', sessions);
   return { root, dataDir };
 }
 
-async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: number) => string, modern = false, adoptTmuxTarget?: string): Promise<{
-  child: pty.IPty;
-  terminal: InstanceType<typeof Terminal>;
-  renderCount: () => number;
-  waitForRender: (minimum: number) => Promise<void>;
-}> {
-  const fixture = makeFixture(multiBot, titleFor, adoptTmuxTarget);
+async function spawnPicker(
+  cols: number,
+  multiBot: boolean,
+  titleFor?: (index: number) => string,
+  modern = false,
+  adoptTmuxTarget?: string,
+  dormantTmux = false,
+  wakeDaemonPort?: number,
+  startupDelayMs?: number,
+): Promise<AttachedPicker> {
+  const fixture = makeFixture(
+    multiBot,
+    titleFor,
+    adoptTmuxTarget,
+    dormantTmux,
+    wakeDaemonPort,
+  );
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     HOME: fixture.root,
@@ -149,32 +195,95 @@ async function spawnPicker(cols: number, multiBot: boolean, titleFor?: (index: n
     'BOTMUX_DAEMON_IPC_PORT',
   ]) delete env[key];
 
-  const child = pty.spawn(process.execPath, ['--import', 'tsx', CLI_PATH, 'list'], {
+  // Drive the picker with Node+tsx even under `bun test`. bun-as-PTY-child
+  // produced a blank TUI (0 `botmux sessions` renders in 5s on CI Linux).
+  const { command, prefixArgs } = nodeTsRunnerPrefix();
+  const launch = [command, ...prefixArgs, CLI_PATH, 'list'];
+  const [file, ...args] = startupDelayMs === undefined
+    ? launch
+    : ['/bin/sh', '-c', `sleep ${startupDelayMs / 1000} && exec "$@"`, 'sh', ...launch];
+  const child = pty.spawn(file, args, {
     cwd: join(TEST_DIR, '..'),
     env,
     cols,
     rows: 24,
     name: 'xterm-256color',
   });
+  const picker = attachPicker(child, cols, modern, command);
+  await picker.waitForRender(1);
+  return picker;
+}
+
+// render() writes the keybinding hints last, so their arrival is the
+// deterministic "this frame is fully painted" signal; the title is not.
+const FRAME_END = '↑/↓ 选择';
+
+interface AttachedPicker {
+  child: pty.IPty;
+  terminal: InstanceType<typeof Terminal>;
+  renderCount: () => number;
+  waitForRender: (minimum: number) => Promise<void>;
+  waitForOutput: (text: string) => Promise<void>;
+}
+
+/** Mirror a PTY child into a headless terminal and wait on what it paints.
+ *  Waits are event-driven and have no wall-clock deadline of their own: a cold
+ *  Node+tsx start of src/cli.ts takes ~1s on an idle machine but 6–7s on a
+ *  contended CI shard (#2455), and a fixed budget turned that into an
+ *  empty-screen failure. A child that exits fails the wait at once; a genuine
+ *  hang is still bounded by the test timeout. */
+function attachPicker(
+  child: pty.IPty,
+  cols: number,
+  modern: boolean,
+  label: string,
+): AttachedPicker {
   children.push(child);
   const terminal = makeTerminal(cols, modern);
   let raw = '';
+  let exit: { exitCode: number; signal?: number } | undefined;
   let writes = Promise.resolve();
+  const pending = new Set<() => void>();
+  const recheck = () => { for (const check of [...pending]) check(); };
   child.onData(data => {
     raw += data;
     writes = writes.then(() => new Promise<void>(resolve => terminal.write(data, resolve)));
+    recheck();
+  });
+  child.onExit(event => { exit = event; recheck(); });
+  // onTestFinished, not onTestFailed: bun:test exports only the former, and a
+  // named import it lacks fails the whole file at load, before runIf skips it.
+  onTestFinished(({ task }) => {
+    if (task.result?.state === 'fail') console.error(`picker output (${label}): ${JSON.stringify(raw.slice(-2000))}`);
   });
 
-  const renderCount = () => raw.split('botmux sessions').length - 1;
-  const waitForRender = async (minimum: number): Promise<void> => {
-    const deadline = Date.now() + 5_000;
-    while (renderCount() < minimum && Date.now() < deadline) await delay(20);
-    expect(renderCount()).toBeGreaterThanOrEqual(minimum);
-    await delay(60);
-    await writes;
+  const waitUntil = (done: () => boolean, what: string) => new Promise<void>((resolve, reject) => {
+    const check = () => {
+      if (done()) {
+        pending.delete(check);
+        resolve();
+      } else if (exit) {
+        pending.delete(check);
+        reject(new Error(`picker exited (code ${exit.exitCode}, signal ${exit.signal ?? 0}) before ${what}: ${JSON.stringify(raw.slice(-800))}`));
+      }
+    };
+    pending.add(check);
+    check();
+  });
+  const renderCount = () => raw.split(FRAME_END).length - 1;
+  return {
+    child,
+    terminal,
+    renderCount,
+    waitForRender: async minimum => {
+      await waitUntil(() => renderCount() >= minimum, `painting frame ${minimum}`);
+      await writes;
+    },
+    waitForOutput: async text => {
+      await waitUntil(() => raw.includes(text), `writing ${JSON.stringify(text)}`);
+      await writes;
+    },
   };
-  await waitForRender(1);
-  return { child, terminal, renderCount, waitForRender };
 }
 
 function inspectScreen(terminal: InstanceType<typeof Terminal>): {
@@ -200,7 +309,10 @@ async function closePicker(child: pty.IPty, terminal: InstanceType<typeof Termin
   if (idx >= 0) children.splice(idx, 1);
 }
 
-describe('session picker real terminal responsiveness', () => {
+// bun's in-process node-pty delivers no onData (measured: Node+tsx child,
+// vitest green, bun test raw=""). The picker still runs under the Node/vitest
+// leg on both macOS and Linux CI.
+describe.runIf(!isBunRuntime())('session picker real terminal responsiveness', () => {
   it('rebuilds horizontal layout when a wide terminal shrinks', async () => {
     const picker = await spawnPicker(180, false);
     const beforeResize = picker.renderCount();
@@ -211,7 +323,7 @@ describe('session picker real terminal responsiveness', () => {
     const screen = inspectScreen(picker.terminal);
     expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
     expect(screen.lines.some(line => line.includes('❯') && line.includes('48000000'))).toBe(true);
-    expect(screen.lines).toContainEqual(expect.stringContaining('↓ 37 更多'));
+    expect(screen.lines.some(line => line.includes('↓ 37 更多'))).toBe(true);
     expect(screen.wrappedRows).toEqual([]);
     await closePicker(picker.child, picker.terminal);
   });
@@ -337,5 +449,96 @@ describe('session picker real terminal responsiveness', () => {
     // bytes were stripped, so the label is not silently dropped.
     expect(screen.lines.some(line => line.includes('evil') && line.includes('injected'))).toBe(true);
     await closePicker(picker.child, picker.terminal);
+  });
+
+  it('offers recovery when the selected managed tmux backend is missing', async () => {
+    const picker = await spawnPicker(120, false, undefined, false, undefined, true);
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines.some(line => line.includes('tmux: bmx-48000000') && line.includes('Enter 恢复并连接'))).toBe(true);
+    expect(screen.lines.some(line => line.includes('⏎ 恢复'))).toBe(true);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('lets q abort a never-resolving wake and exits raw mode promptly', async () => {
+    let markRequestStarted!: () => void;
+    const requestStarted = new Promise<void>(resolve => { markRequestStarted = resolve; });
+    const server = createServer(() => { markRequestStarted(); });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test daemon did not bind a TCP port');
+
+    try {
+      const picker = await spawnPicker(120, false, undefined, false, undefined, true, address.port);
+      const exited = new Promise<void>(resolve => picker.child.onExit(() => resolve()));
+      const beforeWake = picker.renderCount();
+      picker.child.write('\r');
+      await picker.waitForRender(beforeWake + 1);
+      expect(inspectScreen(picker.terminal).lines.some(line => line.includes('正在恢复 tmux'))).toBe(true);
+      // Event-driven like the render waits: a contended runner can take longer
+      // than any fixed budget; a request that never comes fails the test timeout.
+      await requestStarted;
+
+      picker.child.write('q');
+      await exited;
+      picker.terminal.dispose();
+      const idx = children.indexOf(picker.child);
+      if (idx >= 0) children.splice(idx, 1);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  // #2455: the first frame of a cold Node+tsx start took 6–7s on a contended
+  // CI shard and failed a fixed 5s budget with an empty screen. Starting the
+  // picker 6s late keeps that shape on every run, loaded or not.
+  it('waits for a picker that starts later than any fixed budget', async () => {
+    const picker = await spawnPicker(99, false, undefined, false, undefined, false, undefined, 6_000);
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines[0]).toContain('botmux sessions  (1/48)');
+    expect(screen.lines.some(line => line.includes('❯') && line.includes('48000000'))).toBe(true);
+    await closePicker(picker.child, picker.terminal);
+  }, 30_000);
+
+  it('treats a frame as painted only once its keybinding hints arrive', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-picker-frame-'));
+    tempDirs.push(root);
+    const gate = join(root, 'rest-of-frame');
+    // A stand-in TUI that flushes the title, then the rest of the frame only
+    // once the test lets it: the frame is split exactly where a busy writer
+    // could split it.
+    const script = `
+      const fs = require('node:fs');
+      process.stdout.write('\\x1b[H\\x1b[J\\x1b[1m botmux sessions\\x1b[0m  (1/1)\\n\\n');
+      const timer = setInterval(() => {
+        if (!fs.existsSync(${JSON.stringify(gate)})) return;
+        clearInterval(timer);
+        process.stdout.write('❯ 48000000 row\\n\\n\\x1b[2m${FRAME_END}  q 退出\\x1b[0m\\n');
+      }, 10);
+      setInterval(() => {}, 1000);
+    `;
+    const picker = attachPicker(pty.spawn(nodeTsRunnerPrefix().command, ['-e', script], {
+      cols: 80, rows: 24, name: 'xterm-256color',
+    }), 80, false, 'split-frame stand-in');
+    let painted = false;
+    const frame = picker.waitForRender(1).then(() => { painted = true; });
+    await picker.waitForOutput('botmux sessions');
+    expect(painted).toBe(false);
+
+    writeFileSync(gate, '');
+    await frame;
+    const screen = inspectScreen(picker.terminal);
+    expect(screen.lines.some(line => line.includes('48000000'))).toBe(true);
+    expect(screen.lines.some(line => line.includes(FRAME_END))).toBe(true);
+    await closePicker(picker.child, picker.terminal);
+  });
+
+  it('fails at once with the output when the picker exits before painting', async () => {
+    const picker = attachPicker(pty.spawn(nodeTsRunnerPrefix().command, [
+      '-e', `process.stdout.write('boom: picker cannot start\\n'); process.exit(3);`,
+    ], { cols: 80, rows: 24, name: 'xterm-256color' }), 80, false, 'crashing stand-in');
+    await expect(picker.waitForRender(1)).rejects.toThrow(/exited \(code 3[\s\S]*boom: picker cannot start/);
   });
 });

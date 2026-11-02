@@ -14,9 +14,9 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `claude-code` | Claude Code (default) | local process | ✅ |
 | `codex` | Codex CLI | local process | ✅ |
 | `codex-app` | Codex App | local process (app-server protocol) | |
-| `gemini` | Gemini | local process | ✅ |
 | `cursor` | Cursor (cursor-agent) | local process | ✅ |
 | `opencode` | OpenCode | local process | ✅ |
+| `opencode2` | OpenCode 2 (beta, `opencode2`) | local process | |
 | `antigravity` | Antigravity (agy) | local process | |
 | `copilot` | GitHub Copilot | local process | ✅ |
 | `grok` | Grok (grok-cli) | local process | ✅ |
@@ -29,14 +29,52 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `traex` | TRAE CLI (traex) | local process | ✅ |
 | `mtr` | MTR | local process | |
 | `hermes` | Hermes | local process | |
+| `ebsd` | EBSD (requires credential files, see [guide](https://github.com/deepcoldy/botmux/blob/master/docs/ebsd.md)) | local process | |
+| `codem` | CodeM (see [CodeM guide](https://github.com/deepcoldy/botmux/blob/master/docs/codem.md)) | local process | ✅ |
+| `minimax` | MiniMax Code / mcode (see [MiniMax guide](https://github.com/deepcoldy/botmux/blob/master/docs/minimax-code.md)) | local process | ✅ |
 | `genius` | Genius | local process | ✅ |
 | `seed` | Seed (Claude Code fork) | local process | ✅ |
 | `relay` | Relay (new release of Seed) | local process | ✅ |
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
+| `mojo` | Mojo | API-driven (host execution / cloud sandbox) | |
+| `remote-runner` | Generic Remote Runner (see [protocol](https://github.com/deepcoldy/botmux/blob/master/docs/remote-runner.md)) | Remote protocol | |
+| `dsh` | DeepSeek Harness (dsh CLI) | local process (SDK JSON-RPC) | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
+
+### Gemini CLI has been removed
+
+Gemini CLI is no longer maintained upstream, so botmux removed the `gemini` adapter, and the Dashboard and `botmux setup` no longer offer it (the old setup menu number 6 now reports an error instead of selecting another CLI). The replacement is `antigravity` (Antigravity, `agy`).
+
+- A bot whose `bots.json` entry still says `cliId: "gemini"` **refuses to start**, with a (Chinese) hint that Gemini CLI is retired and that `cliId` should be changed to `"antigravity"`. Other bots are unaffected.
+- To migrate: install `agy` and sign in with a Google account, or skip the sign-in and use a Gemini API key — set `modelProvider: "gemini"` in `~/.gemini/antigravity-cli/settings.json` and provide `GEMINI_API_KEY`. Then change `cliId` to `"antigravity"` (edit `bots.json` directly, or change the bot's CLI with `botmux setup`) and run `botmux restart`. While the bot is not started, the Dashboard shows the reason but cannot save its settings.
+- Gemini-specific settings do not carry over: `cliPathOverride` / `wrapperCli` (e.g. `ttadk gemini`), Gemini `model` names and `GEMINI_CLI_HOME` must be removed or reconfigured for the new CLI.
+
+## Pi execution progress
+
+Bots configured with `cliId: "pi"` display Pi's persisted thinking text, narration, tool calls and results in the Lark progress bubble. Tool nodes show commands or file paths and finish with the current turn; the final answer is sent through the reply channel.
+
+Progress is enabled by default and respects `cotEnabled` and the chat-level `/cot on` / `/cot off` switches. `/cot show` displays activity accumulated in the current turn.
+
+Updates follow complete messages written by Pi: calls appear before tool execution and results after execution. Content that has not been persisted is not streamed token by token. Historical records are not replayed into a new turn's bubble.
+
+## DeepSeek Harness (dsh)
+
+`cliId: "dsh"` drives a local `dsh` CLI (the [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner via `dsh --profile <name>` over the SDK JSON-RPC protocol. Prerequisites:
+
+1. `dsh` on PATH (or point `cliPathOverride` at it). **Upgrade note**: this is the `dsh` command from the npm package `@deepseek-ai/dsh`. Earlier versions relied on `dsh-jsonrpc-agent` from the Python wheel — if only that older command is on PATH, the adapter will fail with "command not found" after upgrading.
+2. Native `dsh` CLI configured (`$DSH_HOME/settings.yaml` + `$DSH_HOME/.credentials.yaml`; defaults to `~/.dsh/...` when `DSH_HOME` is unset).
+3. The target profile (default `botmux`, overridable per bot via `dshProfile`) lives under `$DSH_HOME/profiles/<name>/` (default `~/.dsh/profiles/<name>/`). **No manual setup is needed for first use**: when the profile is absent, botmux writes the skeleton (`package.json` + empty `cordis.yml` + `cordis.patch.yml`) and runs `dsh plugin add` to install its dependencies. To add community plugins or switch LLM providers, edit that profile's `cordis.patch.yml` — botmux only creates these files when missing and never overwrites existing content. Configure `DSH_HOME` only on the daemon process; per-bot `env.DSH_HOME` is reserved/rejected so the adapter's prepared paths cannot diverge from the child runtime.
+
+The runner reads `agent-default-model` (provider + model) from `$DSH_HOME/settings.yaml` for the initialize RPC; the plugin composition is entirely controlled by the profile's `cordis.patch.yml` — the runner no longer generates cordis.yml.
+
+When editing `cordis.patch.yml`, note that the two entry forms mean different things: `- insert: [...]` **inserts** new plugins, while a bare `- id: X` (no `insert`) **overrides the config of an existing** plugin and is silently skipped when that id is not present. The default patch botmux generates inserts only `sdk-jsonrpc-server` (the one plugin `dsh-base` lacks), inherits everything else from `dsh-base`, and disables the Web GUI plugins that would block startup in headless mode.
+
+Session JSONL lives under `$DSH_HOME/sessions/botmux/` (default `~/.dsh/sessions/botmux/`). Turns are multi-turn within one runner connection; a daemon restart starts a fresh session (no context resume). The TUI runtime (`dshRuntime: "tui"`) still keeps its own UI state under `~/.dsh-tui`.
+
+`ask_user_question` is bridged through a temporary DSH profile patch generated by botmux. The official runner injects the bridge directly; `dshRuntime: "tui"` uses a dsh-tui wrapper patch that wraps the native question provider, asks in Lark first, and falls back to the native TUI for unsupported prompts. Set `BOTMUX_DSH_ASK_BRIDGE=0` and restart the session to disable the bridge.
 
 ## Mir CLI and MCP Bridge
 
@@ -104,8 +142,30 @@ For the **specific wrapper scripts** of each gateway, use the docs published by 
 1. Create a new file under `src/adapters/cli/` implementing the `CliAdapter` interface
 2. Add the new ID to the `CliId` union type in `src/adapters/cli/types.ts`
 3. Add the import / switch case / export in `src/adapters/cli/registry.ts`
-4. Add the display name to `CLI_DISPLAY_NAMES` in `src/worker.ts` and `cliDisplayNames` in `card-builder.ts`
+4. Add the display name to `CLI_DISPLAY_NAMES` in `src/adapters/cli/display-names.ts` (shared by cards, the worker and the setup / dashboard pickers)
 5. Add an option to the setup interactive menu in `src/cli.ts`
 6. Update the README
 
 See [CONTRIBUTING.md](https://github.com/deepcoldy/botmux/blob/master/CONTRIBUTING.md) for details.
+
+## Native Codex App questions
+
+Botmux-managed `codex-app` sessions and `codex` sessions using app-server RPC bridge native `request_user_input` requests to Lark ask cards. A selection or text reply in the current conversation is returned under the original question IDs to the same native turn. TRAE RPC uses the same bridge.
+
+A batch preserves all questions and option descriptions. Text-only questions appear on a card awaiting a conversation text reply. A batch containing text-only questions is answered entirely through one text reply. Recommended labels are never accepted automatically. A text reply supplies the same batch-level comment to the questions, without including unsubmitted selections. Existing Ask routing and responder permissions apply.
+
+The wait lasts up to one hour. Dispatch errors, timeout, invalidation, or unsupported questions interrupt the native turn instead of returning empty answers. Turn completion, process exit, and session shutdown cancel pending waits; late answers are ignored. Native waits are not retried or restored across daemon restarts.
+
+Choice questions require at least two options. Secret inputs and malformed batches fail explicitly without answering only part of the batch. Do not send secrets through chat cards. Workflow subagents use `humanGate` / decision nodes instead. API-only sessions without Lark transport, ordinary terminal paste mode, and the App history service do not use this bridge.
+
+To verify, ask a model in an ordinary Codex App session to use native `request_user_input` for a choice question. Confirm the Lark card appears, then submit and confirm the same turn continues with your answer. Native tool availability still depends on the Codex version and execution mode.
+
+In `codex-app`, `request_user_input_async` messages carrying `delivery: async` and `questions` create standalone Lark ask cards while the model continues independent work. Cards remain answerable after normal turn completion. Answers preserve the native call ID and question index. With `codexAppCleanInput` enabled and native targeted input available, an authenticated answer from the original question recipient can join its still-running native turn through the existing delivery ledger. Once that turn ends, the answer starts a follow-up in the same thread. Legacy cards without a native turn marker, unavailable structured input, and ineligible origins retain serial delivery. Late answers never steer another native task. Duplicate events create one card; recommended options require explicit submission. An ended card confirms answer collection, not native model consumption. Older active runners upgrade at an idle boundary; targeted delivery applies to new questions with native routing metadata.
+
+Async questions accept nonempty native batches, one option, and duplicate labels. Human-origin cards use the existing canTalk registration policy and freeze the initiating answerer at registration; later speakers or reply-target eviction cannot retarget them. Authorized scheduled/autonomous cards use the existing canTalk responder policy; scheduled task creators still require canOperate permission and silent schedules never post cards. Document-comment turns privately deliver cards to the verified original author, who alone may answer. The answer's follow-up turn retains the original document-comment reply route instead of inheriting a later comment or the session owner.
+
+With concurrent cards, quote the intended card for text answers; unquoted input continues as an ordinary turn with a visible hint. A batch is submitted atomically; text replies provide a shared comment for the entire batch, and TUI-style partial per-question submission is not supported. Requests expire after one hour; expiry, card failures and undelivered answers produce notices. Turn failure/interruption, runner exit, session closure, or replacement cancels requests. Pending cards do not survive daemon/runner restarts and historical questions are not backfilled. Native availability depends on the Codex version; this async event bridge applies to `codex-app`.
+
+Card structure preview (rendered locally from actual card JSON; live Lark interaction has not yet been manually verified):
+
+![Codex native user input card preview](/img/codex-native-user-input-preview.png)

@@ -17,20 +17,6 @@ import type {
   StatusDot,
 } from './card-model-types.js';
 
-/** Concrete status values a SessionRow can carry (mirrors `StreamStatus | 'closed' | 'dormant'`). */
-export type SessionStatus =
-  | 'working'
-  | 'idle'
-  | 'analyzing'
-  | 'stalled'
-  | 'limited'
-  | 'starting'
-  | 'dormant'
-  | 'closed';
-
-/** Status-chip filter value — all StreamStatus + 'closed' + 'all'. */
-export type StatusChip = SessionStatus | 'all';
-
 /** A single row projected for the sessions list card. Keeps `raw` for downstream renderers. */
 export interface SessionRowDto {
   sessionId: string;
@@ -125,6 +111,7 @@ function formatRelative(fromMs: number, nowMs: number): string {
 function buildSecondary(row: SessionRow, nowMs?: number): string {
   const parts: string[] = [];
   if (row.cliId) parts.push(String(row.cliId));
+  if (row.cliInstanceSource) parts.push(`instance:${row.cliInstanceId ?? 'legacy'} (${row.cliInstanceSource})`);
   if (row.workingDir) parts.push(row.workingDir);
   if (typeof nowMs === 'number' && Number.isFinite(row.lastMessageAt)) {
     parts.push(formatRelative(row.lastMessageAt, nowMs));
@@ -155,33 +142,6 @@ export function composeEntries(rows: ReadonlyArray<SessionRow>, nowMs?: number):
     });
   }
   return out;
-}
-
-/**
- * Filter entries by status chip. `all` short-circuits with a shallow copy
- * (same content + order, but a fresh array so downstream pipelines can rely
- * on a non-aliased reference).
- */
-export function filterByStatus(entries: ReadonlyArray<SessionRowDto>, chip: StatusChip): SessionRowDto[] {
-  if (chip === 'all') return entries.slice();
-  return entries.filter(e => e.status === chip);
-}
-
-/** Filter entries by case-insensitive substring against sessionId / title / chatId / workingDir. */
-export function filterBySearch(entries: ReadonlyArray<SessionRowDto>, query: string | undefined): SessionRowDto[] {
-  if (!query) return entries.slice();
-  const needle = query.trim().toLowerCase();
-  if (needle.length === 0) return entries.slice();
-  return entries.filter(e => {
-    const hay = `${e.sessionId} ${e.raw.title ?? ''} ${e.raw.chatId} ${e.raw.workingDir ?? ''}`.toLowerCase();
-    return hay.includes(needle);
-  });
-}
-
-/** Filter entries by CLI id. `undefined` / empty string returns input unchanged. */
-export function filterByCli(entries: ReadonlyArray<SessionRowDto>, cliId: string | undefined): SessionRowDto[] {
-  if (cliId === undefined || cliId === '') return entries.slice();
-  return entries.filter(e => e.cliId === cliId);
 }
 
 const STATUS_ORDER: Record<string, number> = {

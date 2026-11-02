@@ -21,11 +21,11 @@ import {
   SAVED_WORKFLOW_ID_RE,
   SAVED_WORKFLOW_METADATA_SCHEMA_VERSION,
   SAVED_WORKFLOW_REVISION_ID_RE,
+  SAVED_WORKFLOW_REVISION_SCHEMA_VERSION,
   buildSavedWorkflowRevision,
   canonicalJsonStringify,
   loadSavedWorkflowRevision,
   mintSavedWorkflowId,
-  normalizeSavedWorkflowLookupKey,
   validateSavedWorkflowMetadata,
   type LoadedSavedWorkflowRevision,
   type SavedWorkflowMetadata,
@@ -118,11 +118,6 @@ export interface SavedWorkflowListResult {
   invalid: Array<{ workflowId: string; error: string }>;
 }
 
-export type SavedWorkflowResolution =
-  | { kind: 'not_found' }
-  | { kind: 'resolved'; metadata: SavedWorkflowMetadata }
-  | { kind: 'ambiguous'; matches: SavedWorkflowMetadata[] };
-
 export function workflowLibraryRoot(dataDir: string): string {
   if (!dataDir) throw new Error('dataDir is required');
   return join(dataDir, LIBRARY_DIR);
@@ -200,6 +195,14 @@ function buildRevisionPayload(
   };
 }
 
+function assertCurrentDagAuthoringVersion(draft: SavedWorkflowRevisionDraft): void {
+  if (draft.dagTemplate.schemaVersion !== 2) {
+    throw new Error(
+      'new Saved Workflow revision requires dagTemplate.schemaVersion=2 and stable outputs/output keys',
+    );
+  }
+}
+
 function loadedFromStored(stored: StoredSavedWorkflowRevision): LoadedSavedWorkflowRevision {
   return loadSavedWorkflowRevision(stored, {
     workflowId: (stored.payload as SavedWorkflowRevisionPayloadV1).workflowId,
@@ -228,7 +231,9 @@ function exactLibraryBytes(input: CreateOrRecoverExactSavedWorkflowInput): {
     workflowId: metadata.workflowId,
     revisionId: input.expectedRevision.revisionId,
   });
-  const rebuiltRevision = buildSavedWorkflowRevision(loadedRevision.payload);
+  const rebuiltRevision = input.expectedRevision.schemaVersion === SAVED_WORKFLOW_REVISION_SCHEMA_VERSION
+    ? buildSavedWorkflowRevision(loadedRevision.payload)
+    : input.expectedRevision;
   if (canonicalJsonStringify(rebuiltRevision) !== canonicalJsonStringify(input.expectedRevision)) {
     throw new SavedWorkflowConflictError('Expected Saved Workflow revision is not canonical');
   }
@@ -506,7 +511,10 @@ export async function verifyExactSavedWorkflowOrigin(
       try {
         const parsed = JSON.parse(bytes) as unknown;
         const loaded = loadSavedWorkflowRevision(parsed, { workflowId, revisionId });
-        if (bytes !== `${canonicalJsonStringify(buildSavedWorkflowRevision(loaded.payload))}\n`) {
+        const canonical = (parsed as StoredSavedWorkflowRevision).schemaVersion === SAVED_WORKFLOW_REVISION_SCHEMA_VERSION
+          ? buildSavedWorkflowRevision(loaded.payload)
+          : parsed;
+        if (bytes !== `${canonicalJsonStringify(canonical)}\n`) {
           throw new Error('non-canonical');
         }
         loadedRevisions.push(loaded);
@@ -565,6 +573,7 @@ export async function createSavedWorkflow(
   const workflowId = input.workflowId ?? mintSavedWorkflowId();
   assertWorkflowId(workflowId);
   const now = (input.now ?? new Date()).toISOString();
+  assertCurrentDagAuthoringVersion(input.revision);
   const stored = buildSavedWorkflowRevision(
     buildRevisionPayload(workflowId, 1, now, input.owner, input.revision),
   );
@@ -680,6 +689,7 @@ export async function appendSavedWorkflowRevision(
     }
     const previous = await readSavedWorkflowRevision(dataDir, workflowId, metadata.latestRevision);
     const now = (input.now ?? new Date()).toISOString();
+    assertCurrentDagAuthoringVersion(input.revision);
     const stored = buildSavedWorkflowRevision(
       buildRevisionPayload(
         workflowId,
@@ -731,24 +741,6 @@ export async function publishLatestSavedWorkflow(
   });
 }
 
-export async function archiveSavedWorkflow(
-  dataDir: string,
-  workflowId: string,
-  input: { actor: SavedWorkflowOwner; now?: Date },
-): Promise<SavedWorkflowMetadata> {
-  return withExistingSavedWorkflowMutationLock(dataDir, workflowId, async () => {
-    const metadata = await readSavedWorkflowMetadata(dataDir, workflowId);
-    assertOwner(metadata, input.actor);
-    const next = validateSavedWorkflowMetadata({
-      ...metadata,
-      status: 'archived',
-      updatedAt: (input.now ?? new Date()).toISOString(),
-    });
-    await writeMetadata(dataDir, next);
-    return next;
-  });
-}
-
 export async function listSavedWorkflows(
   dataDir: string,
   opts: ListSavedWorkflowOptions = {},
@@ -788,22 +780,6 @@ function isVisible(metadata: SavedWorkflowMetadata, opts: ListSavedWorkflowOptio
     if (!sameOwner(opts.actor, metadata.owner)) return false;
   }
   return true;
-}
-
-export async function resolveSavedWorkflowRef(
-  dataDir: string,
-  ref: string,
-  opts: ListSavedWorkflowOptions = {},
-): Promise<SavedWorkflowResolution> {
-  const normalized = normalizeSavedWorkflowLookupKey(ref);
-  const { entries } = await listSavedWorkflows(dataDir, opts);
-  const matches = entries.filter((metadata) =>
-    metadata.workflowId === ref ||
-    normalizeSavedWorkflowLookupKey(metadata.displayName) === normalized ||
-    metadata.aliases.some((alias) => normalizeSavedWorkflowLookupKey(alias) === normalized));
-  if (matches.length === 0) return { kind: 'not_found' };
-  if (matches.length > 1) return { kind: 'ambiguous', matches };
-  return { kind: 'resolved', metadata: matches[0]! };
 }
 
 async function writeMetadata(dataDir: string, metadata: SavedWorkflowMetadata): Promise<void> {

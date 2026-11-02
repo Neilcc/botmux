@@ -4,12 +4,23 @@ import { resolve } from 'node:path';
 
 import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
+import { MojoBackend } from './mojo-backend.js';
+import { isMojoFullyRemote } from './sandbox.js';
+import { mojoRemoteProofFailureReason } from './mojo-types.js';
+import type { EffectiveMojoConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
+import { RemoteRunnerBackend } from './remote-runner-backend.js';
+import type { RemoteRunnerConfig } from './remote-runner-config.js';
+import type { RemoteRunnerBackendState } from './remote-runner-protocol.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
+import { managedTmuxCandidateSockets } from './tmux-socket.js';
 import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
-import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
+import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
+import { isCodexAppCliId } from '../cli/types.js';
+import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
+import type { BackendType, HerdrBackendConfig, PersistentBackendTarget, SessionBackend, SessionProbe } from './types.js';
 
 const MANAGED_HERDR_AGENT_PREFIX = 'botmux-';
 const MANAGED_HERDR_AGENT_TOKEN_LENGTH = 25;
@@ -79,12 +90,14 @@ export function retireSupersededRecordedHerdrTarget(opts: {
   ownershipScope?: string;
   reuseRecordedHerdrTarget: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
+  herdrConfig?: HerdrBackendConfig;
 }): void {
   if (opts.reuseRecordedHerdrTarget) return;
   const recorded = opts.persistentBackendTarget;
   if (recorded?.backendType !== 'herdr' || !recorded.agentName) return;
 
-  const replacementSessionName = HerdrBackend.managedSessionName();
+  const configuredSession = opts.herdrConfig?.sessionName?.trim();
+  const replacementSessionName = configuredSession || HerdrBackend.managedSessionName();
   const replacementAgentName = managedHerdrAgentName(opts.sessionId, opts.ownershipScope);
   if (
     recorded.sessionName === replacementSessionName
@@ -149,20 +162,180 @@ export type BackendGateDecision =
  * abandoning it would spawn a duplicate CLI and orphan the real conversation.
  * tmux/zellij capability probes use disposable sessions; ZMX checks its
  * version and full-list control plane; Herdr uses `herdr --version`.
+ *
+ * `existingSessionUnknown` is the third state of that existence check: the
+ * probe itself got no answer (a timeout under host load), which a
+ * `hasSession()`-style boolean reports as "no session". Gating on that turns a
+ * false negative on the CHEAP check into a hard refusal for a session whose
+ * pane is alive. So an indeterminate existence answer spawns rather than gates
+ * — the reverse asymmetry from a kill-verification, where an unanswered probe
+ * must NOT be read as success. Callers that deliberately gate on an
+ * indeterminate result (ZMX ownership / protocol version, where adopting
+ * someone else's session is the worse outcome) simply leave this unset.
  */
 export function decideBackendGate(opts: {
   requested: BackendType;
   available: boolean;
   hasExistingSession: boolean;
+  existingSessionUnknown?: boolean;
 }): BackendGateDecision {
   if (opts.requested === 'pty') return { action: 'spawn' };
   if (opts.hasExistingSession) return { action: 'spawn' };
+  if (opts.existingSessionUnknown) return { action: 'spawn' };
   if (opts.available) return { action: 'spawn' };
   return { action: 'gate', reason: `${opts.requested} 后端在本机不可用` };
 }
 
+/** Inputs {@link decideBackendGate} needs for tmux, plus the frozen tri-state
+ *  existence decision the worker threads into {@link selectSessionBackend}. */
+export interface TmuxGateResolution {
+  /** Frozen existence decision. 'unknown' survives only when the tmux binary is
+   *  on PATH (i.e. the probe timed out under load, not "tmux is absent"). */
+  probe: SessionProbe;
+  available: boolean;
+  reason: string;
+  hasExistingSession: boolean;
+  existingSessionUnknown: boolean;
+}
+
+/**
+ * tmux side of the worker's backend gate, mirroring the zellij fix (#836).
+ *
+ * `TmuxBackend.hasSession()` is `probeSession() === 'exists'`, so it answers
+ * `false` both for "no such session" and for "has-session got no answer". Under
+ * host load the second case is real, and the functional probe (a disposable
+ * `new-session`) times out under the same pressure — so a session whose pane
+ * was alive the whole time got the "tmux 不可用 / brew install tmux" card.
+ *
+ *   exists  → reattach; capability probe skipped (PR#249 semantics).
+ *   missing → authoritative: run the capability probe; failure gates.
+ *   unknown → if the binary is NOT on PATH (`locate` is a fork-free stat, so it
+ *             stays authoritative under load) the "unknown" is really ENOENT:
+ *             treat as missing so the capability probe produces the actionable
+ *             install card instead of a node-pty/tmux `execvp` crash. If the
+ *             binary IS on PATH, spawn instead of gate (existingSessionUnknown).
+ *
+ * Deliberately no "create and swallow `duplicate session`" fallback: a create
+ * that collides never ran its argv/wrapper, so the worker's pre-spawn fresh
+ * state (boot marker, argv prompt, startup commands) would be wrong. The
+ * unknown is resolved BEFORE spawn instead, biased toward reattach — see
+ * {@link persistentReattachBias} and {@link reconcileBiasedReattachProbe}.
+ */
+export function resolveTmuxBackendGate(deps: {
+  probeSession: () => SessionProbe;
+  binaryOnPath: () => boolean;
+  probeFunctional: () => { ok: true } | { ok: false; reason: string };
+}): TmuxGateResolution {
+  let probe = deps.probeSession();
+  if (probe === 'unknown' && !deps.binaryOnPath()) probe = 'missing';
+  if (probe === 'exists') {
+    return { probe, available: true, reason: '', hasExistingSession: true, existingSessionUnknown: false };
+  }
+  if (probe === 'unknown') {
+    return { probe, available: true, reason: '', hasExistingSession: false, existingSessionUnknown: true };
+  }
+  const functional = deps.probeFunctional();
+  return {
+    probe,
+    available: functional.ok,
+    reason: functional.ok ? '' : functional.reason,
+    hasExistingSession: false,
+    existingSessionUnknown: false,
+  };
+}
+
+/** Where a managed tmux session should be looked for (see resolveManagedTmuxPlacement). */
+export interface ManagedTmuxPlacement {
+  /** Server holding the live pane — or, when `probe` is 'missing', where to create it. */
+  socketName: string | undefined;
+  probe: SessionProbe;
+}
+
+/**
+ * Pick the tmux server for a managed session before the backend gate runs.
+ *
+ *   - Target recorded WITH a socket: that server is authoritative. If the pane
+ *     is gone there, a new one is created on `preferred` (which may differ —
+ *     e.g. after `BOTMUX_TMUX_SOCKET` changed) unless one already lives there.
+ *   - No socket recorded (rows written before the dedicated socket, rows with
+ *     no target at all, the `BOTMUX_TMUX_SOCKET=default` opt-out) — the pane, if
+ *     any, is most likely on the DEFAULT server, so that is probed first and a
+ *     live legacy pane is reattached in place (no forced migration). `preferred`
+ *     is probed second, which also covers a socket the worker chose but whose
+ *     report to the daemon was lost.
+ *   - Nothing live: create on `preferred`.
+ *
+ * 'unknown' keeps the existing reattach bias ({@link persistentReattachBias}),
+ * pinned to the server that could not answer, so an indeterminate answer never
+ * becomes a duplicate pane on another server.
+ */
+export function resolveManagedTmuxPlacement(opts: {
+  /** `socketName` of the recorded tmux target; `undefined` when absent / default server. */
+  recordedSocketName: string | undefined;
+  /** Socket for a session created now (`preferredManagedTmuxSocket()`). */
+  preferred: string | undefined;
+  /** Launch-semantics existence probe on one server. */
+  probe: (socketName: string | undefined) => SessionProbe;
+}): ManagedTmuxPlacement {
+  const candidates = managedTmuxCandidateSockets(opts.recordedSocketName, opts.preferred);
+  let unknownOn: { socketName: string | undefined } | null = null;
+  for (const socketName of candidates) {
+    const probe = opts.probe(socketName);
+    if (probe === 'exists') return { socketName, probe };
+    if (probe === 'unknown' && !unknownOn) unknownOn = { socketName };
+  }
+  if (unknownOn) return { socketName: unknownOn.socketName, probe: 'unknown' };
+  return { socketName: opts.preferred, probe: 'missing' };
+}
+
+/**
+ * Reattach-vs-fresh from a frozen tri-state existence probe (tmux / zellij).
+ * Only an authoritative 'missing' cold-spawns. 'unknown' is biased toward
+ * reattach: under load a live pane is likelier than a gone one, and the two
+ * wrong guesses are not symmetric —
+ *   · wrong "reattach" (pane actually gone): `pipe-pane` / `attach` fails
+ *     loudly before any input is accepted; nothing is written as if a new
+ *     generation started, and the next launch re-probes.
+ *   · wrong "fresh" (pane actually alive): `new-session` collides, or worse, a
+ *     duplicate CLI is started and every fresh-path side effect (boot marker,
+ *     argv prompt, startupCommands replay) lands against the wrong process.
+ */
+export function persistentReattachBias(probe: SessionProbe | undefined): boolean | undefined {
+  if (probe === undefined) return undefined;
+  return probe !== 'missing';
+}
+
+/**
+ * Second look at a reattach that rests on an indeterminate probe, taken right
+ * before the worker freezes its predicted outcome (fresh marker / wrapper /
+ * startup commands / initial-prompt routing). An authoritative answer replaces
+ * the bias — notably 'missing' turns a doomed reattach into a proper cold
+ * spawn WITH the fresh-path setup. A still-'unknown' answer keeps the bias.
+ * Authoritative frozen decisions are returned untouched (no extra probe).
+ */
+export function reconcileBiasedReattachProbe(
+  frozen: SessionProbe | undefined,
+  reprobe: () => SessionProbe,
+): SessionProbe | undefined {
+  if (frozen !== 'unknown') return frozen;
+  return reprobe();
+}
+
 /** User-facing card shown when {@link decideBackendGate} gates a session. */
 export function backendGateUserMessage(backend: BackendType, reason: string): string {
+  // tmux is installed but the daemon's runtime (container seccomp/sandbox)
+  // blocks clone3/clone: install instructions cannot help, so the card must
+  // not show any — point at the sandbox policy and the PTY escape hatch.
+  if (backend === 'tmux' && classifyTmuxProbeFailure(reason) === 'env-denied') {
+    return [
+      '⚠️ 本机 tmux 不可用，无法启动会话。',
+      `原因：${reason}`,
+      'tmux 已经安装，问题出在 daemon 的运行环境：容器的 seccomp/沙箱策略禁止 clone3/clone 进程克隆，tmux server 无法启动。',
+      '处置：在容器/沙箱配置中放行 clone3（及 clone）系统调用后重试；'
+        + '或临时给该 bot 设置环境变量 BACKEND_TYPE=pty 用 PTY 后端兜底'
+        + '（PTY 会话不跨 daemon 重启存活，仅作应急）。',
+    ].join('\n');
+  }
   const installHint =
     backend === 'tmux'
       ? 'macOS: brew install tmux ｜ Debian/Ubuntu: sudo apt-get install -y tmux ｜ 其它发行版用对应包管理器安装 tmux'
@@ -187,26 +360,70 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
  */
 export function backendSandboxCompatibilityError(opts: {
   backendType: BackendType;
+  cliId?: string;
+  platform?: NodeJS.Platform;
   fileSandboxRequested: boolean;
   /** Compatibility input for callers that still model standalone read
    * isolation. The worker passes false because its unified sandbox request
    * already folds in the legacy readIsolation flag on every host. */
   effectiveReadIsolationRequested: boolean;
+  /**
+   * mojo only: proof-of-remote inputs. `env` / `jwtEnv` are part of the proof, not
+   * decoration — the launcher env decides which binary actually runs (see
+   * mojoUnprovableEnvKeys), so leaving them out let a redirected launcher pass.
+   */
+  mojoConfig?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  };
 }): string | undefined {
   const isolationRequested =
     opts.fileSandboxRequested || opts.effectiveReadIsolationRequested;
   if (!isolationRequested) return undefined;
+  // The Linux file sandboxes hide /tmp and the bootstrap directory, so this
+  // runner cannot reach its authenticated control endpoint. Credential-only
+  // bwrap keeps them visible and is not a file/read sandbox request here.
+  if ((opts.platform ?? process.platform) === 'linux' && isCodexAppCliId(opts.cliId)
+    && (opts.backendType === 'pty' || opts.backendType === 'tmux')) {
+    return 'codex_app_file_sandbox_unsupported';
+  }
   if (
     opts.backendType === 'pty'
     || opts.backendType === 'tmux'
     || opts.backendType === 'riff'
+    || opts.backendType === 'remote-runner'
   ) return undefined;
+  if (opts.backendType === 'mojo') {
+    // A fully-remote mojo session (cloud on, localDaemon off) executes nothing
+    // locally, so there is nothing for botmux's local sandbox to confine —
+    // same rationale as riff, and blocking it would brick sandbox-enabled bots.
+    //
+    // But mojo spawns its binary locally every turn, so with cloud off (or
+    // localDaemon on) the tools DO touch this host. MojoBackend does not launch
+    // that child under the sandbox wrapper, so honouring `sandbox: true` here is
+    // impossible — fail CLOSED with an actionable message rather than running
+    // unisolated while the user believes they are sandboxed.
+    if (isMojoFullyRemote(opts.mojoConfig)) return undefined;
+    // Explanation comes from the shared helper, NOT from a copy local to this gate:
+    // the mandatory device-isolation path refuses the same sessions and used to
+    // give different (and, for an env blocker, unusable) advice. See
+    // mojoRemoteProofFailureReason.
+    return 'backend "mojo" cannot prove it runs nothing locally, so the local '
+      + `sandbox must stay engaged: ${mojoRemoteProofFailureReason(opts.mojoConfig)} `
+      + 'Otherwise disable sandbox for this bot';
+  }
   return `backend "${opts.backendType}" does not support file/read isolation; `
     + 'use tmux/pty or disable sandbox for this bot';
 }
 
 /** Actionable card shown before an incompatible backend/isolation launch fails. */
 export function backendSandboxCompatibilityUserMessage(reason: string): string {
+  if (reason === 'codex_app_file_sandbox_unsupported') {
+    return 'Codex App 暂不支持 Linux 文件沙盒（oncall / scratch）。请关闭 sandbox（包括全局 BOTMUX_SANDBOX 和 legacy readIsolation），或选择支持文件沙盒的 CLI 后重试。';
+  }
   return [
     '⚠️ 当前后端无法执行 botmux 的文件沙盒或读隔离，已拒绝启动以避免未隔离运行。',
     `原因：${reason}`,
@@ -233,7 +450,9 @@ export interface SelectedSessionBackend {
 export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
-  backendConfig?: RiffBackendConfig;
+  backendConfig?: RiffBackendConfig | EffectiveMojoConfig | RemoteRunnerConfig | HerdrBackendConfig;
+  herdrConfig?: HerdrBackendConfig;
+  remoteBackendState?: RemoteRunnerBackendState;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
   herdrOwnershipScope?: string;
@@ -241,15 +460,44 @@ export function selectSessionBackend(opts: {
   reuseRecordedHerdrTarget?: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
   hasExistingSession?: boolean;
+  /** tmux server for the managed session (undefined = default server). */
+  tmuxSocketName?: string;
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
+  if (opts.backendType === 'remote-runner') {
+    return {
+      backend: new RemoteRunnerBackend(
+        (opts.backendConfig ?? {}) as RemoteRunnerConfig,
+        opts.sessionId,
+        opts.remoteBackendState,
+      ),
+      isTmuxMode: false,
+      isPipeMode: false,
+      isZellijMode: false,
+    };
+  }
+
+  if (opts.backendType === 'mojo') {
+    // Unlike riff, an absent config is FINE: every mojo field is optional and
+    // the bare `mojo` binary on PATH with an ambient login is a valid setup.
+    return {
+      backend: new MojoBackend(
+        (opts.backendConfig ?? {}) as EffectiveMojoConfig,
+        opts.sessionId,
+      ),
+      isTmuxMode: false,
+      isPipeMode: false,
+      isZellijMode: false,
+    };
+  }
+
   if (opts.backendType === 'riff') {
     if (!opts.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
     }
     return {
-      backend: new RiffBackend(opts.backendConfig, opts.sessionId),
+      backend: new RiffBackend(opts.backendConfig as RiffBackendConfig, opts.sessionId),
       isTmuxMode: false,
       isPipeMode: false,
       isZellijMode: false,
@@ -257,14 +505,18 @@ export function selectSessionBackend(opts: {
   }
 
   if (opts.backendType === 'zmx') {
-    const sessionName = ZmxBackend.sessionName(opts.sessionId);
-    const reattach = opts.hasExistingSession ?? ZmxBackend.hasSession(sessionName);
+    const recorded = opts.persistentBackendTarget?.backendType === 'zmx'
+      ? opts.persistentBackendTarget : undefined;
+    const sessionName = recorded?.sessionName ?? ZmxBackend.sessionName(opts.sessionId);
+    const socketDir = recorded?.socketDir ?? resolveZmxSocketDir();
+    const reattach = opts.hasExistingSession ?? ZmxBackend.hasSession(sessionName, zmxEnv(process.env, socketDir));
     return {
       backend: new ZmxBackend(sessionName, {
         ownsSession: true,
         isReattach: reattach,
         sessionId: opts.sessionId,
         recoveryStateDir: opts.zmxRecoveryStateDir,
+        socketDir,
       }),
       isTmuxMode: false,
       // ZMX is observed out-of-band (`zmx tail`) and driven independently
@@ -273,16 +525,29 @@ export function selectSessionBackend(opts: {
       isPipeMode: true,
       isZellijMode: false,
       persistentSessionName: sessionName,
-      persistentBackendTarget: { backendType: 'zmx', sessionName },
+      persistentBackendTarget: { backendType: 'zmx', sessionName, socketDir },
       isReattach: reattach,
     };
   }
 
   if (opts.backendType === 'zellij') {
     const sessionName = ZellijBackend.sessionName(opts.sessionId);
-    const reattach = ZellijBackend.hasSession(sessionName);
+    // Prefer the caller's frozen existence decision when supplied: the worker
+    // resolves a tri-state probe once (biasing an indeterminate answer toward
+    // "reattach", since a live pane is more authoritative than a load-timed-out
+    // probe — the same asymmetry decideBackendGate uses) and refreshes it to
+    // "gone" after any teardown, so a post-kill re-selection cold-spawns rather
+    // than reattaching to what it just removed. A bare live `hasSession()`
+    // cannot tell those two call sites apart, so only fall back to it when no
+    // decision was threaded in (default callers / unit tests).
+    const reattach = opts.hasExistingSession ?? ZellijBackend.hasSession(sessionName);
+    // A threaded-in decision is authoritative — tell the backend to honour it
+    // verbatim and skip spawn()'s `|| hasSession()` self-heal, which would
+    // otherwise re-probe and could reattach to a pane a teardown gate just
+    // removed. Default callers (no decision) keep the self-heal via 'auto'.
+    const reattachDecision = opts.hasExistingSession === undefined ? 'auto' : 'frozen';
     return {
-      backend: new ZellijBackend(sessionName, { ownsSession: true, isReattach: reattach }),
+      backend: new ZellijBackend(sessionName, { ownsSession: true, isReattach: reattach, reattachDecision }),
       isTmuxMode: false,
       isPipeMode: false,
       isZellijMode: true,
@@ -303,6 +568,14 @@ export function selectSessionBackend(opts: {
 
   if (opts.backendType === 'herdr') {
     const ownedSessionName = HerdrBackend.sessionName(opts.sessionId);
+    // The caller has already applied chatTypes (herdrConfigForSession); never
+    // re-derive placement from backendConfig, or an excluded session would get
+    // it back.
+    const herdrCfg = opts.herdrConfig;
+    const configuredSession = herdrCfg?.sessionName?.trim();
+    const isCustomSession = Boolean(configuredSession && configuredSession !== HerdrBackend.managedSessionName());
+    const hostSessionName = configuredSession || HerdrBackend.managedSessionName();
+    const placement = herdrCfg ? { herdrConfig: herdrCfg, isCustomHost: isCustomSession } : {};
     // A restarted worker must reattach to the SAME shared host selected by the
     // prior generation. Re-selecting from UI current/default state could pick a
     // different workspace, start a duplicate CLI there, and orphan
@@ -332,6 +605,9 @@ export function selectSessionBackend(opts: {
             isReattach: reattach,
             ownsSession: false,
             ownsAgent: true,
+            // A replacement started in the configured host keeps its Tab/split
+            // placement instead of falling back to a new workspace.
+            ...(recorded.sessionName === hostSessionName ? placement : {}),
           }),
           isTmuxMode: false,
           isPipeMode: true,
@@ -362,33 +638,82 @@ export function selectSessionBackend(opts: {
           + 'close it explicitly before enabling isolation or MCP',
         );
       }
-    } else if (HerdrBackend.hasSession(ownedSessionName)) {
-      return {
-        backend: new HerdrBackend(ownedSessionName, { isReattach: true }),
-        isTmuxMode: false,
-        isPipeMode: true,
-        isZellijMode: false,
-        persistentSessionName: ownedSessionName,
-        persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
-        isReattach: true,
-      };
+    } else {
+      // Owned isolation/MCP host. The reattach decision must be AGENT-precise, not
+      // session-level: herdr can keep a live host session whose `botmux` agent row
+      // has disappeared (killSession's own comment records that session dir, agent
+      // metadata and process state diverge). Predicting reattach from the SESSION
+      // alone would, when the agent is gone, make HerdrBackend.spawn's frozen
+      // reattach guard throw every launch (kill-loop) — and the worker would have
+      // skipped the cold-path setup (PENDING proof + credential-only wrapper, gated
+      // on !willReattachPersistent), so a silent fresh-start would run UNWRAPPED.
+      //
+      // Use TRI-STATE probes (never `hasSession && hasAgent` — those collapse
+      // `unknown` to false and re-introduce fail-open). Table:
+      //   host unknown                     → refuse (no kill, no spawn)
+      //   host missing                     → fall through to the shared-host cold path
+      //   host exists, agent unknown       → refuse
+      //   host exists, agent exists        → reattach the same owned host
+      //   host exists, agent missing       → COLD start IN the same owned host
+      //                                      (isReattach:false → worker writes
+      //                                      PENDING + assembles the wrapper, then
+      //                                      Herdr `agent start`s a new generation);
+      //                                      no teardown of the still-live host.
+      const ownedAgentName = HerdrBackend.defaultAgentName();
+      const hostProbe = HerdrBackend.probeSession(ownedSessionName);
+      if (hostProbe === 'unknown') {
+        throw new Error(
+          `owned herdr session ${ownedSessionName} probe inconclusive; `
+          + 'refusing isolation/MCP reattach-vs-fresh decision',
+        );
+      }
+      if (hostProbe === 'exists') {
+        const agentProbe = HerdrBackend.probeAgent(ownedSessionName, ownedAgentName);
+        if (agentProbe === 'unknown') {
+          throw new Error(
+            `owned herdr agent ${ownedAgentName} in ${ownedSessionName} probe inconclusive; `
+            + 'refusing isolation/MCP reattach-vs-fresh decision',
+          );
+        }
+        const agentLive = agentProbe === 'exists';
+        return {
+          backend: new HerdrBackend(ownedSessionName, {
+            // agent missing on a live host → in-place cold start (create the agent,
+            // NOT the session, which already exists).
+            isReattach: agentLive,
+          }),
+          isTmuxMode: false,
+          isPipeMode: true,
+          isZellijMode: false,
+          persistentSessionName: ownedSessionName,
+          persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
+          isReattach: agentLive,
+        };
+      }
+      // host missing → fall through to the shared-host cold path below.
     }
 
     // Every fresh agent actively launched by this machine's Botmux shares the
-    // reserved `botmux` Herdr host, regardless of which Lark bot, dashboard, or
-    // other Botmux entry point requested it. Topics remain isolated as distinct
-    // managed agents/panes. /adopt stays bound to its explicit user session.
-    const hostSessionName = HerdrBackend.managedSessionName();
+    // configured Herdr host (defaults to the reserved `botmux` session),
+    // regardless of which Lark bot, dashboard, or other Botmux entry point
+    // requested it. Topics remain isolated as distinct managed agents/panes.
+    // /adopt stays bound to its explicit user session.
     const agentName = managedHerdrAgentName(opts.sessionId, opts.herdrOwnershipScope);
     const hostExists = HerdrBackend.hasSession(hostSessionName);
     const reattach = hostExists && HerdrBackend.hasAgent(hostSessionName, agentName);
+
+    if (isCustomSession && !hostExists && !reattach) {
+      throw new Error(`herdr session "${hostSessionName}" is not running; please start it or check your herdr.sessionName configuration`);
+    }
+
     return {
       backend: new HerdrBackend(hostSessionName, {
-        createSession: !hostExists,
+        createSession: !hostExists && !isCustomSession,
         agentName,
         isReattach: reattach,
         ownsSession: false,
         ownsAgent: true,
+        ...placement,
       }),
       isTmuxMode: false,
       isPipeMode: true,
@@ -396,30 +721,39 @@ export function selectSessionBackend(opts: {
       persistentSessionName: hostSessionName,
       persistentBackendTarget: { backendType: 'herdr', sessionName: hostSessionName, agentName },
       isReattach: reattach,
-      createdHerdrSessionName: hostExists ? undefined : hostSessionName,
+      createdHerdrSessionName: hostExists || isCustomSession ? undefined : hostSessionName,
     };
   }
 
   const sessionName = TmuxBackend.sessionName(opts.sessionId);
-  if (TmuxBackend.hasSession(sessionName)) {
+  const socketName = opts.tmuxSocketName;
+  // Default-server targets keep the historical shape (no socketName key).
+  const persistentBackendTarget: PersistentBackendTarget = socketName === undefined
+    ? { backendType: 'tmux', sessionName }
+    : { backendType: 'tmux', sessionName, socketName };
+  // Prefer the worker's frozen decision (tri-state probe resolved once at the
+  // gate, biased toward reattach on 'unknown', refreshed to 'missing' after any
+  // teardown) so the gate, the pre-spawn fresh/reattach setup and the backend
+  // all agree. Default callers without a decision keep the live boolean probe.
+  if (opts.hasExistingSession ?? TmuxBackend.hasSession(sessionName, socketName)) {
     return {
-      backend: new TmuxPipeBackend(sessionName, { ownsSession: true, isReattach: true }),
+      backend: new TmuxPipeBackend(sessionName, { ownsSession: true, isReattach: true, socketName }),
       isTmuxMode: true,
       isPipeMode: true,
       isZellijMode: false,
       persistentSessionName: sessionName,
-      persistentBackendTarget: { backendType: 'tmux', sessionName },
+      persistentBackendTarget,
       isReattach: true,
     };
   }
 
   return {
-    backend: new TmuxPipeBackend(sessionName, { createSession: true, ownsSession: true }),
+    backend: new TmuxPipeBackend(sessionName, { createSession: true, ownsSession: true, socketName }),
     isTmuxMode: true,
     isPipeMode: true,
     isZellijMode: false,
     persistentSessionName: sessionName,
-    persistentBackendTarget: { backendType: 'tmux', sessionName },
+    persistentBackendTarget,
     isReattach: false,
   };
 }

@@ -7,6 +7,16 @@ export interface BotmuxCapabilitiesDocument {
     stable_app_dispatch_v1: true;
     stable_dispatch_acceptance_v1: true;
     managed_activation_v2: true;
+    current_actor_v2: true;
+    current_execution_v1: true;
+    current_execution_origin_v1: true;
+    controlled_failure_recovery_v1: true;
+    headless_session_v1: true;
+    constrained_invocation_v1: true;
+    model_only_invocation_v1: true;
+    completion_proposal_v1: true;
+    ask_form_v1: true;
+    riff_host_tools_v1: true;
   };
 }
 
@@ -34,6 +44,16 @@ export function botmuxCapabilities(): BotmuxCapabilitiesDocument {
       stable_app_dispatch_v1: true,
       stable_dispatch_acceptance_v1: true,
       managed_activation_v2: true,
+      current_actor_v2: true,
+      current_execution_v1: true,
+      current_execution_origin_v1: true,
+      controlled_failure_recovery_v1: true,
+      headless_session_v1: true,
+      constrained_invocation_v1: true,
+      model_only_invocation_v1: true,
+      completion_proposal_v1: true,
+      ask_form_v1: true,
+      riff_host_tools_v1: true,
     },
   };
 }

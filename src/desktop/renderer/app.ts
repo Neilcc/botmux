@@ -92,6 +92,10 @@ const desktopShellInjectedCss = `
     grid-column: 1 / -1 !important;
     min-width: 0 !important;
     width: 100% !important;
+    /* 浏览器端侧边栏悬浮成 fixed 卡片后，.workspace 用 margin-left 让位；
+       桌面端靠注入 CSS 隐藏 .sidebar，必须把这段让位清零，否则内容整体右移
+       留下一条与隐藏侧栏等宽的空隙。 */
+    margin-left: 0 !important;
   }
 
   .attention-strip {
@@ -103,18 +107,21 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'app.subtitle': '飞书 AI CLI 控制台',
     'nav.overview': '总览',
     'nav.sessions': '会话',
+    'nav.decisionBoard': '决策看板',
+    'nav.workbench': '驾驶舱',
     'nav.insights': '洞察',
     'nav.workflows': '工作流',
     'nav.groups': '群组',
     'nav.monitoring': '监控看板',
     'nav.schedules': '定时',
     'nav.whiteboards': '白板',
+    'nav.docWatches': '文档监听',
     'nav.roles': '角色管理',
+    'nav.messageListeners': '消息监听',
     'nav.botDefaults': 'Bot 配置',
+    'nav.agents': 'Agent',
     'nav.skills': 'Skills',
-    'nav.team': '团队',
     'nav.connectors': 'Webhook',
-    'nav.office': '办公室',
     'nav.settings': '设置',
     'summary.onlineDaemons': '在线 Daemon',
     'summary.needsAttention': '需要处理',
@@ -186,18 +193,21 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'app.subtitle': 'Feishu AI CLI Control',
     'nav.overview': 'Overview',
     'nav.sessions': 'Sessions',
+    'nav.decisionBoard': 'Decision board',
+    'nav.workbench': 'Cockpit',
     'nav.insights': 'Insight',
     'nav.workflows': 'Workflows',
     'nav.groups': 'Groups',
     'nav.monitoring': 'Monitoring',
     'nav.schedules': 'Schedules',
     'nav.whiteboards': 'Whiteboards',
+    'nav.docWatches': 'Doc Watches',
     'nav.roles': 'Roles',
+    'nav.messageListeners': 'Message Listener',
     'nav.botDefaults': 'Bot Profiles',
+    'nav.agents': 'Agents',
     'nav.skills': 'Skills',
-    'nav.team': 'Team',
     'nav.connectors': 'Webhook',
-    'nav.office': 'Office',
     'nav.settings': 'Settings',
     'summary.onlineDaemons': 'Online daemons',
     'summary.needsAttention': 'Needs attention',

@@ -2,7 +2,7 @@
 import type React from 'react';
 import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { bootstrap, store } from './store.js';
 import {
@@ -31,13 +31,37 @@ import { InfoTip } from './dashboard-components.js';
 import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { initIconTooltips } from './icon-tooltip.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
-import { updateAndRestartBotmux, type BotmuxUpdatePhase } from './update-action.js';
+import {
+  updateAndRestartBotmux,
+  type BotmuxUpdatePhase,
+  type BinaryUpdateStatus,
+  type UpdateStatusSnapshot,
+  type OtherUpdateState,
+  updateActionErrorCode,
+  classifyOtherUpdate,
+  observedInstallCompleted,
+  pollUpdateStatus,
+  binaryProgressRingValue,
+  binaryProgressText,
+} from './update-action.js';
 import {
   canonicalDashboardClientShellUrl,
   dashboardClientShellRedirect,
   readDashboardClientShell,
+  readDashboardWorkbenchShell,
 } from './client-shell.js';
 import { dashboardLoginHref } from './auth-login.js';
+import { ToastStack } from './toast.js';
+import { createHashChangeHandler } from './leave-guard.js';
+import { ConfirmModalRoot } from './confirm-modal.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  parseWorkbenchCapabilities,
+} from './agent-workbench-capabilities.js';
+import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
+import { NAV_GROUPS, NAV_ITEMS, NAV_SUBPAGES, type NavItem } from './nav-items.js';
+import { DECISION_BOARD_CHANGED_EVENT, boardsFromResponse } from './decision-board-model.js';
+import type { PalettePageEntry, PaletteShellContext } from './command-palette-sources.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -52,22 +76,21 @@ type BotmuxUpdateStatus = {
   current: string;
   latest: string | null;
   versionLookupOk: boolean;
+  latestSource?: 'configured' | 'public' | 'configured-fallback' | null;
   behind: boolean;
   localDevInstall: boolean;
   updateSupported: boolean;
+  /** Whether /api/update/rollback can actually drive this install. Absent on
+   *  older backends; see the fallback where it is consumed. */
+  rollbackSupported?: boolean;
   updateCommand: string | null;
   node: { version: string; required: number; ok: boolean };
   installs: { entries: Array<{ binPath: string }>; multiple: boolean };
-};
-
-type NavItem = {
-  id: string;
-  href: string;
-  labelKey?: string;
-  label?: string;
-  manage?: boolean;
-  plugin?: boolean;
-  icon: ReactNode;
+  runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+  runningDaemonRestartHint?: string;
+  // Present on backends that report live binary-download progress.
+  updateInFlight?: boolean;
+  binaryUpdate?: BinaryUpdateStatus | null;
 };
 
 type PluginDashboardNavEntry = {
@@ -82,81 +105,35 @@ const MANAGE_ROUTES = [
   'roles',
   'role-profiles',
   'bot-defaults',
+  'agents',
   'skills',
+  'customization',
+  'doc-watches',
+  'message-listeners',
   'plugins',
-  'team',
   'connectors',
   'insights',
+  'feedback',
   'whiteboards',
+  'terminal',
 ];
 
-const NAV_ITEMS: NavItem[] = [
-  {
-    id: 'overview',
-    href: '#/',
-    labelKey: 'nav.overview',
-    icon: (
-      <>
-        <rect x="1.5" y="1.5" width="5.4" height="5.4" rx="1.5" />
-        <rect x="9.1" y="1.5" width="5.4" height="5.4" rx="1.5" />
-        <rect x="1.5" y="9.1" width="5.4" height="5.4" rx="1.5" />
-        <rect x="9.1" y="9.1" width="5.4" height="5.4" rx="1.5" />
-      </>
-    ),
-  },
-  { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
-  {
-    id: 'groups',
-    href: '#/groups',
-    labelKey: 'nav.groups',
-    icon: (
-      <>
-        <circle cx="5.6" cy="5.8" r="2.4" />
-        <circle cx="11" cy="6.8" r="1.9" />
-        <path d="M1.8 13.2c.5-2.4 2-3.6 3.8-3.6s3.3 1.2 3.8 3.6M9.8 12.6c.4-1.7 1.5-2.6 2.8-2.6 1 0 1.9.5 2.4 1.6" />
-      </>
-    ),
-  },
-  { id: 'roles', href: '#/roles', labelKey: 'nav.roles', manage: true, icon: <><path d="M8 1.8l5.2 2v3.4c0 3.4-2.2 5.9-5.2 7-3-1.1-5.2-3.6-5.2-7V3.8z" /><path d="M5.8 8l1.6 1.6 2.8-3" /></> },
-  {
-    id: 'monitoring',
-    href: '#/monitoring',
-    labelKey: 'nav.monitoring',
-    icon: (
-      <>
-        <path d="M2 9.2h2.3l1.3-4.8 2.5 8.4 1.8-5.1h4.1" />
-        <path d="M2 2.5h12v11H2z" />
-      </>
-    ),
-  },
-  { id: 'insights', href: '#/insights', labelKey: 'nav.insights', manage: true, icon: <><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5" /></> },
-  {
-    id: 'workflows',
-    href: '#/workflows',
-    labelKey: 'nav.workflows',
-    icon: (
-      <>
-        <circle cx="3.4" cy="3.6" r="1.9" />
-        <circle cx="3.4" cy="12.4" r="1.9" />
-        <circle cx="12.6" cy="8" r="1.9" />
-        <path d="M5.2 4.4l5.6 2.8M5.2 11.6l5.6-2.8" />
-      </>
-    ),
-  },
-  { id: 'schedules', href: '#/schedules', labelKey: 'nav.schedules', icon: <><circle cx="8" cy="8" r="6.2" /><path d="M8 4.5V8l2.4 1.6" /></> },
-  { id: 'whiteboards', href: '#/whiteboards', labelKey: 'nav.whiteboards', manage: true, icon: <><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2" /><path d="M4.8 5.2h6.4M4.8 8h6.4M4.8 10.8h4" /></> },
-  { id: 'office', href: '#/office', labelKey: 'nav.office', icon: <><rect x="3" y="4" width="10" height="7" rx="2" /><circle cx="6" cy="7.5" r="1" /><circle cx="10" cy="7.5" r="1" /><path d="M8 4V2M4.5 11v2M11.5 11v2" /></> },
-  { id: 'bot-defaults', href: '#/bot-defaults', labelKey: 'nav.botDefaults', manage: true, icon: <><rect x="2.5" y="5" width="11" height="8" rx="2" /><circle cx="5.8" cy="9" r="1" /><circle cx="10.2" cy="9" r="1" /><path d="M8 5V2.5M5.5 13v1.2M10.5 13v1.2" /></> },
-  { id: 'skills', href: '#/skills', labelKey: 'nav.skills', manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
-  { id: 'plugins', href: '#/plugins', label: '插件', manage: true, icon: <><path d="M6.4 1.8h3.2v3h2.8v3.2H9.6v2.8H6.4V8H3.6V4.8h2.8z" /><path d="M2.2 11.8h11.6v2.4H2.2z" /></> },
-  { id: 'team', href: '#/team', labelKey: 'nav.team', manage: true, icon: <><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c-2 1.8-2 10.6 0 12.4 2-1.8 2-10.6 0-12.4z" /></> },
-  { id: 'connectors', href: '#/connectors', labelKey: 'nav.connectors', manage: true, icon: <><path d="M5.5 6.5v-3a2.5 2.5 0 0 1 5 0v3" /><rect x="3.5" y="6.5" width="9" height="7" rx="2" /></> },
-  { id: 'settings', href: '#/settings', labelKey: 'nav.settings', icon: <><path d="M8 1.75 9.35 2.05 10 3.28l1.38.3 1.04-.96.96.96-.96 1.04.3 1.38 1.23.65L14.25 8l-.3 1.35-1.23.65-.3 1.38.96 1.04-.96.96-1.04-.96-1.38.3-.65 1.23L8 14.25l-1.35-.3L6 12.72l-1.38-.3-1.04.96-.96-.96.96-1.04-.3-1.38-1.23-.65L1.75 8l.3-1.35 1.23-.65.3-1.38-.96-1.04.96-.96 1.04.96 1.38-.3.65-1.23z" /><circle cx="8" cy="8" r="2" /></> },
-];
 
 let pinnedPluginNavItems: NavItem[] = [];
+/** 至少有一个 Bot 设为管家时，侧边栏才显示「决策看板」（见 loadDecisionBoardNav）。 */
+let decisionBoardNavVisible = false;
+/** 全部插件 Dashboard 页面（含没置顶的）；⌘K 收录全部，侧边栏只放置顶的。 */
+let pluginPageNavItems: NavItem[] = [];
 
 let isAuthed = true;
+/**
+ * `/api/settings` 明确回答了登录态（200 或带身份语义的 401）才置位。请求失败（网络错误 /
+ * 5xx）时 isAuthed 只是默认的 true，不能据此去拉管理数据——公开只读访客会吃到 401 弹登录浮层。
+ */
+let authStateKnown = false;
+/** 上一次探 /api/settings 的时间；登录态未知时唤起面板会再探，但至少间隔 AUTH_REPROBE_MS。 */
+let lastAuthProbeAt = 0;
+const AUTH_REPROBE_MS = 10_000;
 let publicReadOnly = false;
 let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
@@ -203,9 +180,14 @@ function isActiveNav(item: NavItem, hash: string): boolean {
 }
 
 function sidebarNavItems(): NavItem[] {
-  const builtInItems = readDashboardClientShell()
-    ? NAV_ITEMS.filter(item => item.id !== 'workflows')
-    : NAV_ITEMS;
+  const clientShell = readDashboardClientShell();
+  const builtInItems = NAV_ITEMS.filter(item => {
+    if (clientShell && item.id === 'workflows') return false;
+    // 网页终端在 Desktop/Mobile 客户端壳里归原生会话面管（见 dashboardShellAllowsWebTerminal）。
+    if (item.id === 'terminal') return !clientShell && ui.hostTerminal;
+    if (item.id === 'decision-board') return decisionBoardNavVisible;
+    return true;
+  });
   if (pinnedPluginNavItems.length === 0) return builtInItems;
   const pluginIndex = builtInItems.findIndex(item => item.id === 'plugins');
   if (pluginIndex < 0) return [...builtInItems, ...pinnedPluginNavItems];
@@ -216,11 +198,82 @@ function sidebarNavItems(): NavItem[] {
   ];
 }
 
+/** ⌘K 面板的「页面」条目：与侧边栏同一份可见性（权限 / 客户端壳 / pinned 插件）。 */
+function paletteNavPages(): PalettePageEntry[] {
+  const groupOf = new Map<string, string>();
+  for (const group of NAV_GROUPS) for (const id of group.items) groupOf.set(id, group.labelKey);
+  const visible = sidebarNavItems().filter(item => isAuthed || !item.manage);
+  const byId = new Map(visible.map(item => [item.id, item]));
+  const pages: PalettePageEntry[] = visible.map(item => {
+    const groupKey = groupOf.get(item.plugin ? 'plugins' : item.id);
+    return {
+      id: item.id,
+      href: item.href,
+      label: labelOf(item),
+      labelKey: item.labelKey,
+      aliases: item.aliases,
+      groupLabel: groupKey ? t(groupKey) : undefined,
+      icon: item.icon,
+    };
+  });
+  // 不在侧边栏的子页面 / 页内 tab：父项可见才收录，客户端壳会重定向走的地址跳过。
+  for (const sub of NAV_SUBPAGES) {
+    const parent = byId.get(sub.parentId);
+    if (!parent || dashboardClientShellRedirect(sub.href)) continue;
+    const groupKey = groupOf.get(parent.id);
+    pages.push({
+      id: sub.id,
+      href: sub.href,
+      label: t(sub.labelKey),
+      labelKey: sub.labelKey,
+      aliases: sub.aliases,
+      parent: { label: labelOf(parent), labelKey: parent.labelKey },
+      groupLabel: groupKey ? t(groupKey) : undefined,
+      icon: parent.icon,
+    });
+  }
+  // 没置顶的插件页面（置顶的已作为侧边栏条目收录）。
+  const pluginsEntry = byId.get('plugins');
+  if (pluginsEntry) {
+    for (const plugin of pluginPageNavItems) {
+      if (byId.has(plugin.id)) continue;
+      pages.push({ id: plugin.id, href: plugin.href, label: labelOf(plugin), groupLabel: labelOf(pluginsEntry), icon: plugin.icon });
+    }
+  }
+  return pages;
+}
+
 function navClassName(item: NavItem): string | undefined {
   const classes = [];
   if (isActiveNav(item, activeHash)) classes.push('active');
   if (item.id === 'settings' && updateBehind) classes.push('nav-has-update');
   return classes.length ? classes.join(' ') : undefined;
+}
+
+/** 侧边栏导航锚点：桌面分组导航与移动端横向 rail 共用同一份渲染。 */
+function renderNavAnchor(item: NavItem): React.JSX.Element {
+  return (
+    <a
+      href={item.href}
+      data-route={item.id}
+      className={[navClassName(item), item.plugin ? 'sidebar-plugin-item' : ''].filter(Boolean).join(' ') || undefined}
+      title={item.plugin ? labelOf(item) : undefined}
+    >
+      {icon(item.icon)}
+      <span className="sidebar-nav-label">{labelOf(item)}</span>
+      {item.id === 'settings' && updateBehind ? (
+        <InfoTip
+          className="nav-update-tip"
+          label={updateBadgeTitle()}
+          trigger={<span className="nav-update-dot" aria-hidden="true" />}
+          preventClick={false}
+          focusable={false}
+        >
+          {updateBadgeTitle()}
+        </InfoTip>
+      ) : null}
+    </a>
+  );
 }
 
 function readShellLocale(): DashboardLocale | null {
@@ -383,6 +436,62 @@ function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): React.JSX.E
         <span>{t('overview.openSessions')}</span>
       </div>
     </div>
+  );
+}
+
+// ── ⌘K 全局搜索 ─────────────────────────────────────────────────────────────
+// 壳层只负责唤起（快捷键 + 顶栏入口）；面板本体是独立 chunk，首次唤起或空闲时预取。
+const PALETTE_MAC = typeof navigator !== 'undefined' && isMacLike(
+  (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || navigator.platform || '',
+);
+type CommandPaletteModule = typeof import('./command-palette.js');
+let commandPaletteModule: Promise<CommandPaletteModule> | null = null;
+
+function loadCommandPalette(): Promise<CommandPaletteModule> {
+  commandPaletteModule ??= import('./command-palette.js').catch(error => {
+    commandPaletteModule = null;
+    throw error;
+  });
+  return commandPaletteModule;
+}
+
+/** 当前 hash 是否落在无边框工作台壳上（没有顶栏 / 侧栏，也不挂 ⌘K 面板）；见 DashboardShell 里的说明。 */
+function framelessWorkbenchSurface(hash: string): 'dock' | 'appCenter' | 'board' | null {
+  if (!readDashboardClientShell() && !readDashboardWorkbenchShell()) return null;
+  if (hash.startsWith('#/agent-workbench-dock')) return 'dock';
+  if (hash.startsWith('#/agent-workbench')) return 'appCenter';
+  // 决策看板的直达入口（飞书侧栏 AppLink → /board/<app>/<seq>）带沉浸式标记：侧栏只有
+  // 350–800px，不放 Dashboard 的顶栏和侧栏；从 Dashboard 侧边栏点进来仍是正常壳。
+  if (readDashboardWorkbenchShell() && hash.startsWith('#/board')) return 'board';
+  return null;
+}
+
+function preloadCommandPalette(): void {
+  void loadCommandPalette().catch(() => { /* 真正唤起时再报错 */ });
+}
+
+function openCreateBotFromPalette(): void {
+  void openBotOnboarding();
+}
+
+function CommandPaletteTrigger(props: { onOpen(): void }): React.JSX.Element {
+  const shortcut = paletteShortcutLabel(PALETTE_MAC);
+  return (
+    <button
+      type="button"
+      className="topbar-search-trigger"
+      aria-haspopup="dialog"
+      aria-keyshortcuts={PALETTE_MAC ? 'Meta+K' : 'Control+K'}
+      aria-label={`${t('palette.dialogLabel')} (${shortcut})`}
+      title={`${t('palette.dialogLabel')} (${shortcut})`}
+      onPointerEnter={preloadCommandPalette}
+      onFocus={preloadCommandPalette}
+      onClick={props.onOpen}
+    >
+      {icon(<><circle cx="7" cy="7" r="4.6" /><path d="m10.4 10.4 3.6 3.6" /></>)}
+      <span className="topbar-search-text">{t('palette.triggerPlaceholder')}</span>
+      <kbd className="topbar-search-kbd" aria-hidden="true">{shortcut}</kbd>
+    </button>
   );
 }
 
@@ -565,6 +674,9 @@ function TopbarVersionControl(props: {
   const { status } = props;
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
+  const [progress, setProgress] = useState(0);
+  const [binaryStatus, setBinaryStatus] = useState<BinaryUpdateStatus | null>(null);
+  const [observeKind, setObserveKind] = useState<OtherUpdateState | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshFailed, setRefreshFailed] = useState(false);
   const [errorDetail, setErrorDetail] = useState('');
@@ -577,6 +689,16 @@ function TopbarVersionControl(props: {
   const [activeRollback, setActiveRollback] = useState<string | null>(null);
   const actionInFlightRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
+  const progressTimerRef = useRef<number | null>(null);
+  const stopPollingRef = useRef<(() => void) | null>(null);
+  // After a 409 update_in_flight we attach to the update that blocked us, which
+  // may run in another tab (flag visible) or in the CLI/maintenance process
+  // (flag invisible — install completion is detected from version state, and
+  // the actual reload only after the dashboard instance changes).
+  const observingRef = useRef(false);
+  const observeRollbackRef = useRef(false);
+  const observeStartVersionRef = useRef('');
+  const observeInstanceRef = useRef('');
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLElement>(null);
@@ -588,9 +710,21 @@ function TopbarVersionControl(props: {
     reconnectTimerRef.current = null;
   };
 
+  const clearProgressTimer = () => {
+    if (progressTimerRef.current === null) return;
+    window.clearInterval(progressTimerRef.current);
+    progressTimerRef.current = null;
+  };
+
   useEffect(() => {
     actionInFlightRef.current = false;
+    observingRef.current = false;
+    stopPollingRef.current?.();
+    stopPollingRef.current = null;
     setPhase('idle');
+    setProgress(0);
+    setBinaryStatus(null);
+    setObserveKind(null);
     setRefreshing(false);
     setRefreshFailed(false);
     setErrorDetail('');
@@ -602,6 +736,31 @@ function TopbarVersionControl(props: {
     setSelectedRollback(null);
     setActiveRollback(null);
   }, [status?.current, status?.latest]);
+
+  // Faux progress bar. npm install gives no reliable percentage, so we creep a
+  // deliberately-capped bar per phase: install climbs toward 50% (the real
+  // install ends there), restart+reconnect climbs toward ~95%; the actual
+  // reconnect reload finishes the job, so we never fake a 100%. A live binary
+  // download replaces the creep with its measured byte progress. Reset to 0 on
+  // idle/error clears it.
+  useEffect(() => {
+    clearProgressTimer();
+    if (phase === 'idle' || phase === 'error') {
+      setProgress(0);
+      return;
+    }
+    if (phase === 'updating' && binaryStatus) {
+      const ring = binaryProgressRingValue(binaryStatus);
+      if (ring !== null) setProgress(ring);
+      return;
+    }
+    const cap = phase === 'updating' ? 50 : 95;
+    if (phase === 'restarting') setProgress(value => Math.max(value, 50));
+    progressTimerRef.current = window.setInterval(() => {
+      setProgress(value => (value >= cap ? cap : value + Math.max(0.5, (cap - value) * 0.08)));
+    }, 400);
+    return () => clearProgressTimer();
+  }, [phase, binaryStatus]);
 
   useEffect(() => {
     if (status) setRefreshFailed(status.versionLookupOk === false);
@@ -651,7 +810,7 @@ function TopbarVersionControl(props: {
     };
   }, [open]);
 
-  useEffect(() => () => clearReconnectTimer(), []);
+  useEffect(() => () => { clearReconnectTimer(); clearProgressTimer(); stopPollingRef.current?.(); }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -677,9 +836,17 @@ function TopbarVersionControl(props: {
 
   const behind = status.behind && !!status.latest;
   const unknown = !status.latest;
+  const mirrorFallback = status.latestSource === 'configured-fallback';
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
-  const rollbackSupported = status.updateSupported && !status.localDevInstall && status.node.ok;
+  // Older backends omit rollbackSupported; retain their update capability fallback.
+  const rollbackSupported = (status.rollbackSupported ?? status.updateSupported)
+    && !status.localDevInstall && status.node.ok;
   const busy = phase === 'updating' || phase === 'restarting';
+  // Progress-ring geometry. R=20 → circumference C; the arc fills clockwise
+  // from 12 o'clock for `progress`%.
+  const RING_R = 20;
+  const RING_C = 2 * Math.PI * RING_R;
+  const ringDashoffset = RING_C * (1 - Math.max(2, Math.round(progress)) / 100);
   const command = status.updateCommand ?? 'botmux update';
   const currentVersion = `v${status.current}`;
   const latestVersion = status.latest ? `v${status.latest}` : '';
@@ -713,6 +880,73 @@ function TopbarVersionControl(props: {
     reconnectTimerRef.current = window.setTimeout(() => void tick(), 3_000);
   };
 
+  // Called by the status poller both while OUR OWN POST is in flight (live byte
+  // progress) and after a 409, while observing an update running elsewhere.
+  const handleStatusSnapshot = (snapshot: UpdateStatusSnapshot): void => {
+    if (!observingRef.current) {
+      setBinaryStatus(snapshot.binaryUpdate ?? null);
+      return;
+    }
+    // A cross-process updater never flips this dashboard's in-memory flag, so
+    // install completion comes from version state: rollback moves current, an
+    // update makes `behind` false. But "installed on disk" is NOT "running":
+    // the winner may still be sitting on a restart confirmation (Settings) or
+    // be a CLI update that never restarts. So we only switch to the restart
+    // phase here and let the /__selfcheck instance watcher decide about the
+    // reload — never reload on version state alone.
+    if (observedInstallCompleted(snapshot, observeStartVersionRef.current, observeRollbackRef.current)) {
+      observingRef.current = false;
+      stopPollingRef.current?.();
+      stopPollingRef.current = null;
+      setBinaryStatus(null);
+      setObserveKind(null);
+      setPhase('restarting');
+      pollReconnect(observeInstanceRef.current);
+      return;
+    }
+    const kind = classifyOtherUpdate(snapshot);
+    setObserveKind(kind);
+    setBinaryStatus(kind === 'progress' ? snapshot.binaryUpdate ?? null : null);
+  };
+
+  // Progress-only polling while our own POST is in flight (no timeout: the
+  // POST settling ends it).
+  const startStatusPolling = (): (() => void) =>
+    pollUpdateStatus(fetch, handleStatusSnapshot, 1000);
+
+  // Polling after a 409: bounded by an independent timer so persistent 503s /
+  // dead network / a hung request still reach a terminal state.
+  const startObservePolling = (): (() => void) =>
+    pollUpdateStatus(fetch, handleStatusSnapshot, 1000, 10 * 60_000, () => {
+      observingRef.current = false;
+      actionInFlightRef.current = false;
+      setBinaryStatus(null);
+      setObserveKind(null);
+      setPhase('error');
+      setErrorDetail(t('update.inProgressSlow'));
+    });
+
+  // Our POST lost to an update running in another tab/process: stay in the
+  // updating UI and track that update instead of reporting a failure.
+  const beginObserve = (isRollback: boolean, instance: string): void => {
+    observingRef.current = true;
+    observeRollbackRef.current = isRollback;
+    observeStartVersionRef.current = status?.current ?? '';
+    observeInstanceRef.current = instance;
+    setBinaryStatus(null);
+    setObserveKind('busy');
+    setPhase('updating');
+    setErrorDetail('');
+    stopPollingRef.current?.();
+    stopPollingRef.current = startObservePolling();
+  };
+
+  const stopStatusPolling = (): void => {
+    stopPollingRef.current?.();
+    stopPollingRef.current = null;
+    setBinaryStatus(null);
+  };
+
   const run = async () => {
     if (!behind) return;
     if (!automatic) {
@@ -723,12 +957,37 @@ function TopbarVersionControl(props: {
     if (actionInFlightRef.current) return;
 
     actionInFlightRef.current = true;
+    observingRef.current = false;
     setActiveRollback(null);
     setRefreshFailed(false);
     setErrorDetail('');
+    setBinaryStatus(null);
+    setObserveKind(null);
+    stopPollingRef.current?.();
+    stopPollingRef.current = startStatusPolling();
+    let previousInstance: string;
     try {
-      const previousInstance = await dashboardInstance();
+      previousInstance = await dashboardInstance();
+    } catch (error) {
+      stopStatusPolling();
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    try {
       const result = await updateAndRestartBotmux(fetch, setPhase);
+      stopStatusPolling();
+      if (!result.changed && !result.restarted && !result.restartError) {
+        // The server skipped an implicit update. Refresh the stale badge and
+        // return to idle instead of reporting a failed restart or reconnecting.
+        actionInFlightRef.current = false;
+        setPhase('idle');
+        setProgress(0);
+        setBinaryStatus(null);
+        setRefreshFailed(!await props.onRefresh());
+        return;
+      }
       if (!result.restarted) {
         // Update installed but the restart handoff failed — surface it
         // directly instead of polling for a reconnect that will never come.
@@ -739,6 +998,11 @@ function TopbarVersionControl(props: {
       }
       pollReconnect(previousInstance);
     } catch (error) {
+      if (updateActionErrorCode(error) === 'update_in_flight') {
+        beginObserve(false, previousInstance);
+        return; // the status poller keeps tracking the winner
+      }
+      stopStatusPolling();
       actionInFlightRef.current = false;
       setPhase('error');
       setErrorDetail(error instanceof Error ? error.message : String(error));
@@ -780,14 +1044,34 @@ function TopbarVersionControl(props: {
     if (!selectedRollback || !rollbackSupported || rollbackLoading || actionInFlightRef.current) return;
 
     actionInFlightRef.current = true;
+    observingRef.current = false;
     setActiveRollback(selectedRollback);
     setRefreshFailed(false);
     setErrorDetail('');
+    setBinaryStatus(null);
+    setObserveKind(null);
+    stopPollingRef.current?.();
+    stopPollingRef.current = startStatusPolling();
+    let previousInstance: string;
     try {
-      const previousInstance = await dashboardInstance();
+      previousInstance = await dashboardInstance();
+    } catch (error) {
+      stopStatusPolling();
+      actionInFlightRef.current = false;
+      setPhase('error');
+      setErrorDetail(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    try {
       await updateAndRestartBotmux(fetch, setPhase, selectedRollback);
+      stopStatusPolling();
       pollReconnect(previousInstance);
     } catch (error) {
+      if (updateActionErrorCode(error) === 'update_in_flight') {
+        beginObserve(true, previousInstance);
+        return;
+      }
+      stopStatusPolling();
       actionInFlightRef.current = false;
       setPhase('error');
       setErrorDetail(error instanceof Error ? error.message : String(error));
@@ -808,9 +1092,15 @@ function TopbarVersionControl(props: {
   };
 
   const message = phase === 'updating'
-    ? activeRollback
-      ? t('update.rollbackInstalling', { version: activeRollback })
-      : t('update.updating', { command })
+    ? binaryStatus
+      ? binaryProgressText(binaryStatus, t)
+      : observeKind === 'busy'
+        ? t('update.inProgressBusy')
+        : observeKind === 'waiting'
+          ? t('update.inProgressExternal')
+          : activeRollback
+            ? t('update.rollbackInstalling', { version: activeRollback })
+            : t('update.updating', { command })
     : phase === 'restarting'
       ? activeRollback
         ? t('update.rollbackRestarting', { version: activeRollback })
@@ -823,10 +1113,14 @@ function TopbarVersionControl(props: {
           ? t('update.topbarRefreshFailed')
           : behind
           ? automatic
-            ? t('update.versionUpgradePrompt', { version: latestVersion })
+            ? mirrorFallback
+              ? t('update.mirrorVersionUpgradePrompt', { version: latestVersion })
+              : t('update.versionUpgradePrompt', { version: latestVersion })
             : unavailableReason
           : status.latest
-            ? t('update.upToDate')
+            ? mirrorFallback
+              ? t('update.mirrorUpToDate')
+              : t('update.upToDate')
             : t('update.checkUnavailable');
   const action = !automatic
     ? t('update.topbarReview')
@@ -856,12 +1150,10 @@ function TopbarVersionControl(props: {
         onClick={() => setOpen(value => !value)}
       >
         <span>{currentVersion}</span>
-        {busy
-          ? <span className="dashboard-update-spinner" aria-hidden="true" />
-          : <span
-              className={`dashboard-version-state ${versionSignal.className}`}
-              aria-hidden="true"
-            >{versionSignal.symbol}</span>}
+        <span
+          className={`dashboard-version-state ${versionSignal.className}`}
+          aria-hidden="true"
+        >{versionSignal.symbol}</span>
       </button>
       {open && popoverPosition && typeof document !== 'undefined' ? createPortal((
         <section
@@ -899,15 +1191,44 @@ function TopbarVersionControl(props: {
           <div className="dashboard-version-popover-body">
             <div className="dashboard-version-current">
               <strong>{currentVersion}</strong>
-              <span className={versionSignal.className} aria-hidden="true">
-                {busy ? <span className="dashboard-update-spinner" /> : versionSignal.symbol}
-              </span>
+              {busy ? (
+                <span
+                  className="dashboard-version-ring"
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(progress)}
+                  aria-label={message}
+                >
+                  <svg viewBox="0 0 44 44" width="44" height="44" aria-hidden="true">
+                    <defs>
+                      <linearGradient id="dvr-grad" x1="0%" y1="100%" x2="100%" y2="0%">
+                        <stop offset="0%" stopColor="var(--brand-accent-cyan)" />
+                        <stop offset="55%" stopColor="var(--accent)" />
+                        <stop offset="100%" stopColor="var(--brand-accent-pink)" />
+                      </linearGradient>
+                    </defs>
+                    <circle className="dvr-track" cx="22" cy="22" r="20" />
+                    <circle
+                      className="dvr-arc"
+                      cx="22" cy="22" r="20"
+                      style={{ strokeDasharray: RING_C, strokeDashoffset: ringDashoffset }}
+                    />
+                  </svg>
+                  <span className="dvr-pct">{Math.round(progress)}%</span>
+                </span>
+              ) : (
+                <span className={versionSignal.className} aria-hidden="true">{versionSignal.symbol}</span>
+              )}
             </div>
             <p
               className={`dashboard-version-message${phase === 'error' || refreshFailed ? ' is-error' : ''}`}
               role={phase === 'error' || refreshFailed ? 'alert' : 'status'}
               aria-live="polite"
             >{message}</p>
+            {status.runningDaemonRestartHint ? (
+              <p className="dashboard-version-message" role="status">{status.runningDaemonRestartHint}</p>
+            ) : null}
             <a
               className="dashboard-version-release-link"
               href="https://github.com/deepcoldy/botmux/releases"
@@ -1035,7 +1356,6 @@ function TopbarVersionControl(props: {
                 disabled={busy}
                 onClick={() => void run()}
               >
-                {busy ? <span className="dashboard-update-spinner" aria-hidden="true" /> : null}
                 {action}
               </button>
             </footer>
@@ -1053,6 +1373,35 @@ function DashboardShell(): React.JSX.Element {
   const [statusAutoOpen, setStatusAutoOpen] = useState(false);
   const previousAttentionRef = useRef(statusSummary.attention);
   const statusAutoOpenTimerRef = useRef<number | null>(null);
+  // 每次唤起 seq+1 作为面板的 key：重新挂载 = 查询 / 分类 / 选中项从零开始。
+  const [palette, setPalette] = useState<{ open: boolean; seq: number }>({ open: false, seq: 0 });
+  const [PaletteView, setPaletteView] = useState<CommandPaletteModule['CommandPalette'] | null>(null);
+  const paletteOpenRef = useRef(false);
+  const paletteEnabledRef = useRef(true);
+  paletteOpenRef.current = palette.open;
+
+  const closePalette = useCallback(() => setPalette(prev => (prev.open ? { ...prev, open: false } : prev)), []);
+  // 允许叠在会话详情抽屉等原生模态框之上：面板 showModal 后是 top layer 最上层，
+  // Esc 只关它自己；选中跳转会换 hash 重挂载页面，底下的抽屉随之卸掉。
+  const openPalette = useCallback(() => {
+    // 首屏 /api/settings 失败（网络错误 / 5xx）时登录态未知，面板不拉 Skill / Agent；唤起时再探
+    // （限频：服务端持续出错时反复开关面板不该线性放大请求）。
+    if (!authStateKnown && Date.now() - lastAuthProbeAt >= AUTH_REPROBE_MS) void loadAuthState().then(renderShell);
+    void loadCommandPalette()
+      .then(mod => {
+        setPaletteView(() => mod.CommandPalette);
+        setPalette(prev => (prev.open ? prev : { open: true, seq: prev.seq + 1 }));
+      })
+      .catch(error => {
+        if (maybeReloadBrowserForStaleRouteChunk(error, {
+          href: window.location.href,
+          hash: location.hash || '#/',
+          getSessionStorage: () => window.sessionStorage,
+          reload: () => window.location.reload(),
+        })) return;
+        console.error('botmux command palette failed to load', error);
+      });
+  }, []);
 
   const clearStatusAutoOpenTimer = () => {
     if (statusAutoOpenTimerRef.current === null) return;
@@ -1077,6 +1426,19 @@ function DashboardShell(): React.JSX.Element {
     return () => clearStatusAutoOpenTimer();
   }, []);
   useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || !isPaletteHotkey(event, PALETTE_MAC)) return;
+      if (!paletteEnabledRef.current) return;
+      // 宿主终端（xterm）里 Ctrl+K 是 readline 删到行尾，xterm 自己处理后会拦下；这里再兜一层。
+      if (event.target instanceof Element && event.target.closest('.xterm')) return;
+      event.preventDefault();
+      if (paletteOpenRef.current) closePalette();
+      else openPalette();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [closePalette, openPalette]);
+  useEffect(() => {
     const previousAttention = previousAttentionRef.current;
     previousAttentionRef.current = statusSummary.attention;
 
@@ -1098,6 +1460,45 @@ function DashboardShell(): React.JSX.Element {
     expiredShown = false;
     setAuthExpiredOpen(false);
   };
+  // 工作台默认是无边框壳（没有 topbar / 侧栏），但无边框只留给两类入口：桌面 / 移动
+  // 客户端（botmuxClientShell），以及带沉浸式标记的直达入口（botmuxWorkbenchShell，
+  // `/workbench`、短票兑换、卡片按钮与 CLI 打印的链接都 302 到这种 hash，见
+  // core/workbench-shell.ts）。从侧边栏等网页入口点进 #/agent-workbench 时必须保持
+  // 正常壳，否则导航一去不回。两种标记都可能挂在 search 或 hash（为过登录重定向把
+  // 标记放在 hash 里，启动时再提升进 search），reader 两种都认。
+  const workbenchSurface = framelessWorkbenchSurface(activeHash);
+  // 无边框工作台壳没有顶栏，也不挂面板。
+  paletteEnabledRef.current = !workbenchSurface;
+  // 壳层随每条 SSE 重渲染；context 换新对象会让面板重建全部条目并重跑整次搜索。
+  // 只有页面清单可能变化时才换：开关面板、切语言、登录态、置顶插件、宿主终端权限。
+  const paletteContext = useMemo<PaletteShellContext>(() => ({
+    pages: palette.open ? paletteNavPages() : [],
+    manageDataReady: authStateKnown && isAuthed,
+    setLocale,
+    openCreateSession: requestOpenCreateSession,
+    openCreateBot: openCreateBotFromPalette,
+  }), [palette.open, ui.locale, isAuthed, authStateKnown, pinnedPluginNavItems, pluginPageNavItems, ui.hostTerminal, decisionBoardNavVisible]);
+  if (workbenchSurface) {
+    return (
+      <>
+        <div className="workbench-route-host" data-workbench-surface={workbenchSurface}>
+          <main id="root" ref={setRouteRoot} />
+        </div>
+        {/* 工作台是无边框壳（没有 topbar / 侧栏），登录态失效时这个浮层是它唯一
+            的自救出口——漏传 loginUrl 会让浮层退化成「访问链接已失效 / 知道了」
+            的死胡同，一键登录压根不渲染。与下面普通壳的传参保持一致。 */}
+        <AuthExpiredOverlay
+          open={authExpiredOpen}
+          loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
+          onClose={closeAuthExpired}
+        />
+        {/* 全局反馈系统：toast() / confirm() 的挂载点（fixed 定位，与树位置无关）。
+            workbench 无边框壳也需要挂载，否则将来 workbench 内调用 confirm() 会永久挂起。 */}
+        <ToastStack />
+        <ConfirmModalRoot />
+      </>
+    );
+  }
   return (
     <>
       <div className="aurora" aria-hidden="true"><i className="a1" /><i className="a2" /><i className="a3" /></div>
@@ -1115,6 +1516,9 @@ function DashboardShell(): React.JSX.Element {
               <TopbarVersionControl status={botmuxUpdateStatus} onRefresh={() => checkUpdateBadge(true)} />
             </div>
           </div>
+          <div className="topbar-center">
+            <CommandPaletteTrigger onOpen={openPalette} />
+          </div>
           <div className="topbar-actions">
             <TopbarStatusMenu summary={statusSummary} autoOpen={statusAutoOpen} />
             <div className="topbar-tool-group">
@@ -1130,7 +1534,7 @@ function DashboardShell(): React.JSX.Element {
               <ThemeMenuSlot />
               <a
                 className="topbar-docs-link"
-                href="https://bytedance.aiforce.cloud/app/app_4k9smq6rdxher/"
+                href="https://deepcoldy.github.io/botmux/"
                 target="_blank"
                 rel="noopener noreferrer"
                 title={t('nav.docs')}
@@ -1172,29 +1576,26 @@ function DashboardShell(): React.JSX.Element {
               </div>
             ) : null}
             <nav className="sidebar-nav" aria-label="Dashboard">
-              {sidebarNavItems().filter(item => isAuthed || !item.manage).map(item => (
-                <a
-                  key={item.id}
-                  href={item.href}
-                  data-route={item.id}
-                  className={[navClassName(item), item.plugin ? 'sidebar-plugin-item' : ''].filter(Boolean).join(' ') || undefined}
-                  title={item.plugin ? labelOf(item) : undefined}
-                >
-                  {icon(item.icon)}
-                  <span className="sidebar-nav-label">{labelOf(item)}</span>
-                  {item.id === 'settings' && updateBehind ? (
-                    <InfoTip
-                      className="nav-update-tip"
-                      label={updateBadgeTitle()}
-                      trigger={<span className="nav-update-dot" aria-hidden="true" />}
-                      preventClick={false}
-                      focusable={false}
-                    >
-                      {updateBadgeTitle()}
-                    </InfoTip>
-                  ) : null}
-                </a>
-            ))}
+              {(() => {
+                const visible = sidebarNavItems().filter(item => isAuthed || !item.manage);
+                const byId = new Map(visible.map(item => [item.id, item]));
+                // pinned plugin 项没有自己的组，跟在「管理」组的「插件」之后。
+                const pinnedPlugins = visible.filter(item => item.plugin);
+                return NAV_GROUPS.map(group => {
+                  const items = group.items.flatMap(id => {
+                    const item = byId.get(id);
+                    if (!item) return [];
+                    return item.id === 'plugins' ? [item, ...pinnedPlugins] : [item];
+                  });
+                  if (items.length === 0) return null;
+                  return (
+                    <div className="nav-group" key={group.id}>
+                      <div className="nav-group-title">{t(group.labelKey)}</div>
+                      {items.map(renderNavAnchor)}
+                    </div>
+                  );
+                });
+              })()}
             </nav>
           </aside>
           <div className="workspace">
@@ -1209,6 +1610,18 @@ function DashboardShell(): React.JSX.Element {
         loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
         onClose={closeAuthExpired}
       />
+      {PaletteView ? (
+        <PaletteView
+          key={palette.seq}
+          open={palette.open}
+          onClose={closePalette}
+          mac={PALETTE_MAC}
+          context={paletteContext}
+        />
+      ) : null}
+      {/* 全局反馈系统：toast() / confirm() 的挂载点（fixed 定位，与树位置无关） */}
+      <ToastStack />
+      <ConfirmModalRoot />
     </>
   );
 }
@@ -1258,6 +1671,10 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
+    // Management reads are intentionally outside an H5/platform Workbench
+    // identity's capability map. The server marks that expected narrow denial;
+    // an unmarked 401 still means the identity expired and opens the login UI.
+    if (res.headers.get('x-botmux-auth-scope') === 'workbench') return res;
     const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
     const method = (args[1]?.method ?? 'GET').toUpperCase();
     const isRead = method === 'GET' || method === 'HEAD';
@@ -1267,19 +1684,64 @@ window.fetch = async function patchedFetch(
   return res;
 };
 
-async function loadAuthState(): Promise<void> {
+/**
+ * P1-4：拉取服务端投影的最小操作能力集。走 origFetch 绕过全局 401 包装——匿名
+ * （含 publicReadOnly 访客）在这里 401 是预期的能力探测结果，不是登录过期事件。
+ * 任何失败（401、网络错误、响应不合形）严格回落全 false：操作入口宁可少画，
+ * 不给无权身份画出会 401/403 的按钮。
+ */
+async function loadWorkbenchCapabilities(): Promise<void> {
   try {
-    const r = await fetch('/api/settings');
+    const r = await origFetch('/api/workbench/capabilities', { cache: 'no-store' });
+    ui.workbenchCapabilities = r.ok
+      ? parseWorkbenchCapabilities(await r.json())
+      : NO_WORKBENCH_CAPABILITIES;
+  } catch {
+    ui.workbenchCapabilities = NO_WORKBENCH_CAPABILITIES;
+  }
+}
+
+async function loadAuthState(): Promise<void> {
+  lastAuthProbeAt = Date.now();
+  // 能力探测与 /api/settings 并行：两者互不依赖，也都在首次 route() 之前完成。
+  const capabilitiesProbe = loadWorkbenchCapabilities();
+  try {
+    // Use the unwrapped request: a valid narrow Workbench identity is supposed
+    // to get a scoped 401 here, and that is auth-state data rather than an
+    // expiry event for the global fetch wrapper.
+    const r = await origFetch('/api/settings');
     if (r.ok) {
       const j = await r.json();
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
+      ui.workbenchAuthed = isAuthed;
+      ui.hostTerminal = isAuthed && j.hostTerminal === true;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
       ui.publicReadOnly = publicReadOnly;
+      authStateKnown = true;
       const serverLocale = readShellLocale() ?? normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
+    } else if (r.status === 401 && r.headers.get('x-botmux-auth-scope') === 'workbench') {
+      // H5/platform identities can use Workbench control leases but must never
+      // become Dashboard owners merely because the shell probed /api/settings.
+      isAuthed = false;
+      ui.authed = false;
+      ui.workbenchAuthed = true;
+      ui.hostTerminal = false;
+      publicReadOnly = false;
+      ui.publicReadOnly = false;
+      authStateKnown = true;
+    } else if (r.status === 401) {
+      isAuthed = false;
+      ui.authed = false;
+      ui.workbenchAuthed = false;
+      ui.hostTerminal = false;
+      authStateKnown = true;
+      const loginUrl = r.headers.get('x-botmux-login-url') ?? undefined;
+      showAuthExpiredOverlay(loginUrl);
     }
   } catch { /* keep defaults */ }
+  await capabilitiesProbe;
 }
 
 async function loadPinnedPluginNavItems(): Promise<void> {
@@ -1288,20 +1750,42 @@ async function loadPinnedPluginNavItems(): Promise<void> {
     if (!response.ok) return;
     const body = await response.json();
     const entries = (Array.isArray(body?.plugins) ? body.plugins : []) as PluginDashboardNavEntry[];
-    pinnedPluginNavItems = entries
-      .filter(entry => entry.pinned === true && typeof entry.route === 'string')
-      .map(entry => ({
+    const routable = entries.filter(entry => typeof entry.route === 'string');
+    const pages: Array<{ pinned: boolean; item: NavItem }> = routable.map(entry => ({
+      pinned: entry.pinned === true,
+      item: {
         id: `plugin:${entry.pluginId}:${entry.id}`,
         href: entry.route,
         label: entry.displayName || entry.pluginId,
         manage: true,
         plugin: true,
         icon: <><path d="M5.2 2.2h5.6v3.1l1.7 1.7-1.4 1.4-1-1v6.4H5.9V7.4l-1 1L3.5 7l1.7-1.7z" /><path d="M8 13.8v1" /></>,
-      }));
+      },
+    }));
+    pluginPageNavItems = pages.map(page => page.item);
+    pinnedPluginNavItems = pages.filter(page => page.pinned).map(page => page.item);
     renderShell();
   } catch {
     // The core navigation remains usable when plugin metadata is unavailable.
   }
+}
+
+/**
+ * 侧边栏要不要显示「决策看板」：问一次 /api/decision-board/boards（只列开了管家的 Bot）。
+ * 本机管理身份和飞书 H5 免登身份都能读；其它身份（匿名、平台访客）对它是既定的 401，
+ * 所以走 origFetch，不让全局 401 包装弹登录浮层。失败一律当作没有看板。
+ */
+async function loadDecisionBoardNav(): Promise<void> {
+  let visible = false;
+  if (ui.authed || ui.workbenchAuthed) {
+    try {
+      const r = await origFetch('/api/decision-board/boards', { cache: 'no-store' });
+      visible = r.ok && boardsFromResponse(await r.json().catch(() => null)).length > 0;
+    } catch { /* 当作没有看板 */ }
+  }
+  if (visible === decisionBoardNavVisible) return;
+  decisionBoardNavVisible = visible;
+  renderShell();
 }
 
 async function persistLocale(locale: DashboardLocale): Promise<void> {
@@ -1467,6 +1951,9 @@ void (async () => {
   renderShell();
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
   void loadPinnedPluginNavItems();
+  // Bot 配置里开关管家后会发这个事件，侧边栏随之出现 / 消失。
+  window.addEventListener(DECISION_BOARD_CHANGED_EVENT, () => { void loadDecisionBoardNav(); });
+  void loadDecisionBoardNav();
   void checkUpdateBadge();
   window.setInterval(() => {
     if (document.hidden) return;
@@ -1474,15 +1961,29 @@ void (async () => {
   }, 30 * 60_000);
   initOwnerAvatar();
   try {
-    await bootstrap();
+    await bootstrap({
+      // P1-14：排程只对「本机管理身份」和「publicReadOnly 匿名访客」开放。
+      // Workbench-only 身份（飞书 H5 / 平台 teammate|guest，loadAuthState 里把
+      // authed 置 false、workbenchAuthed 置 true）对 /api/schedules 是既定的
+      // 401，别发这一跳。注意能力判断只影响「发不发请求」，会话快照的容错不
+      // 依赖它对不对。
+      canReadSchedules: () => ui.authed || ui.publicReadOnly,
+    });
   } catch (err) {
     console.error('botmux dashboard bootstrap failed', err);
     store.setOnline(false);
   }
   void loadNameMaps().then(renderShell);
   void loadGroupsSnapshot().then(renderShell);
-  window.addEventListener('hashchange', () => {
-    if (!applyShellLocaleFromHash()) void route();
-  });
+  // 空闲时预取 ⌘K 面板 chunk，首次唤起不等网络；无边框工作台壳不挂面板，不白取。
+  if (!framelessWorkbenchSurface(location.hash || '#/')) {
+    if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(preloadCommandPalette, { timeout: 5_000 });
+    else window.setTimeout(preloadCommandPalette, 3_000);
+  }
+  // A page with unsaved edits can hold a navigation back (see leave-guard.ts).
+  window.addEventListener('hashchange', createHashChangeHandler({
+    applyLocale: applyShellLocaleFromHash,
+    route: () => { void route(); },
+  }));
   void route();
 })();

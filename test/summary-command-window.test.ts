@@ -21,10 +21,24 @@ vi.mock('../src/im/lark/client.js', () => ({
     return out.reverse();
   }),
   listThreadMessages: vi.fn(async () => []),
+  // message-parser (imported by summary-command) re-exports this name. Bun's
+  // mock is the whole module, so omitting it is a SyntaxError at import time.
+  getMessageDetail: vi.fn(),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBotOpenId: () => BOT_OPEN_ID,
+  // message-parser imports this name. Bun 的整模块 mock 缺 named 绑定会在加载期
+  // SyntaxError（vitest 容忍工厂子集，所以 vitest 下此前一直是绿的）。
+  effectiveBotDisplayName: (state: any) =>
+    state?.config?.displayName || state?.botName || state?.config?.larkAppId,
+  // logger / client import graph. Bun's mock is the whole module.
+  getLoadedConfigPath: () => undefined,
+  loadBotConfigs: () => [],
+  getBot: () => undefined,
+  getAllBots: () => [],
+  getBotClient: () => undefined,
+  getOwnerOpenId: () => undefined,
 }));
 
 const { buildSummaryCommandPrompt } = await import('../src/im/lark/summary-command.js');

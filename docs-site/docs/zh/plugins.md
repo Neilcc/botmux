@@ -36,10 +36,15 @@ scripts**。安装第三方插件仍等同于信任其发布者。
 
 ## 创建项目
 
-Botmux 当前要求 Node.js 22 或更高版本。安装 Botmux 后运行生成器：
+插件**开发**需要 Node.js 22 或更高版本，且 `npm` 在 `PATH` 中——生成器会调用 npm
+来搭脚手架、装依赖、跑测试。（这是插件开发本身的要求；botmux 自己是自包含二进制，
+不需要 Node，见 [快速接入](/quickstart)。）
+
+按你习惯的方式装好 botmux，然后运行生成器：
 
 ```bash
-npm install -g botmux@latest
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+# 或者走 npm 安装：npm install -g botmux@latest
 
 botmux plugin init my-plugin
 cd botmux-plugin-my-plugin
@@ -206,6 +211,18 @@ Streamable HTTP：
 Botmux 通过统一 MCP Gateway 聚合当前会话已启用插件的 MCP
 server。插件集合与凭证快照以 CLI 进程为边界，因此修改绑定或配置后应新建会话。
 
+#### 可信调用身份注入
+
+当一轮对话由某个真实 IM 用户触发时，Gateway 会在转发 `tools/call` 时注入一份**宿主侧盖章、模型无法伪造**的调用身份，供需要按用户做权限或审计的插件使用。契约如下：
+
+- 身份出现在两处：MCP 请求的 `_meta.botmuxTrustedCaller`（stdio 与 streamable-http 都注入），以及 streamable-http 的 `x-botmux-trusted-open-id` / `x-botmux-trusted-union-id` / `x-botmux-trusted-app-id` 请求头（另有 `x-botmux-turn-id` / `x-botmux-dispatch-attempt`）。`botmuxTrustedCaller` 里的字段为 `requestUserOpenId` / `requestUserUnionId` / `requestLarkAppId`。
+- **只信这些带 `botmux` 命名空间的键**。Gateway 会在注入前**无条件剥离**客户端（模型）在 `_meta` 里自带的、以 `botmux` 开头的任意键，以及入站的 `x-botmux-trusted-*` 头——无论这一轮是否存在宿主身份。因此模型无法通过在工具参数里塞 `_meta.botmuxTrustedCaller` 来冒充他人。
+- 反过来，插件**不要**去读裸键（如未加命名空间的 `requestUserUnionId` 或自定义的 `trustedCaller`）当作身份来源：这类键不在剥离范围内，可被模型自由填写。
+- 并非每一轮都有可信身份：系统/恢复轮、以及拿不到发送方 `open_id`/`union_id` 的场景不会注入。插件必须对「无 `botmuxTrustedCaller`」**fail-closed**（拒绝需要身份的操作），不要在缺身份时回退到模型自报值。
+- 身份仅存在于宿主 worker 进程内存中、按轮设置，不落任何文件；不要把它连同 transport token 一起对用户展示或写进日志。
+
+背景与设计见飞书文档：[Botmux 插件开发与市场注册指南](https://bytedance.larkoffice.com/docx/FE2mdNdSgoFMVuxWTS7ctqO6nFb)、[Agent Chrome 插件安装与使用指南](https://bytedance.larkoffice.com/docx/RJPfdn0oHoC5zgxVXH1cKMjFnqc)（后者是「MCP + Skill + Service 打包成 `@botmux-ai/plugin-*`、按会话隔离」的完整范例）。
+
 ### Dashboard
 
 `src/dashboard/index.js` 默认导出一个组件：
@@ -221,7 +238,30 @@ export default function PluginDashboard({ pluginId, api }) {
 - `getServiceStatus()`；
 - `startService()`；
 - `stopService()`；
-- `restartService()`。
+- `restartService()`；
+
+- `react`：宿主 React 实例，插件应复用它，避免打包另一份 React；
+- `getSettings()`：读取适配器允许在浏览器展示的配置；
+- `saveSettings(value)`：通过适配器保存 JSON 值；
+- `listBots()`：列出可管理的 Bot。
+
+配置功能需要显式提供 `dist/server/settings.js` ES 模块，并同时导出：
+
+```ts
+export function getSettings(api: { config: PluginConfigApi }): unknown | Promise<unknown>;
+export function saveSettings(api: { config: PluginConfigApi }, value: unknown): unknown | Promise<unknown>;
+```
+
+注入的 `api` **只有 `config`**，提供 `get(key?)`、`set(key, value)`、
+`replace(object)` 和 `path`。它不是 `baseApi`，不包含 `runtime`、`logger`、
+`resolve` 或 `settingsPath`。使用受控 config API，明确挑选可展示的字段，
+不要直接回传原始 `config.json` 或敏感信息。
+两个方法允许返回可 JSON 序列化的值或 void；null/undefined 会归一化为
+`{ ok: true }`。请求 JSON 非法返回 400，插件或适配器不存在返回 404，
+不支持的方法返回 405。适配器内部异常、导出错误及不可序列化结果返回完整的
+500 JSON 响应，错误码统一为 `plugin_settings_failed`，不暴露原始异常。
+适配器导出在请求时检查，convention scanner 不执行插件代码。
+
 
 Dashboard 代码在安装 Botmux 的系统用户权限边界内运行。不要把敏感配置渲染进页面或浏览器日志。
 

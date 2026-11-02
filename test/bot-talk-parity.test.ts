@@ -20,6 +20,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 let tempDir: string;
+const inviterTalk = vi.hoisted(() => ({ allowed: false }));
+vi.mock('../src/services/vc-meeting-inviter-access.js', () => ({ canInviterTalkToMeeting: () => inviterTalk.allowed }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
@@ -44,6 +46,7 @@ import { evaluateTalk, evaluateBotTalk, canRunDaemonCommand, TALK_REASONS, type 
 import { recordTeamBot } from '../src/services/team-bots-store.js';
 import { recordTeamGroup } from '../src/services/team-groups-store.js';
 import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
+import { adminListFingerprint, writeBotAdminUnions } from '../src/services/bot-admin-unions-store.js';
 
 const APP = 'parity_app';
 const CHAT = 'oc_parity';
@@ -79,6 +82,11 @@ function restricted(): void {
 }
 
 const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
+  meetingInviter: {
+    arrange: () => { restricted(); inviterTalk.allowed = true; },
+    human: true, bot: true,
+    why: 'The shared predicate consumes a preverified human invitation. A real bot cannot acquire that human identity; this parity fixture reuses one ID on both callers. No operate grant.',
+  },
   allowedUser: {
     arrange: () => {
       restricted();
@@ -101,6 +109,23 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
     },
     human: true, bot: true,
   },
+  sameOwnerBot: {
+    arrange: () => {
+      restricted();
+      // 同机兄弟应用：它学到的自身 union_id 就是发送方 union，管理员与本 bot 是同一个人。
+      process.env.BOTS_CONFIG = join(tempDir, 'bots.json');
+      writeFileSync(process.env.BOTS_CONFIG, JSON.stringify([
+        { larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
+        { larkAppId: 'parity_sibling', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['on_owner'] },
+      ]));
+      writeFileSync(join(tempDir, 'bot-union-ids.json'), JSON.stringify({ parity_sibling: { unionId: SENDER_UNION, learnedAt: 1 } }));
+      writeBotAdminUnions(tempDir, APP, { fingerprint: adminListFingerprint(['ou_owner']), admins: ['on_owner'], exact: true, owner: 'on_owner', updatedAt: 1 });
+      writeBotAdminUnions(tempDir, 'parity_sibling', { fingerprint: adminListFingerprint(['on_owner']), admins: ['on_owner'], exact: true, owner: 'on_owner', updatedAt: 1 });
+    },
+    human: false, bot: true,
+    why: 'sameOwnerBot 腿与 teamBot 腿同一契约：只认飞书盖章的 bot 发送方 union（人侧调用点恒不传 senderUnionId），'
+      + '且要求它精确对上本机 bots.json 里唯一一个同 owner 的兄弟应用。真人的 union 不会是某个 bot 学到的自身 union。',
+  },
   teamBot: {
     arrange: () => {
       restricted();
@@ -111,8 +136,10 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
       + '否则恶意成员把真人 union 报成 bot 就能继承 bot 信任。所以人侧不命中不是 parity 缺口，而是这条腿的定义。',
   },
   teamMember: {
-    // 平台团队成员（真人）腿走 memberUnionId：布置一个平台团队（CHAT 是其协作群、
-    // MEMBER_UNION 是其成员），人侧传 memberUnionId=MEMBER_UNION → 命中 reason:'teamMember'。
+    // 平台团队成员（真人）腿走 memberUnionId：布置一个平台团队（本 bot APP 在其 bots
+    // roster、MEMBER_UNION 是其成员），人侧传 memberUnionId=MEMBER_UNION → 命中
+    // reason:'teamMember'。teamMember 腿现在锚在「本 bot ∈ 同队 bots」，不看 chatId，
+    // 所以 CHAT 在不在 groupChatIds 都免 grant（此处仍列 CHAT 是为了 bot 侧的团队拉群腿）。
     //
     // bot 侧同样放行，但走的是**另一条腿**：平台协作群会被镜像成团队拉群
     // （applyPlatformTeamSync → team-groups），故 evaluateBotTalk 经团队拉群腿命中
@@ -122,7 +149,7 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
       restricted();
       applyPlatformTeamSync(tempDir, {
         rev: 'rev-1',
-        teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [CHAT], memberUnionIds: [MEMBER_UNION], bots: [] }],
+        teams: [{ teamId: 'team-1', teamName: 'Team One', groupChatIds: [CHAT], memberUnionIds: [MEMBER_UNION], bots: [{ appId: APP }] }],
       });
     },
     humanMemberUnionId: MEMBER_UNION,
@@ -166,10 +193,22 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
     human: true, bot: false,
     why: 'evaluateBotTalk 不传 chatType → p2pOpen 腿 fail-closed。飞书里 bot 之间不存在私聊，开着只是白扩边界。',
   },
+  blocked: {
+    // 否决腿（不是放行源）：在 allowedUser 命中之后、其余所有腿之前按 sender open_id 否决。
+    // 这里不布置任何放行腿——open 模式下它仍必须被拒，证明黑名单不依赖限制态；其余
+    // 放行腿 × blocked 的完整优先级矩阵见 test/blocked-users-talk.test.ts。
+    arrange: () => {
+      getBot(APP).resolvedBlockedUsers = [SENDER];
+    },
+    human: false, bot: false,
+    why: 'blocked 是纯增量否决腿：人/bot 同拒（sender open_id 维度，与 union / chat 均无关）；'
+      + 'evaluateBotTalk 独有的团队拉群 chat 维度腿在 reason===\'blocked\' 时也不复活（见 evaluateBotTalk）。',
+  },
 };
 
 describe('bot talk parity — bot 闸门与人侧 evaluateTalk 同源', () => {
   beforeEach(() => {
+    inviterTalk.allowed = false;
     tempDir = mkdtempSync(join(tmpdir(), 'botmux-parity-'));
     const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [] });
     bot.resolvedAllowedUsers = [];
@@ -180,7 +219,10 @@ describe('bot talk parity — bot 闸门与人侧 evaluateTalk 同源', () => {
     bot.config.globalGrants = undefined;
     bot.config.p2pOpen = undefined;
   });
-  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+  afterEach(() => {
+    delete process.env.BOTS_CONFIG;
+    rmSync(tempDir, { recursive: true, force: true });
+  });
 
   for (const [reason, c] of Object.entries(CASES) as Array<[TalkReason, ParityCase]>) {
     it(`talk 源 "${reason}"：人=${c.human ? '放行' : '拦截'} / bot=${c.bot ? '放行' : '拦截'}`, () => {
@@ -291,4 +333,12 @@ describe('canRunDaemonCommand — bot 发送方走 evaluateBotTalk（daemon 命�
       canRunDaemonCommand(APP, otherChat, SENDER, undefined, '/status', undefined, 'group', true),
     ).toBe(false);
   });
+});
+
+it('meeting invitation talk never grants daemon administration', () => {
+  const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', allowedUsers: ['ou_owner'] });
+  bot.resolvedAllowedUsers = ['ou_owner'];
+  inviterTalk.allowed = true;
+  expect(canRunDaemonCommand(APP, CHAT, SENDER, undefined, '/restart')).toBe(false);
+  inviterTalk.allowed = false;
 });

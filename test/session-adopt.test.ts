@@ -18,6 +18,9 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),
   sendUserMessage: vi.fn(async () => {}),
   deleteMessage: vi.fn(async () => {}),
+  getMessageDetail: vi.fn(async () => ({
+    items: [{ chat_id: 'oc_chat', thread_id: 'omt_adopt_picker' }],
+  })),
   getChatInfo: vi.fn(),
   MessageWithdrawnError: class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
@@ -39,7 +42,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   // zellij is pid-AGNOSTIC on purpose (see adoptLiveKey doc / fix 57dcbebbb):
   // the key must stay stable across a render→confirm pid shift.
   adoptLiveKey: vi.fn((s: any) =>
-    'zellijPaneId' in s
+    'orcaTerminalHandle' in s
+      ? `live:orca:${s.orcaTerminalHandle}`
+      : 'zellijPaneId' in s
       ? `live:zellij:${s.zellijSession}/${s.zellijPaneId}`
       : `live:tmux:${s.tmuxTarget}:${s.cliPid}`,
   ),
@@ -55,6 +60,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
+    resolvedBlockedUsers: [],
     botOpenId: 'ou_bot',
   })),
   getAllBots: vi.fn(() => []),
@@ -79,7 +85,25 @@ vi.mock('../src/services/session-store.js', () => ({
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
+  collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
+
+// Resume-confirm tests swap in a fake on-disk store (`resumeStore.list`); while
+// it is unset every adapter is the real one.
+const resumeStore = vi.hoisted(() => ({
+  list: undefined as undefined | ((opts: { limit: number; exclude?: ReadonlySet<string> }) => Promise<any[]>),
+}));
+vi.mock('../src/adapters/cli/registry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/adapters/cli/registry.js')>();
+  return {
+    ...actual,
+    createCliAdapterSync: ((...args: Parameters<typeof actual.createCliAdapterSync>) => {
+      const adapter = actual.createCliAdapterSync(...args);
+      if (resumeStore.list) adapter.listResumableSessions = resumeStore.list;
+      return adapter;
+    }) as typeof actual.createCliAdapterSync,
+  };
+});
 
 vi.mock('../src/services/codex-app-threads.js', () => ({
   listCodexAppThreads: vi.fn(async () => []),
@@ -116,7 +140,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
       if (stored && stored.status !== 'closed') {
         store.closeSession(sessionId, { cleanupBridgeMarkers: !hadLiveWorker });
       }
-      return { ok: true, alreadyClosed: false, known: !!stored };
+      return { ok: true, outcome: 'closed', alreadyClosed: false, known: !!stored };
     }),
   };
 });
@@ -141,6 +165,12 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
   saveFrozenCards: vi.fn(),
 }));
 
+// The /adopt picker's live-name enrichment shells out to herdr and reads
+// ~/.claude transcripts; keep it out of these tests (pass sessions through).
+vi.mock('../src/services/adopt-live-enrich.js', () => ({
+  enrichAdoptLiveSessions: vi.fn(async (sessions: unknown[]) => sessions),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -151,9 +181,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { killWorker, forkWorker, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
+import { closeSession, killWorker, forkWorker, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
-import { deleteMessage } from '../src/im/lark/client.js';
+import { deleteMessage, getMessageDetail } from '../src/im/lark/client.js';
 import { getBot } from '../src/bot-registry.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
 import { sessionKey } from '../src/core/types.js';
@@ -248,9 +278,13 @@ describe('Adopt card actions', () => {
     vi.mocked(getBot).mockReturnValue({
       config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
       botOpenId: 'ou_bot',
     } as any);
     vi.mocked(listCodexAppThreads).mockResolvedValue([]);
+    vi.mocked(getMessageDetail).mockResolvedValue({
+      items: [{ chat_id: 'oc_chat', thread_id: 'omt_adopt_picker' }],
+    });
   });
 
   // ── Disconnect ──────────────────────────────────────────────────────────
@@ -301,6 +335,33 @@ describe('Adopt card actions', () => {
 
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    });
+
+    it('does not report disconnect success when the close result carries a residual', async () => {
+      const ds = makeDaemonSession({
+        adoptedFrom: {
+          tmuxTarget: '0:1.0',
+          originalCliPid: 12345,
+          cwd: '/home/user/project',
+        },
+      });
+      const sessions = new Map<string, DaemonSession>([
+        [sessionKey(ROOT_ID, APP_ID), ds],
+      ]);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCardAction(makeDisconnectEvent(ROOT_ID), deps, APP_ID);
+
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('未能确认完全断开');
+      expect(reply).not.toContain('已断开');
     });
   });
 
@@ -408,13 +469,62 @@ describe('Adopt card actions', () => {
       await handleCardAction(makeAdoptSelectEvent(ROOT_ID, 'live:tmux:0:1.0:99999'), deps, APP_ID);
       await flush();
 
+      expect(getMessageDetail).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('已退出'),
         undefined,
         APP_ID,
+        undefined,
+        { replyTarget: { mode: 'thread', rootMessageId: 'om_card_msg' } },
       );
       expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
+
+      vi.doUnmock('../src/core/session-discovery.js');
+    });
+
+    it('falls back to the legacy route when the picker placement probe fails', async () => {
+      vi.doMock('../src/core/session-discovery.js', () => ({
+        discoverAdoptableSessions: vi.fn(() => []),
+        discoverAdoptableSessionByTarget: vi.fn(() => undefined),
+        excludeOwnedHerdrAdoptTargets: vi.fn((sessions: unknown[]) => sessions),
+        adoptTargetKey: vi.fn((s: any) => `tmux:${s.tmuxTarget}:${s.cliPid}`),
+        adoptTargetLabel: vi.fn(() => ''),
+      }));
+      vi.mocked(getMessageDetail).mockRejectedValueOnce(new Error('placement unavailable'));
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), makeDaemonSession());
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, 'live:tmux:0:1.0:99999'), deps, APP_ID);
+      await flush();
+
+      expect(deps.sessionReply).toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[5]).toBeUndefined();
+      expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
+
+      vi.doUnmock('../src/core/session-discovery.js');
+    });
+
+    it('freezes a top-level picker confirmation to its trusted chat', async () => {
+      vi.doMock('../src/core/session-discovery.js', () => ({
+        discoverAdoptableSessions: vi.fn(() => []),
+        discoverAdoptableSessionByTarget: vi.fn(() => undefined),
+        excludeOwnedHerdrAdoptTargets: vi.fn((sessions: unknown[]) => sessions),
+        adoptTargetKey: vi.fn((s: any) => `tmux:${s.tmuxTarget}:${s.cliPid}`),
+        adoptTargetLabel: vi.fn(() => ''),
+      }));
+      vi.mocked(getMessageDetail).mockResolvedValueOnce({ items: [{ chat_id: 'oc_chat' }] });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), makeDaemonSession());
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, 'live:tmux:0:1.0:99999'), deps, APP_ID);
+      await flush();
+
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[5]).toEqual({
+        replyTarget: { mode: 'plain', chatId: 'oc_chat' },
+      });
 
       vi.doUnmock('../src/core/session-discovery.js');
     });
@@ -438,6 +548,154 @@ describe('Adopt card actions', () => {
     });
   });
 
+  describe('adopt_confirm (resume)', () => {
+    // 29 on-disk transcripts, newest first. The 9 newest belong to sessions
+    // still running in panes, so the card lists hist-10 … hist-29.
+    const HISTORY = Array.from({ length: 29 }, (_, i) => {
+      const n = String(i + 1).padStart(2, '0');
+      return { cliSessionId: `hist-${n}`, cwd: '/work/demo', title: `示例会话 ${n}`, lastActivityAt: 10_000 - i };
+    });
+    const LIVE = HISTORY.slice(0, 9).map((h, i) => ({
+      source: 'herdr' as const,
+      herdrSessionName: 'default',
+      herdrTarget: `w1:p${i + 1}`,
+      herdrPaneId: `w1:p${i + 1}`,
+      cliId: 'claude-code' as const,
+      cwd: '/work/demo',
+      paneCols: 200,
+      paneRows: 50,
+      sessionId: h.cliSessionId,
+    }));
+    // In the card only because the live duplicates were skipped.
+    const PICKED = 'hist-21';
+    let list: ReturnType<typeof vi.fn>;
+    const lastExclude = () => new Set((list.mock.calls.at(-1)![0] as { exclude?: ReadonlySet<string> }).exclude);
+
+    beforeEach(() => {
+      // Mirrors the real adapters: exclusion first, truncation second.
+      list = vi.fn(async ({ limit, exclude }: { limit: number; exclude?: ReadonlySet<string> }) =>
+        HISTORY.filter(h => !exclude?.has(h.cliSessionId)).slice(0, limit));
+      resumeStore.list = list as any;
+    });
+    afterEach(() => {
+      resumeStore.list = undefined;
+      vi.useRealTimers();
+    });
+
+    /** The snapshot as the /adopt command caches it: live panes, plus history
+     *  queried with their session ids excluded. */
+    async function cacheSnapshot(sessions: Map<string, DaemonSession>, atMs: number) {
+      const { discoverResumableSessionsForBot, ADOPT_RESUME_LIMIT } = await import('../src/core/command-handler.js');
+      const { cacheAdoptCandidates } = await import('../src/services/adopt-picker.js');
+      const candidates = {
+        sessions: LIVE,
+        resumable: await discoverResumableSessionsForBot(
+          'claude-code', undefined, sessions, ADOPT_RESUME_LIMIT, new Set(LIVE.map(s => s.sessionId)),
+        ),
+        resumeLimit: ADOPT_RESUME_LIMIT,
+      };
+      cacheAdoptCandidates(ROOT_ID, candidates, atMs);
+      return candidates;
+    }
+
+    function makeAdoptPickEvent(rootId: string, entryKey: string, operatorOpenId = 'ou_user') {
+      return {
+        action: { value: { action: 'adopt_pick', entry_key: entryKey, root_id: rootId, search: '', page: 0 } },
+        operator: { open_id: operatorOpenId },
+        context: { open_message_id: 'om_card_msg' },
+      };
+    }
+
+    function setup() {
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      return { ds, sessions, deps: makeDeps(sessions) };
+    }
+
+    const replies = (deps: CardHandlerDeps) =>
+      vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join('\n');
+
+    it('imports a history entry that is in the card only because live duplicates were skipped', async () => {
+      const { ds, sessions, deps } = setup();
+      const snapshot = await cacheSnapshot(sessions, Date.now());
+      expect(snapshot.resumable.map(r => r.cliSessionId)).toEqual(HISTORY.slice(9).map(h => h.cliSessionId));
+      list.mockClear();
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      await flush();
+
+      // Confirm re-queries the store itself rather than trusting the snapshot.
+      expect(list).toHaveBeenCalledTimes(1);
+      for (const s of LIVE) expect(lastExclude().has(s.sessionId)).toBe(true);
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
+      expect(ds.session.cliSessionId).toBe(PICKED);
+      expect(replies(deps)).not.toContain('已不存在');
+      expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
+    });
+
+    it('falls back to the pre-dedup query when the card snapshot has expired', async () => {
+      const { ds, sessions, deps } = setup();
+      await cacheSnapshot(sessions, Date.now() - 5 * 60 * 1000 - 1000);
+      list.mockClear();
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      await flush();
+
+      // Same exclude set as before the live dedup: store identities (none here)
+      // plus the active sessions' own ids.
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(lastExclude()).toEqual(new Set(['uuid-adopt-test']));
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session.cliSessionId).toBeUndefined();
+      expect(replies(deps)).toContain('已不存在');
+    });
+
+    it('adopt_pick renews the snapshot so a confirm right after it still uses the same snapshot', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const t0 = new Date('2026-01-01T00:00:00Z').getTime();
+      vi.setSystemTime(t0);
+      const { ds, sessions, deps } = setup();
+      const snapshot = await cacheSnapshot(sessions, t0);
+      list.mockClear();
+
+      vi.setSystemTime(t0 + 299_000);
+      await handleCardAction(makeAdoptPickEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      const { buildAdoptSelectCard } = await import('../src/im/lark/card-builder.js');
+      expect(vi.mocked(buildAdoptSelectCard).mock.calls.at(-1)?.[3]).toBe(snapshot.resumable);
+
+      // Past the original 5-minute TTL, but only 3 s after the pick.
+      vi.setSystemTime(t0 + 302_000);
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      await flush();
+
+      // The pick was served from the snapshot; only confirm queried the store.
+      expect(list).toHaveBeenCalledTimes(1);
+      for (const s of LIVE) expect(lastExclude().has(s.sessionId)).toBe(true);
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
+      expect(ds.session.cliSessionId).toBe(PICKED);
+      expect(replies(deps)).not.toContain('已不存在');
+    });
+
+    it('reports not-found when the picked history entry left the store after the card was rendered', async () => {
+      const { ds, sessions, deps } = setup();
+      const snapshot = await cacheSnapshot(sessions, Date.now());
+      expect(snapshot.resumable.map(r => r.cliSessionId)).toContain(PICKED);
+      // The transcript is gone (or now claimed) by the time the user confirms.
+      list.mockClear();
+      list.mockImplementation(async ({ limit, exclude }: { limit: number; exclude?: ReadonlySet<string> }) =>
+        HISTORY.filter(h => h.cliSessionId !== PICKED && !exclude?.has(h.cliSessionId)).slice(0, limit));
+
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, `resume:${PICKED}`), deps, APP_ID);
+      await flush();
+
+      expect(list).toHaveBeenCalledTimes(1);
+      for (const s of LIVE) expect(lastExclude().has(s.sessionId)).toBe(true);
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session.cliSessionId).toBeUndefined();
+      expect(replies(deps)).toContain('已不存在');
+    });
+  });
+
   describe('codex-app thread select', () => {
     it('should resume selected Codex App thread without adopt metadata', async () => {
       vi.mocked(getBot).mockReturnValue({
@@ -448,6 +706,7 @@ describe('Adopt card actions', () => {
           cliPathOverride: '/opt/codex',
         },
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
@@ -487,6 +746,7 @@ describe('Adopt card actions', () => {
           cliPathOverride: '/opt/codex',
         },
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
@@ -534,7 +794,7 @@ describe('Adopt card actions', () => {
     it('sandbox:true bot → replies the sandbox-blocked notice, never persists adoptedFrom', async () => {
       vi.mocked(getBot).mockReturnValue({
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true },
-        resolvedAllowedUsers: [], botOpenId: 'ou_bot',
+        resolvedAllowedUsers: [], resolvedBlockedUsers: [], botOpenId: 'ou_bot',
       } as any);
       const { startAdoptSession } = await import('../src/core/command-handler.js');
       const ds = makeDaemonSession();

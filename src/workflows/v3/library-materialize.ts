@@ -39,7 +39,8 @@ import { isValidRunId } from './ops-projection.js';
 import {
   computeSavedWorkflowGateDigest,
   computeSavedWorkflowSideEffects,
-  assertNoSavedWorkflowChatSideEffects,
+  collectSavedWorkflowChatSideEffectProblems,
+  formatSavedWorkflowChatSideEffectProblems,
   validateDagTemplate,
   validateSpecTemplate,
   type LoadedSavedWorkflowRevision,
@@ -98,7 +99,7 @@ export interface CompileSavedWorkflowFromRunOptions {
   inputs?: Record<string, SavedWorkflowParamDef>;
   contextRefs?: SavedWorkflowBuiltinContextRef[];
   specStatus?: 'current' | 'stale';
-  /** Explicit user confirmation after reviewing free-text secret/path lint. */
+  /** Explicit user confirmation after reviewing free-text lint warnings. */
   acknowledgeUnsafeLiterals?: boolean;
 }
 
@@ -182,18 +183,24 @@ export function buildSavedWorkflowRevisionBaseline(
     throw new Error('cannot save workflow: source run has no pinned bots.snapshot.json');
   }
   const snapshots = parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
+  const hasLegacySelector = (nodes: V3Dag['nodes']): boolean => nodes.some((node) =>
+    node.inputs.some((input) => input.select !== undefined)
+    || (node.type === 'loop' && node.body !== undefined && hasLegacySelector(node.body.nodes)));
+  if (loaded.dag.schemaVersion !== 2 && hasLegacySelector(loaded.dag.nodes)) {
+    throw new Error(
+      'cannot save workflow: source run uses legacy artifact selectors; revise it to schemaVersion 2 with stable outputs/output keys first',
+    );
+  }
   const normalizedNodes = canonicalizeNodeBots(cloneNodes(loaded.dag.nodes), snapshots);
-  const dagTemplate = validateDagTemplate({ nodes: normalizedNodes });
-  // Authoring boundary: a freshly compiled definition must be free of
-  // chat-facing side effects in goal nodes. This does NOT run on the read path
-  // (loadSavedWorkflowRevision), so existing revisions stay loadable.
-  assertNoSavedWorkflowChatSideEffects(dagTemplate);
+  const dagTemplate = validateDagTemplate({ schemaVersion: 2, nodes: normalizedNodes });
   const { runId: _runId, ...specWithoutRunId } = loaded.spec;
   const specTemplate = validateSpecTemplate(specWithoutRunId);
   const inputs = opts.inputs ?? {};
   const contextRefs = opts.contextRefs ?? collectSavedWorkflowTemplateBindings(dagTemplate).context;
   assertSavedWorkflowTemplateBindings(dagTemplate, inputs, contextRefs);
-  const lintWarnings: string[] = [];
+  const lintWarnings = formatSavedWorkflowChatSideEffectProblems(
+    collectSavedWorkflowChatSideEffectProblems(dagTemplate),
+  );
   collectSavedWorkflowReusableTextWarnings(dagTemplate, 'dagTemplate', lintWarnings);
   collectSavedWorkflowReusableTextWarnings(specTemplate, 'specTemplate', lintWarnings);
   const revision: SavedWorkflowRevisionDraft = {
@@ -351,6 +358,9 @@ export function materializeSavedWorkflowRun(
   );
   const resolvedContext = resolveContext(input.revision.payload.contextRefs, input.context);
   const dag = validateDag({
+    ...(input.revision.payload.dagTemplate.schemaVersion !== undefined
+      ? { schemaVersion: input.revision.payload.dagTemplate.schemaVersion }
+      : {}),
     runId,
     nodes: cloneNodes(input.revision.payload.dagTemplate.nodes),
   });

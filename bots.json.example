@@ -4,6 +4,9 @@
     "larkAppSecret": "your_secret_1",
     "cliId": "claude-code",
     "model": "sonnet",
+    "groupDefaultModels": {
+      "oc_xxx_team": { "claude-code": { "model": "opus", "reasoningEffort": "high" } }
+    },
     "disableCliBypass": true,
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"],
@@ -25,8 +28,7 @@
   {
     "larkAppId": "cli_xxx_bot3",
     "larkAppSecret": "your_secret_3",
-    "cliId": "gemini",
-    "model": "gemini-2.5-pro",
+    "cliId": "antigravity",
     "allowedUsers": ["charlie@company.com"],
     "workingDir": "~/projects"
   },
@@ -49,6 +51,19 @@
     "larkAppSecret": "your_secret_6",
     "cliId": "pi",
     "allowedUsers": ["frank@company.com"],
+    "workingDir": "~/projects"
+  },
+  {
+    "larkAppId": "cli_xxx_bot7",
+    "larkAppSecret": "your_secret_7",
+    "cliId": "traex",
+    "model": "DeepSeek-V4-Pro",
+    "reasoningEffort": "medium",
+    "nativeSubagentRuntime": {
+      "model": { "mode": "custom", "value": "DeepSeek-V4-Pro" },
+      "reasoningEffort": { "mode": "custom", "value": "high" }
+    },
+    "allowedUsers": ["grace@company.com"],
     "workingDir": "~/projects"
   }
 ]

@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { computeViewportTop, pickChoice, truncateToWidth } from '../src/setup/interactive-select.js';
+import { describe, expect, it, vi } from 'vitest';
+import { BOTMUX_APP_ICON_BASE64 } from '../src/setup/app-icon-data.js';
+import { validateAvatarPng } from '../src/services/open-platform-rename.js';
+import { computeViewportTop, matchesSelectItem, pickChoice, truncateToWidth } from '../src/setup/interactive-select.js';
 import {
   createOpenPlatformAppWithClient,
   listOpenPlatformApps,
@@ -43,6 +45,25 @@ describe('pickChoice non-TTY fallback', () => {
   it('returns null for an empty item list', async () => {
     expect(await pickChoice(fakeRl(['1']), { title: 't', items: [] })).toBe(null);
   });
+
+  it('toggles language on "l" or "L" when allowLangToggle is true', async () => {
+    const { getDefaultLocale, setDefaultLocale } = await import('../src/i18n/index.js');
+    setDefaultLocale('zh');
+    let callCount = 0;
+    const factory = () => {
+      callCount++;
+      return {
+        title: getDefaultLocale() === 'zh' ? '中文标题' : 'English Title',
+        items: ITEMS,
+        defaultIndex: 0,
+      };
+    };
+    const res = await pickChoice(fakeRl(['L', '2']), factory, { allowLangToggle: true });
+    expect(res).toBe(1);
+    expect(getDefaultLocale()).toBe('en');
+    expect(callCount).toBeGreaterThanOrEqual(2);
+    setDefaultLocale('zh');
+  });
 });
 
 describe('computeViewportTop (长列表视口滚动)', () => {
@@ -75,6 +96,15 @@ describe('truncateToWidth', () => {
   });
 });
 
+describe('matchesSelectItem', () => {
+  it('matches hidden search text used by cascaded CLI groups', () => {
+    const item = { label: 'TRAE CLI', submenu: true, searchText: 'traex TRAE CLI 2.0 coco TRAE CLI 1.0' };
+    expect(matchesSelectItem(item, 'TRAE')).toBe(true);
+    expect(matchesSelectItem(item, 'traex')).toBe(true);
+    expect(matchesSelectItem(item, 'codex')).toBe(false);
+  });
+});
+
 function stubClient(responses: unknown[] | ((path: string, body: unknown) => unknown)): OpenPlatformApiClient & { calls: Array<{ path: string; body: unknown }> } {
   const calls: Array<{ path: string; body: unknown }> = [];
   const queue = Array.isArray(responses) ? [...responses] : null;
@@ -91,6 +121,12 @@ function stubClient(responses: unknown[] | ((path: string, body: unknown) => unk
     apiOrigin: 'https://open.feishu.cn',
     calls,
     async postJson(path: string, body?: unknown) {
+      calls.push({ path, body });
+      return throwIfError(queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body));
+    },
+    // 语义幂等的 POST（robot/event switch、读 Secret）走这条；stub 里与 postJson
+    // 同构记账，好让「调用了哪些 path」的既有断言不受实现分流影响。
+    async postJsonIdempotent(path: string, body?: unknown) {
       calls.push({ path, body });
       return throwIfError(queue ? queue.shift() : (responses as (p: string, b: unknown) => unknown)(path, body));
     },
@@ -166,6 +202,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_new' } },                  // upsert_by_template
       { code: 0 },                                                 // robot/switch
       { code: 0 },                                                 // event/switch
+      { code: 0, data: { privileges: [], scopeBiz: [] } },         // privilege/all（数据范围收窄，无待收窄项）
       { code: 0, data: { versionId: 'v-init' } },                  // app_version/create（启用发布）
       { code: 0 },                                                 // publish/commit
       { code: 0, data: { secret: 'new-secret' } },                 // secret
@@ -181,6 +218,9 @@ describe('createOpenPlatformAppWithClient', () => {
       '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_new',
       '/developers/v1/event/switch/cli_new',
+      // 模板建出的应用数据范围默认是 mode:'all'（「全部」），必须在**这一版发布之前**
+      // 收窄，否则第一个版本仍带「全部」进审批。
+      '/developers/v1/privilege/all/cli_new',
       '/developers/v1/app_version/create/cli_new',
       '/developers/v1/publish/commit/cli_new/v-init',
       '/developers/v1/secret/cli_new',
@@ -189,6 +229,10 @@ describe('createOpenPlatformAppWithClient', () => {
     expect(upload.get('uploadType')).toBe('4');
     expect(upload.get('isIsv')).toBe('false');
     expect(upload.get('scale')).toBe(JSON.stringify({ width: 512, height: 512 }));
+    // 默认图标沿用会话群头像：渐变底色 + logo 现渲染成 512×512，而不是纯 favicon。
+    const icon = Buffer.from(await (upload.get('file') as Blob).arrayBuffer());
+    expect(validateAvatarPng(icon)).toEqual({ ok: true });
+    expect(icon.equals(Buffer.from(BOTMUX_APP_ICON_BASE64, 'base64'))).toBe(false);
     expect(client.calls[1].body).toMatchObject({
       appManifestTemplateID: 'developer_console',
       createAppUserCustomField: {
@@ -199,15 +243,46 @@ describe('createOpenPlatformAppWithClient', () => {
     });
     expect(client.calls[2].body).toEqual({ clientId: 'cli_new', enable: true });
     expect(client.calls[3].body).toEqual({ clientId: 'cli_new', eventMode: 4 });
-    // 启用发布用极简版本 payload,可见成员含创建者(否则发布后不自动上架启用)
-    expect(client.calls[4].body).toMatchObject({
+    // 启用发布用极简版本 payload,可见成员含创建者(否则发布后不自动上架启用)。
+    // ⚠️ 按**路径**取而不是按下标：这条链路中间插过步骤（数据范围收窄），写死下标会让
+    // 任何后续插入都变成一堆看不出所以然的失败。
+    const bodyOf = (needle: string) => client.calls.find(call => call.path.includes(needle))?.body as any;
+    expect(bodyOf('/app_version/create/')).toMatchObject({
       appVersion: '1.0.0',
       visibleSuggest: { members: ['u_creator'], isAll: 0 },
       pcDefaultAbility: 'bot',
       mobileDefaultAbility: 'bot',
     });
-    expect(client.calls[4].body).not.toHaveProperty('applyReasonConfig');
-    expect(client.calls[5].body).toEqual({ clientId: 'cli_new' });
+    expect(bodyOf('/app_version/create/')).not.toHaveProperty('applyReasonConfig');
+    expect(bodyOf('/publish/commit/')).toEqual({ clientId: 'cli_new' });
+  });
+
+  it('falls back to the plain favicon when the gradient icon cannot be rendered', async () => {
+    vi.doMock('../src/services/bot-app-icon.js', () => ({
+      renderBotAppIconPng: () => { throw new Error('render exploded'); },
+    }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const client = stubClient([
+        { code: 0, data: { url: 'https://cdn.example/botmux.png' } },
+        { code: 0, data: { ClientID: 'cli_fallback_icon' } },
+        { code: 0 },
+        { code: 0 },
+        { code: 0, data: { privileges: [], scopeBiz: [] } },
+        { code: 0, data: { versionId: 'v-init' } },
+        { code: 0 },
+        { code: 0, data: { secret: 'new-secret' } },
+      ]);
+      await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-fb', creatorUserId: 'u_creator' }))
+        .resolves.toEqual({ appId: 'cli_fallback_icon', appSecret: 'new-secret' });
+      const upload = client.calls[0].body as FormData;
+      const icon = Buffer.from(await (upload.get('file') as Blob).arrayBuffer());
+      expect(icon.equals(Buffer.from(BOTMUX_APP_ICON_BASE64, 'base64'))).toBe(true);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('render exploded'));
+    } finally {
+      warn.mockRestore();
+      vi.doUnmock('../src/services/bot-app-icon.js');
+    }
   });
 
   it('fails closed (with appId) when the enabling publish commit fails — no silent orphan', async () => {
@@ -216,6 +291,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_commit_fail' } },
       { code: 0 },
       { code: 0 },
+      { code: 0, data: { privileges: [], scopeBiz: [] } }, // privilege/all（数据范围收窄）
       { code: 0, data: { versionId: 'v-init' } }, // 版本创建成功
       { code: 1, msg: 'publish commit rejected' }, // commit 失败 → 抛
     ]);
@@ -227,6 +303,7 @@ describe('createOpenPlatformAppWithClient', () => {
       '/developers/v1/manifest/upsert_by_template',
       '/developers/v1/robot/switch/cli_commit_fail',
       '/developers/v1/event/switch/cli_commit_fail',
+      '/developers/v1/privilege/all/cli_commit_fail',
       '/developers/v1/app_version/create/cli_commit_fail',
       '/developers/v1/publish/commit/cli_commit_fail/v-init',
     ]);
@@ -238,6 +315,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_noverid' } },
       { code: 0 },
       { code: 0 },
+      { code: 0, data: { privileges: [], scopeBiz: [] } }, // privilege/all（数据范围收窄）
       { code: 0, data: {} }, // code=0 但没 versionId → 可能留下未发布草稿
     ]);
     await expect(createOpenPlatformAppWithClient(client, { name: 'botmux-nv', creatorUserId: 'u_creator' }))
@@ -253,6 +331,7 @@ describe('createOpenPlatformAppWithClient', () => {
       { code: 0, data: { ClientID: 'cli_orphan_guard' } },
       { code: 0 },
       { code: 0 },
+      { code: 0, data: { privileges: [], scopeBiz: [] } }, // privilege/all（数据范围收窄）
       { code: 0, data: { versionId: 'v-init' } },
       { code: 0 },
       { code: 0, data: {} }, // secret 缺失

@@ -5,9 +5,12 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { isBunRuntime } from './helpers/ts-runner.js';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -15,6 +18,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { prepareDirectSandbox, probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import { buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { ensureGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
@@ -62,17 +67,26 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
     mkdirSync(dataDir, { recursive: true });
     mkdirSync(project, { recursive: true });
     vi.stubEnv('HOME', home);
+    vi.stubEnv('TRAE_HOME', '');
     vi.stubEnv('SESSION_DATA_DIR', dataDir);
   });
 
   afterEach(() => {
     vi.unstubAllEnvs();
-    rmSync(root, { recursive: true, force: true });
+    // prepareDirectSandbox() chmods its deny-mask sources to 000 under `root`, and
+    // a 000 directory cannot be traversed — so a plain recursive delete throws
+    // `EACCES: permission denied, rm` for any NON-root uid (measured: green as
+    // root, red on Node and Bun alike as a normal user, i.e. what CI runs as).
+    rmSandboxScratch(root);
   });
 
-  it.each(['default', 'custom'] as const)(
-    'relays a session MCP through the trusted host without exposing descriptors in bwrap (%s data dir)',
-    async (dataDirMode) => {
+  it.each([
+    ['codex', 'default'], ['codex', 'custom'],
+    ['traex', 'default'], ['traex', 'custom'],
+    ['coco', 'default'], ['coco', 'custom'],
+  ] as const)(
+    'relays a session MCP through the trusted host without exposing descriptors in bwrap (%s, %s data dir)',
+    async (cliId, dataDirMode) => {
       if (dataDirMode === 'custom') {
         dataDir = join(root, 'custom-botmux-home', 'data');
         mkdirSync(dataDir, { recursive: true });
@@ -110,19 +124,21 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
       });
 
       const gatewayBin = join(home, '.botmux', 'bin', 'botmux');
-      const codexConfig = join(root, 'codex-config.toml');
+      const traeAdapter = cliId === 'traex' ? createTraexAdapter('/bin/traex')
+        : cliId === 'coco' ? createCocoAdapter('/bin/coco') : undefined;
+      const cliConfig = traeAdapter?.mcpGateway?.configPath ?? join(root, 'codex-config.toml');
       mkdirSync(join(home, '.botmux', 'bin'), { recursive: true });
       writeFileSync(gatewayBin, '#!/bin/sh\nexit 99\n');
       chmodSync(gatewayBin, 0o755);
-      const installReport = ensureGatewayEntry({
+      const installReport = ensureGatewayEntry(traeAdapter ?? {
         id: 'codex',
-        mcpGateway: { format: 'codex-toml', configPath: codexConfig },
+        mcpGateway: { format: 'codex-toml', configPath: cliConfig },
       }, {
         command: gatewayBin,
         args: ['mcp', 'serve'],
       });
       expect(installReport.state).toBe('installed');
-      const forwardedKeys = codexForwardedEnvKeys(codexConfig);
+      const forwardedKeys = codexForwardedEnvKeys(cliConfig);
 
       let gatewayHost: SessionMcpGatewayHost | null = null;
       let sandbox: ReturnType<typeof prepareDirectSandbox> = null;
@@ -149,7 +165,13 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
           workingDir: project,
           currentAppId: 'cli_test',
           botHome,
-          redirectedCliData: true,
+          redirectedCliData: cliId === 'codex',
+          readonlyRoots: [
+            // Match worker's dependency carve-out for symlinked worktrees.
+            realpathSync(resolve('node_modules')),
+            ...(traeAdapter?.sandboxReadonlyPaths?.() ?? []).map(path =>
+              path.startsWith('~/') ? join(home, path.slice(2)) : path),
+          ],
           execPaths: [dirname(process.execPath)],
           botmuxInstallRoot: resolve('.'),
           outbox,
@@ -192,6 +214,16 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
         expect(probe.error).toBeUndefined();
         expect(probe.status, probe.stderr).toBe(0);
 
+        if (traeAdapter) {
+          const configProbe = spawnSync(sandbox.bin, [
+            ...sandbox.args.slice(0, commandIndex + 1), '/bin/sh', '-c',
+            'test -r "$1" && ! (printf forbidden >> "$1")', 'verify-readonly-trae-config', cliConfig,
+          ], { cwd: project, env: { ...process.env, ...sandbox.env }, encoding: 'utf8', timeout: 10_000 });
+          expect(configProbe.error).toBeUndefined();
+          expect(configProbe.status, configProbe.stderr).toBe(0);
+          expect(readFileSync(cliConfig, 'utf8')).not.toContain('forbidden');
+        }
+
         const parentGatewayEnv: Record<string, string> = {
           [MCP_GATEWAY_SESSION_ENV]: sessionId,
           [MCP_GATEWAY_DATA_DIR_ENV]: dataDir,
@@ -217,13 +249,17 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
           stderr: 'pipe',
         });
         client = new Client({ name: 'sandbox-gateway-test', version: '1.0.0' });
-        await client.connect(transport);
+        let relayStderr = '';
+        transport.stderr?.on('data', chunk => { relayStderr += String(chunk); });
+        try { await client.connect(transport); }
+        catch (error) { throw new Error(`Gateway relay failed: ${relayStderr}`, { cause: error }); }
 
         expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
         const result = await client.callTool({ name: 'echo', arguments: { value: 1 } });
-        expect((result.content[0] as { text: string }).text).toContain(
-          `alpha:echo:{"value":1}:session=${sessionId}:token=host-only-token`,
-        );
+        const echoed = (result.content[0] as { text: string }).text;
+        // #917 fixture 回显 `_meta`，不再与 session 字段连成一段。
+        expect(echoed).toContain('alpha:echo:{"value":1}');
+        expect(echoed).toContain(`session=${sessionId}:token=host-only-token`);
       } finally {
         if (client) await client.close().catch(() => undefined);
         else if (transport) await transport.close().catch(() => undefined);
@@ -239,7 +275,21 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
   // root (shared drive / ~/.local/bin symlink / fnm / nvm). Before the fix the
   // trusted `botmux` shim's `exec node` failed `not found` → MCP gateway exited
   // → Connection closed. The fix prepends dirname(realpath(process.execPath)).
-  it('resolves bare `node` under a hostile symlink-form host PATH (canonical exec dir prepended)', () => {
+  //
+  // NODE-ONLY, and not merely by preference: the fix under test is
+  // "prepend dirname(realpath(process.execPath))", and the probe then asserts
+  // bare `node` runs inside the sandbox. Under `bun test` process.execPath is the
+  // BUN binary, so the sandbox is granted bun's directory and the probe looks for
+  // a `node` that was never put there — exit 127. MEASURED on CI (runner node is
+  // /opt/hostedtoolcache/node/..., outside the /usr/bin the fixture keeps) and
+  // masked on a dev box that happens to have /usr/bin/node, which is why it reads
+  // as green locally under both runtimes.
+  //
+  // Granting bun's dir and probing for `bun` instead would NOT preserve the
+  // regression: the shim this protects execs `node` literally (see
+  // botmuxShimExecLine), so a bun-shaped probe would assert something production
+  // never does. The vitest/Node leg runs this for real; keep it there.
+  it.skipIf(isBunRuntime())('resolves bare `node` under a hostile symlink-form host PATH (canonical exec dir prepended) — Node-only: execPath is bun under `bun test`', () => {
     const botmuxHome = join(dataDir, '..');
     const botHome = join(botmuxHome, 'bots', 'cli_test');
     const outbox = join(dataDir, 'sandboxes', 'sid-path', 'outbox');
@@ -281,4 +331,5 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
       sandbox.cleanup();
     }
   });
+
 });

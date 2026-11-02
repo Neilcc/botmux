@@ -14,6 +14,9 @@ import {
   serializeRunEnvelope,
   type Sha256Digest,
 } from '../src/workflows/v3/run-envelope.js';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import { readScheduledTaskFromAuthority } from '../src/core/scheduled-turn-provenance.js';
+import type { ScheduledTask } from '../src/types.js';
 
 const DIGEST = `sha256:${'a'.repeat(64)}` as Sha256Digest;
 const CAPABILITY = 'c'.repeat(64);
@@ -25,16 +28,68 @@ const BINDING: RunChatBinding = {
   ownerOpenId: 'ou_caller',
 };
 
+const SCHED_TASK_ID = 'abcdef12';
+const SCHED_TURN_ID = `schedule:${SCHED_TASK_ID}:12345678-1234-1234-1234-123456789abc`;
+const SCHED_OWNER = 'ou_task_owner';
+const SCHED_BINDING: RunChatBinding = {
+  larkAppId: 'cli_owner',
+  chatId: 'oc_owner',
+  rootMessageId: 'om_root',
+  sessionId: 'sess-1',
+  ownerOpenId: SCHED_OWNER,
+};
+
 describe('v3 session relay authorization', () => {
   let baseDir: string;
+  let dataRoot: string;
+  let sessionDataDir: string;
+  let authority: ScheduleAuthorityStore | undefined;
+  /** The daemon's loader: host authority store only. */
+  const loadScheduledTask = (appId: string, taskId: string) =>
+    readScheduledTaskFromAuthority(authority, appId, taskId);
 
   beforeEach(() => {
     baseDir = mkdtempSync(join(tmpdir(), 'v3-session-relay-'));
+    dataRoot = mkdtempSync(join(tmpdir(), 'v3-session-relay-data-'));
+    sessionDataDir = join(dataRoot, 'sessions');
+    mkdirSync(sessionDataDir, { recursive: true });
+    authority = ScheduleAuthorityStore.open(sessionDataDir);
   });
 
   afterEach(() => {
+    authority?.close();
+    authority = undefined;
     rmSync(baseDir, { recursive: true, force: true });
+    rmSync(dataRoot, { recursive: true, force: true });
   });
+
+  function scheduledTask(overrides: Record<string, unknown> = {}): ScheduledTask {
+    const task: Record<string, unknown> = {
+      id: SCHED_TASK_ID,
+      name: 'nightly',
+      chatId: 'oc_owner',
+      larkAppId: 'cli_owner',
+      ownerOpenId: SCHED_OWNER,
+      enabled: true,
+      ...overrides,
+    };
+    for (const key of Object.keys(task)) if (task[key] === undefined) delete task[key];
+    return task as unknown as ScheduledTask;
+  }
+
+  /** What the CLI inside the sandbox can rewrite: the BOT_HOME projection. */
+  function writeProjection(task: ScheduledTask): void {
+    const dir = join(dataRoot, 'bots', 'cli_owner');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'schedules.json'), JSON.stringify({ [task.id]: task }));
+  }
+
+  /** The daemon's state: the authority row plus the projection it mirrors. */
+  function writeScheduledTask(overrides: Record<string, unknown> = {}): void {
+    const task = scheduledTask(overrides);
+    authority!.initializeApp('cli_owner', [task]);
+    writeProjection(task);
+  }
 
   function writeEnvelope(runId: string, binding?: RunChatBinding): void {
     const runDir = join(baseDir, runId);
@@ -285,5 +340,179 @@ describe('v3 session relay authorization', () => {
     for (const mutation of V3_SESSION_RUN_MUTATIONS) {
       expect(authorize({ mutation }).ok, mutation).toBe(true);
     }
+  });
+
+  describe('scheduled turns (schedule: prefix)', () => {
+    function authorizeScheduled(
+      overrides: Partial<Parameters<typeof authorizeV3SessionRunMutationRequest>[0]> = {},
+      gate: (appId: string, openId: string) => boolean = () => true,
+    ) {
+      return authorizeV3SessionRunMutationRequest({
+        runId: 'sched-ok',
+        mutation: 'start',
+        raw: { sessionId: 'sess-1', originCapability: CAPABILITY },
+        trustedHost: false,
+        session: sessionView({
+          liveOrigin: { capability: CAPABILITY, turnId: SCHED_TURN_ID, dispatchAttempt: 1 },
+          // A scheduled session has no human inbound fields.
+          callerOpenId: undefined,
+          quoteTargetId: undefined,
+        }),
+        selfLarkAppId: 'cli_owner',
+        baseDir,
+        loadScheduledTask,
+        isScheduleOwnerAllowed: gate,
+        ...overrides,
+      });
+    }
+
+    it('authorizes a scheduled turn as the task owner without human inbound fields', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask();
+      expect(authorizeScheduled()).toEqual({
+        ok: true,
+        body: {},
+        runDir: join(baseDir, 'sched-ok'),
+        larkAppId: 'cli_owner',
+      });
+    });
+
+    it('rejects a scheduled turn when the creator was removed from allowedUsers', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask();
+      const decision = authorizeScheduled({}, () => false);
+      expect(decision).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+      expect((decision as { detail?: string }).detail).toContain('授权名单');
+    });
+
+    it('rejects a scheduled turn whose task has no ownerOpenId (legacy task)', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask({ ownerOpenId: undefined });
+      expect(authorizeScheduled()).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('rejects a scheduled turn whose task does not exist', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      expect(authorizeScheduled()).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('allows an auto-completed one-shot only while that exact turn is live', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask({
+        enabled: false,
+        disabledReason: 'once_completed',
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+      expect(authorizeScheduled({
+        isScheduledTurnLive: turnId => turnId === SCHED_TURN_ID,
+      }).ok).toBe(true);
+      expect(authorizeScheduled({
+        isScheduledTurnLive: () => false,
+      })).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('does not let daemon liveness override a manual pause', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask({
+        enabled: false,
+        disabledReason: 'manual',
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+      expect(authorizeScheduled({
+        isScheduledTurnLive: () => true,
+      })).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('fails closed when the daemon did not inject the owner gate', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask();
+      const decision = authorizeV3SessionRunMutationRequest({
+        runId: 'sched-ok',
+        mutation: 'start',
+        raw: { sessionId: 'sess-1', originCapability: CAPABILITY },
+        trustedHost: false,
+        session: sessionView({
+          liveOrigin: { capability: CAPABILITY, turnId: SCHED_TURN_ID, dispatchAttempt: 1 },
+          callerOpenId: undefined,
+          quoteTargetId: undefined,
+        }),
+        selfLarkAppId: 'cli_owner',
+        baseDir,
+        loadScheduledTask,
+      });
+      expect(decision).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('ignores a sandbox-rewritten schedules.json: owner and target come from the authority store', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask();
+      // Agent inside the sandbox swaps the creator for another person and
+      // re-targets the task; the authority row is untouched.
+      writeProjection(scheduledTask({ ownerOpenId: 'ou_someone_else', chatId: 'oc_other' }));
+      const gateSeen: string[] = [];
+      const decision = authorizeScheduled({}, (_app, openId) => { gateSeen.push(openId); return true; });
+      expect(decision.ok).toBe(true);
+      expect(gateSeen).toEqual([SCHED_OWNER]);
+    });
+
+    it('denies a scheduled turn whose authority row is gone even if schedules.json still lists it', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask();
+      authority!.revoke('cli_owner', SCHED_TASK_ID);
+      expect(authorizeScheduled()).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('denies a task that exists only in schedules.json (forged projection row)', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      authority!.initializeApp('cli_owner', []);
+      writeProjection(scheduledTask());
+      expect(authorizeScheduled()).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('fails closed when the daemon did not inject the authority loader', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask();
+      expect(authorizeScheduled({ loadScheduledTask: undefined })).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('rejects a scheduled turn bound to a different chat tuple', () => {
+      writeEnvelope('sched-ok', { ...SCHED_BINDING, chatId: 'oc_other' });
+      writeScheduledTask();
+      expect(authorizeScheduled()).toMatchObject({
+        ok: false, status: 403, error: 'run_binding_mismatch',
+      });
+    });
+
+    it('still requires the generation join for non-scheduled turns', () => {
+      // Regression guard: the exemption must not widen ordinary turns.
+      writeEnvelope('bound-b', { ...BINDING, ownerOpenId: 'ou_caller_b' });
+      const decision = authorize({
+        runId: 'bound-b',
+        session: sessionView({
+          liveOrigin: { capability: CAPABILITY, turnId: 'turn-a' },
+          callerOpenId: 'ou_caller_b',
+          quoteTargetId: 'turn-b',
+        }),
+      });
+      expect(decision).toEqual({ ok: false, status: 403, error: 'turn_provenance_stale' });
+    });
   });
 });

@@ -1,16 +1,22 @@
 # 5-minute quick setup
 
-> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` (**a single Lark QR scan** creates the app + configures all permissions + publishes) → `botmux start` → `botmux autostart enable` → add the bot to a group and start chatting.
+> 💡 **TL;DR**: `curl -fsSL .../install.sh | sh` → `botmux setup` (**a single Lark QR scan** creates the app + configures all permissions + publishes) → `botmux start` → `botmux autostart enable` → add the bot to a group and start chatting.
 
-**Before you start**: confirm the [Prerequisites](/en/prerequisites) (Node ≥ 22, target CLI installed and logged in) — a missing prerequisite here is the most common cause of "installed but won't connect."
+**Before you start**: confirm the [Prerequisites](/en/prerequisites) (target CLI installed and logged in, tmux) — a missing prerequisite here is the most common cause of "installed but won't connect."
 
 ## Step 1 · Install
 
 ```bash
-npm install -g botmux
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 ```
 
-Requires **Node.js ≥ 22**, with at least one AI coding CLI already installed and signed in locally (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy`, etc.). **The default session backend is tmux (≥3.x), so install it** — when it's unavailable botmux hard-gates with a card instead of silently downgrading to pty; only pick an explicit backend (`BACKEND_TYPE=pty` or per-bot `backendType`: `pty`/`herdr`/`zellij`) if you truly need a tmux-free environment (riff is a cloud agent and doesn't occupy a local backend).
+botmux is a **self-contained single-file binary** with its runtime embedded — **neither installing nor running it needs Node**. It installs to `~/.botmux/bin/botmux` (override with `BOTMUX_INSTALL_DIR`), picks the binary for your OS/arch, verifies its SHA-256, and adds `~/.botmux/bin` to the startup file your shell actually reads (zsh / bash / fish each get the correct one), so **a new terminal has the command**. Supported: linux / macOS × x64 / arm64, with musl builds selected automatically on Alpine and similar. **On Windows, install inside WSL2.**
+
+> 🔁 **Upgrading is always the curl command**, regardless of how you originally installed (npm/pnpm global installs included): re-run the command above to replace the binary in place — it won't append a second PATH line — then open a new terminal and run `botmux restart`. To install a specific version: `curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh` (the variable must precede the `sh` on the right side of the pipe to take effect). ⚠️ **Do not npm-upgrade from releases older than v3.18.0** — crossing the Node-sources → binary form boundary leaves the daemon unable to restart; see [FAQ · How do I upgrade?](/en/faq#how-do-i-upgrade).
+
+> 📦 **npm works too** (`npm install -g botmux`, needs Node ≥ 22 to run the install itself): the npm package carries **the same self-contained binary** (verified byte-identical to the GitHub Release asset by SHA-256; only the one matching your os/arch is installed), and its postinstall points `~/.botmux/bin/botmux` at it and writes PATH the same way. The only difference is **who installs it**: the npm path needs Node, the curl path never touches it; **upgrades always re-run the curl command, no matter how you installed** (npm-upgrading from a pre-v3.18.0 install across that form boundary can leave the daemon unable to restart — see [FAQ · How do I upgrade?](/en/faq#how-do-i-upgrade)). Once running, the two are identical.
+
+Running botmux itself needs no Node, but you do need **at least one AI coding CLI installed and signed in locally** (`claude` / `codex` / `cursor-agent` / `opencode` / `coco` / `agy`, etc. — each with its own runtime requirements). **The default session backend is tmux (≥3.x), so install it** — when it's unavailable botmux hard-gates with a card instead of silently downgrading to pty; only pick an explicit backend (`BACKEND_TYPE=pty` or per-bot `backendType`: `pty`/`herdr`/`zellij`) if you truly need a tmux-free environment (riff is a cloud agent and doesn't occupy a local backend).
 
 ## Step 2 · Configure (`botmux setup`)
 
@@ -61,7 +67,6 @@ Pick one line for the CLI you have installed (all non-interactive; they print th
 ```bash
 claude -p "$DIAG" --allowedTools "Bash"   # Claude Code
 codex exec "$DIAG"                         # Codex
-gemini -p "$DIAG" --yolo                   # Gemini
 coco  -p "$DIAG" --yolo                    # Trae / CoCo (aliases trae-agent / ta)
 cursor-agent -p "$DIAG"                    # Cursor
 ```
@@ -76,3 +81,13 @@ Still stuck? Check manually (usually local-side):
 - **Network**: the long-lived WebSocket can't get out (corporate network / proxy / firewall) → the agent will see the connection errors in the logs.
 
 After confirming, run `botmux restart`. See [FAQ / Troubleshooting](/en/faq) for more.
+
+### Adding an @ mention by editing does not trigger the bot?
+
+Editing a message that has not yet triggered the bot to add an @ mention requires the optional `im.message.updated_v1` subscription with long-connection delivery. Missing this event does not affect ordinary new messages.
+
+Group context sharing (`/context-sharing`) marks recalled messages in its record only when the optional `im.message.recalled_v1` event is subscribed. Without it, recalls are not reflected and the bot's startup log reports the gap; ordinary new messages are unaffected.
+
+At startup, botmux uses an existing Feishu Open Platform login session to add this event to an existing long-connection configuration. It does not switch delivery modes, change permissions, or publish an app version. Logs reporting a successful update request or a configuration readback do not verify the published version or actual event delivery. After adding the subscription to a production app, inspect the pending changes in the Open Platform and publish a version, then test by adding an @ mention to a message that has not previously triggered the bot.
+
+If the sender relies on team membership for chat access, edited messages also require a contact lookup to recover the sender's `union_id`. The app needs contact read permissions (the default permission manifest includes `contact:user.id:readonly`), and the sender must be within its visibility scope. If permission is missing or the lookup fails, botmux uses only the original message author's `open_id` under the existing access rules; team membership alone cannot grant access. It never borrows the editor's identity.

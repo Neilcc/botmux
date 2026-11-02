@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 
 import {
   discoverGitSkillCandidates,
+  discoverGitSkillCandidatesAsync,
   installGitSkill,
   installGitSkillAsync,
   installGitSkillsFromSourceAsync,
@@ -244,12 +245,47 @@ describe('git skill install', () => {
   });
 
   it('removes the throwaway checkout after async dashboard discovery', async () => {
-    const { discoverGitSkillCandidatesAsync } = await import('../src/services/skill-registry-store.js');
-
     const discovered = await discoverGitSkillCandidatesAsync({ url: repo, ref: 'HEAD' });
 
     expect(discovered.skills.map(skill => skill.name)).toEqual(['deploy']);
     expect(readdirSync(join(home, '.botmux', 'skills', 'sources'))).toEqual([]);
+  });
+
+  it('keeps mixed shallow and nested candidates during fallback discovery', async () => {
+    write(join(repo, 'skills', 'category', 'nested', 'SKILL.md'), '---\nname: nested\n---\n# Nested');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add nested skill'], repo);
+
+    const discovered = await discoverGitSkillCandidatesAsync({
+      url: repo,
+      ref: 'HEAD',
+      fallbackToFullDepth: true,
+    });
+
+    expect(discovered.skills.map(skill => skill.name).sort()).toEqual(['deploy', 'nested']);
+    expect(discovered.deepScanned).toBe(true);
+
+    const installed = await installGitSkillsFromSourceAsync({
+      url: repo,
+      ref: 'HEAD',
+      skillNames: ['nested'],
+    });
+    expect(installed.map(skill => skill.name)).toEqual(['nested']);
+  });
+
+  it('keeps sync CLI discovery aligned with fallback installation candidates', () => {
+    write(join(repo, 'plugins', 'p', 'skills', 'nested', 'SKILL.md'), '---\nname: nested\n---\n# Nested');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add plugin skill'], repo);
+
+    const discovered = discoverGitSkillCandidates({
+      url: repo,
+      ref: 'HEAD',
+      fallbackToFullDepth: true,
+    });
+
+    expect(discovered.skills.map(skill => skill.name).sort()).toEqual(['deploy', 'nested']);
+    expect(discovered.deepScanned).toBe(true);
   });
 
   it('installs the only discovered skill from a repository root', async () => {
@@ -277,6 +313,20 @@ describe('git skill install', () => {
       url: repo,
       path: 'skills/review',
     });
+  });
+
+  it('reuses one checkout for an async multi-skill install', async () => {
+    write(join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\n---\n# Review');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add review skill'], repo);
+    const { url, logFile } = installGithubGitShim(home, repo, 'cached-fetch');
+
+    const packages = await installGitSkillsFromSourceAsync({ url, ref: 'HEAD', all: true });
+
+    expect(packages.map(pkg => pkg.name).sort()).toEqual(['deploy', 'review']);
+    const attempts = readFileSync(logFile, 'utf8').trim().split(/\r?\n/);
+    expect(attempts.filter(line => line === 'https-authenticated-clone')).toHaveLength(1);
+    expect(attempts.filter(line => line === 'https-authenticated-fetch')).toHaveLength(1);
   });
 
   it('updates an installed git skill from its recorded source', () => {
@@ -326,6 +376,59 @@ describe('git skill install', () => {
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+
+  describe('a source recorded with a branch name', () => {
+    function commitDeploy(description: string): string {
+      write(join(repo, 'skills', 'deploy', 'SKILL.md'), `---\nname: deploy\ndescription: ${description}\n---\n# Deploy`);
+      run('git', ['add', '.'], repo);
+      run('git', ['commit', '-m', description], repo);
+      return run('git', ['rev-parse', 'HEAD'], repo);
+    }
+
+    beforeEach(() => {
+      // A non-default branch: the clone's initial checkout never touches it.
+      run('git', ['checkout', '-b', 'release'], repo);
+      commitDeploy('Release v1');
+    });
+
+    it('updates to the remote branch tip, not the stale local branch of the cache', () => {
+      installGitSkill({ url: repo, path: 'skills/deploy', ref: 'release' });
+      expect(readSkillRegistry().skills.deploy.description).toBe('Release v1');
+      // A cache written by an earlier build holds a LOCAL `release` branch at
+      // the first-installed commit; fetch never moves it.
+      const cache = installedGitSourceDir(home);
+      run('git', ['branch', '-f', 'release', 'HEAD'], cache);
+      const v2 = commitDeploy('Release v2');
+
+      const result = updateInstalledSkill('deploy');
+
+      expect(result.ok).toBe(true);
+      expect(readSkillRegistry().skills.deploy.description).toBe('Release v2');
+      expect(readSkillRegistry().skills.deploy.source).toMatchObject({ ref: 'release', commit: v2 });
+    });
+
+    it('does the same for dashboard (async) updates', async () => {
+      await installGitSkillAsync({ url: repo, path: 'skills/deploy', ref: 'release' });
+      run('git', ['branch', '-f', 'release', 'HEAD'], installedGitSourceDir(home));
+      const v2 = commitDeploy('Release v2 async');
+
+      const result = await updateInstalledSkillAsync('deploy');
+
+      expect(result.ok).toBe(true);
+      expect(readSkillRegistry().skills.deploy.description).toBe('Release v2 async');
+      expect(readSkillRegistry().skills.deploy.source).toMatchObject({ ref: 'release', commit: v2 });
+    });
+
+    it('keeps a tag or commit pinned where it points', () => {
+      const pinned = run('git', ['rev-parse', 'HEAD'], repo);
+      run('git', ['tag', 'v1'], repo);
+      installGitSkill({ url: repo, path: 'skills/deploy', ref: 'v1' });
+      commitDeploy('Release v2');
+
+      expect(updateInstalledSkill('deploy').ok).toBe(true);
+      expect(readSkillRegistry().skills.deploy).toMatchObject({ description: 'Release v1', source: { commit: pinned } });
+    });
   });
 
   it('supports async install and update for dashboard jobs', async () => {

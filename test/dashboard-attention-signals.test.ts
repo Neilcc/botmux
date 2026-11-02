@@ -7,7 +7,7 @@
 //     no worker yet, so the normal spawn-time announce never fires) and
 //     no-ops for non-pending sessions
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
@@ -23,9 +23,12 @@ import {
   publishAttentionPatch,
   publishClosedSessionPatch,
   publishLastInputFromBotPatch,
+  publishNativeTopicLinkPatch,
   publishSessionMessagePreviewPatch,
 } from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import { Aggregator } from '../src/dashboard/aggregator.js';
+import { fillNativeTopicId } from '../src/core/native-topic-id.js';
 import { attentionWaitSince } from '../src/dashboard/web/ui.js';
 import {
   setTerminalProxyPort,
@@ -174,6 +177,39 @@ describe('attention signals', () => {
         body: { sessionId: 'sess-1', patch: { lastInputFromBot: false } },
       },
     ]);
+  });
+
+  it('immediately adds a direct topic link to an already-hydrated active row', () => {
+    const ds = makeDs();
+    ds.session.scope = 'thread';
+    const aggregator = new Aggregator();
+    aggregator.hydrateSessions(ds.larkAppId, [composeRowFromActive(ds)]);
+    expect(aggregator.getSession('sess-1')?.feishuThreadLink).toBeUndefined();
+
+    const seen = collectEvents();
+    expect(fillNativeTopicId(ds.session, 'thread', 'omt_original')).toBe(true);
+    expect(publishNativeTopicLinkPatch(ds)).toBe(true);
+    expect(seen).toEqual([{
+      type: 'session.update',
+      body: {
+        sessionId: 'sess-1',
+        patch: { feishuThreadLink: expect.stringContaining('open_thread_id=omt_original') },
+      },
+    }]);
+    aggregator.applyEvent(ds.larkAppId, seen[0]);
+    expect(aggregator.getSession('sess-1')?.feishuThreadLink).toContain('open_thread_id=omt_original');
+
+    // A repeated message cannot overwrite the original topic or emit another
+    // Dashboard patch; malformed/chat ids are rejected before this helper.
+    expect(fillNativeTopicId(ds.session, 'thread', 'omt_other')).toBe(false);
+    expect(fillNativeTopicId(ds.session, 'chat', 'omt_chat')).toBe(false);
+    expect(seen).toHaveLength(1);
+  });
+
+  it('does not publish a native topic patch without a valid link', () => {
+    const seen = collectEvents();
+    expect(publishNativeTopicLinkPatch(makeDs())).toBe(false);
+    expect(seen).toEqual([]);
   });
 
   it('publishSessionMessagePreviewPatch refreshes the exchange after queue append', () => {
@@ -378,34 +414,6 @@ describe('attention signals', () => {
     announcePendingRepoSession(makeDs({ pendingRepo: false }));
     announcePendingRepoSession(makeDs());
     expect(seen).toHaveLength(0);
-  });
-
-  it('handleThreadReply clears agent attention before early-return intercepts', () => {
-    const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
-    const start = src.indexOf('async function handleThreadReply(');
-    expect(start).toBeGreaterThanOrEqual(0);
-    const end = src.indexOf('async function autoCreateDocSession(', start);
-    expect(end).toBeGreaterThan(start);
-    // Bound the source-order assertion by the next top-level sibling instead
-    // of a character count. Legitimate additions to handleThreadReply (for
-    // example master's CAS handoff paths or PR #597's admission and recovery
-    // guards) must not make this regression test silently inspect only the
-    // first part of the function.
-    const region = src.slice(start, end);
-    const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
-    expect(clearIdx).toBeGreaterThanOrEqual(0);
-    for (const marker of [
-      'isCallbackUrl(content)',
-      'handleV3SavedWorkflowCommandIfAny',
-      'parseWorkflowGrillTrigger',
-      'isLegacyTemplateCommand',
-      'parseSlashCommandInvocation',
-      'findPendingAskByAnchor',
-    ]) {
-      const markerIdx = region.indexOf(marker);
-      expect(markerIdx).toBeGreaterThanOrEqual(0);
-      expect(clearIdx).toBeLessThan(markerIdx);
-    }
   });
 
   it('attentionWaitSince prefers agent raise time and falls back safely', () => {

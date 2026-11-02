@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { appendFileSync, closeSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -22,11 +23,39 @@ const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
 const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
 const threadNotLoadedReads = Number(process.env.FAKE_CODEX_THREAD_NOT_LOADED_READS ?? '0');
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
+// 前 N 次 thread/read 成功响应延迟 M 毫秒——模拟繁忙机器上慢的 app-server，
+// 让单次响应耗时超过调用方的整段等待预算（waitForThreadPreview 的 deadline
+// 超时容错只在这种条件下可复现）。只影响成功响应，不影响错误分支。
+const threadReadDelayMs = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_MS ?? '0');
+const threadReadDelayReads = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_READS ?? '1');
+// Slow every thread/name/set reply, as a loaded runner slows a local round trip.
+const nameSetDelayMs = Number(process.env.FAKE_CODEX_NAME_SET_DELAY_MS ?? '0');
+// Same for the thread/read that verifies a written name (reads after name/set).
+const verifyReadDelayMs = Number(process.env.FAKE_CODEX_VERIFY_READ_DELAY_MS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
 const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
-if (pidPath) writeFileSync(pidPath, String(process.pid));
+// 结尾换行表示 PID 已写完整（test/helpers/pid-file.ts 据此判断）：writeFileSync
+// 先建空文件再写入，轮询方在这个窗口读到 ''，Number('') 是 0，而 process.kill(0, 0)
+// 探测的是测试自己的进程组，永远成功，「已回收」就永远等不到。
+if (pidPath) writeFileSync(pidPath, `${process.pid}\n`);
+if (process.env.FAKE_CODEX_INHERITED_STDIO) {
+  // 后代持有 stdio，让父进程 exit 后仍无法触发 close。
+  spawn(process.execPath, ['-e', `
+    const { appendFileSync } = require('node:fs');
+    const log = entry => appendFileSync(process.argv[1], JSON.stringify(entry) + '\\n');
+    process.on('SIGUSR1', () => {
+      process.stdout.write(JSON.stringify({ id: 9001, method: 'stale/request' }) + '\\n',
+        () => log({ staleRequestSent: process.pid }));
+    });
+    log({ stdioHolderPid: process.pid });
+    setTimeout(() => {}, 60_000);
+  `, logPath], { stdio: 'inherit' });
+  if (process.env.FAKE_CODEX_INHERITED_STDIO === 'exit') {
+    process.on('SIGTERM', () => process.exit(0));
+  }
+}
 if (envLogPath) {
   const codexHome = process.env.CODEX_HOME ?? '';
   writeFileSync(envLogPath, JSON.stringify({
@@ -38,10 +67,12 @@ if (envLogPath) {
 let inputBuffer = '';
 let turnAttempt = 0;
 let threadReadAttempt = 0;
+let nameSetSeen = false;
 let currentThreadName;
 let goalTurn = null;
 let reconciledTurn = null;
 let activeTurn;
+let pendingUserInput;
 let steerCount = 0;
 /** For steer-group-mismatch: the clientIds actually sent (root + steers), so the
  *  fixture can emit a full-items terminal turn that OMITS one — exercising the
@@ -58,19 +89,58 @@ if (logPath) {
   }) + '\n');
 }
 
+// FAKE_CODEX_COALESCE=1: batch every line written within one synchronous pass
+// into a SINGLE stdout write. Adjacent pipe writes coalesce into one read
+// whenever the reader is scheduled late (routine on loaded CI runners), and
+// the runner's message ordering must not depend on chunk boundaries — this
+// knob makes that transport condition deterministic instead of scheduler-luck.
+let coalesceBuffer = null;
 function write(message) {
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+  const line = JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n';
+  if (process.env.FAKE_CODEX_COALESCE === '1') {
+    if (coalesceBuffer === null) {
+      coalesceBuffer = '';
+      setImmediate(() => {
+        const out = coalesceBuffer;
+        coalesceBuffer = null;
+        process.stdout.write(out);
+      });
+    }
+    coalesceBuffer += line;
+    return;
+  }
+  process.stdout.write(line);
 }
 
 function respond(id, result) {
   write({ id, result });
 }
 
+/** Write several JSON-RPC messages in ONE stdout chunk so the runner receives
+ * them in a single read. Adjacent pipe writes coalesce whenever the reader is
+ * scheduled late; this makes that transport condition deterministic for the
+ * completion-race regression repros. */
+function writeBatch(messages) {
+  process.stdout.write(messages
+    .map(message => JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
+    .join(''));
+}
+
 function reject(id, code, message) {
   write({ id, error: { code, message } });
 }
 
+const startedAgentItems = new Set();
 function notify(method, params) {
+  const key = `${params.turnId}:${params.item?.id ?? params.itemId}`;
+  if (method === 'item/started' && params.item?.type === 'agentMessage') startedAgentItems.add(key);
+  if (method === 'item/agentMessage/delta' && !startedAgentItems.has(key)
+      && !(behavior === 'async-user-input-no-start' && params.itemId === 'call_async_question')) {
+    // Real streams declare delivery before deltas. Keep the no-start async
+    // case explicit so buffering is tested rather than inferred from sleeps.
+    notify('item/started', { threadId: params.threadId, turnId: params.turnId,
+      item: { type: 'agentMessage', id: params.itemId, delivery: null } });
+  }
   write({ method, params });
 }
 
@@ -78,18 +148,85 @@ function completeTurn(request) {
   const threadId = request.params.threadId;
   const turnId = `turn-fake-${turnAttempt}`;
   const responseLast = behavior === 'start-response-last'
-    || behavior === 'start-response-last-goal';
+    || behavior === 'start-response-last-goal' || behavior === 'async-user-input-early';
   if (!responseLast) respond(request.id, { turn: { id: turnId } });
   notify('turn/started', { threadId, turn: { id: turnId } });
   // Exercise duplicate pre-response lifecycle notifications: the runner must
   // buffer one edge and must not misclassify a duplicate as autonomous work.
   if (responseLast) notify('turn/started', { threadId, turn: { id: turnId } });
+  if (behavior === 'capacity-error') {
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed',
+      error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } } });
+    return;
+  }
+  if (behavior === 'failed-no-error') {
+    // Protocol variant: terminal failure that omits the error object entirely.
+    // The runner must settle it as a generic failure, never crash the process
+    // (JSON.stringify(undefined) returns undefined → toLowerCase TypeError).
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed' } });
+    return;
+  }
   if (request.params.outputSchema) {
     write({
       id: 9000 + turnAttempt,
       method: 'item/tool/call',
       params: { threadId, turnId, tool: 'forbidden-test-tool' },
     });
+  }
+  if (behavior.startsWith('user-input')) {
+    pendingUserInput = { threadId, turnId, requestId: behavior === 'user-input-string' ? 'native-question-1' : 9200 + turnAttempt };
+    const questions = [
+      { id: 'environment', header: 'Environment', question: 'Choose environment', isOther: true, isSecret: false,
+        options: [{ label: 'Staging (Recommended)', description: 'Test first' }, { label: 'Production', description: 'Live traffic' }] },
+      { id: 'notify', header: 'Notify', question: 'Choose channel', isOther: true, isSecret: false,
+        options: [{ label: 'Lark', description: 'In this chat' }, { label: 'Email', description: 'Send later' }] },
+    ];
+    if (behavior === 'user-input-unsupported') questions[1].options = [{ label: 'Only one' }];
+    if (behavior === 'user-input-text') questions[1].options = null;
+    write({ id: pendingUserInput.requestId, method: 'item/tool/requestUserInput', params: { threadId, turnId, questions } });
+    if (behavior === 'user-input-cancelled') {
+      setTimeout(() => { notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } }); pendingUserInput = undefined; }, 200);
+    }
+    if (behavior === 'user-input-exit') setTimeout(() => process.exit(1), 200);
+    return;
+  }
+  if (behavior.startsWith('async-user-input') && turnAttempt === 1) {
+    if (behavior === 'async-user-input-live-steer') {
+      activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+      groupClientIds = [request.params.clientUserMessageId ?? null];
+    }
+    const item = { type: 'agentMessage', id: 'call_async_question', delivery: 'async', phase: 'final_answer',
+      text: 'Which environment?\nPPE (Recommended) / Production', questions: [
+        { title: 'Which environment?', options: ['PPE (Recommended)', 'Production'] },
+        { title: 'Which voice?', options: null },
+      ] };
+    if (behavior === 'async-user-input-malformed') item.questions[0].options = [];
+    if (behavior === 'async-user-input-selected') item.questions[1].options = ['Elia', 'Other'];
+    const notificationThread = behavior === 'async-user-input-foreign' ? 'foreign-thread' : threadId;
+    if (behavior === 'async-user-input-corrected') notify('item/completed', { threadId, turnId,
+      item: { ...item, questions: [{ title: '', options: null }] } });
+    if (behavior === 'async-user-input-overlap') {
+      const text = `Example: ${item.text} END EXAMPLE\n`;
+      notify('item/agentMessage/delta', { threadId, turnId, itemId: 'ordinary-example', delta: text });
+      notify('item/completed', { threadId, turnId, item: { type: 'agentMessage', id: 'ordinary-example', text } });
+    }
+    if (behavior !== 'async-user-input-no-start') notify('item/started', { threadId: notificationThread, turnId, item });
+    notify('item/agentMessage/delta', { threadId: notificationThread, turnId, itemId: item.id, delta: item.text });
+    notify('item/completed', { threadId: notificationThread, turnId, item });
+    if (behavior === 'async-user-input-duplicate') notify('item/completed', { threadId, turnId, item });
+    if (behavior === 'async-user-input-limit') {
+      for (let n = 1; n <= 32; n++) notify('item/completed', { threadId, turnId, item: { ...item, id: `call_limit_${n}` } });
+    }
+    if (responseLast) respond(request.id, { turn: { id: turnId } });
+    if (behavior === 'async-user-input-exit') { setTimeout(() => process.exit(1), 400); return; }
+    if (behavior === 'async-user-input-live-steer') return;
+    setTimeout(() => {
+      const status = behavior === 'async-user-input-interrupted' ? 'interrupted' : 'completed';
+      notify('item/completed', { threadId, turnId,
+        item: { type: 'agentMessage', id: 'async-independent-final', phase: behavior === 'async-user-input-overlap' ? 'commentary' : 'final_answer', text: 'Independent work completed' } });
+      notify('turn/completed', { threadId, turn: { id: turnId, status } });
+    }, 400);
+    return;
   }
   if (behavior === 'hang-turn-completion') return;
   const finish = () => {
@@ -205,7 +342,13 @@ function completeTurn(request) {
     }
     if (responseLast) respond(request.id, { turn: { id: turnId } });
   };
-  if (behavior === 'delayed-first' && turnAttempt === 1) setTimeout(finish, 300);
+  if (process.env.FAKE_CODEX_FINISH_GATE) {
+    const gate = setInterval(() => {
+      if (!existsSync(process.env.FAKE_CODEX_FINISH_GATE)) return;
+      clearInterval(gate);
+      finish();
+    }, 10);
+  } else if (behavior === 'delayed-first' && turnAttempt === 1) setTimeout(finish, 300);
   else finish();
 }
 
@@ -332,16 +475,76 @@ function emitTurnCompletion(threadId, turnId, outputSchema) {
 
 function handle(request) {
   if (logPath) appendFileSync(logPath, JSON.stringify(request) + '\n');
-  if (request.result !== undefined || request.error !== undefined) return;
+  if (request.result !== undefined || request.error !== undefined) {
+    if (behavior.startsWith('user-input') && pendingUserInput && request.id === pendingUserInput.requestId) {
+      const { threadId, turnId } = pendingUserInput;
+      pendingUserInput = undefined;
+      notify('item/completed', { threadId, turnId, item: {
+        id: 'message-user-input', type: 'agentMessage', phase: 'final_answer', text: `Answered: ${JSON.stringify(request.result)}`,
+      } });
+      notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
+    }
+    return;
+  }
+  if (request.method === 'turn/interrupt' && behavior.startsWith('user-input')) {
+    if (behavior === 'user-input-interrupt-error') { reject(request.id, -32000, 'interrupt failed'); return; }
+    const pending = pendingUserInput;
+    pendingUserInput = undefined;
+    respond(request.id, {});
+    if (pending) notify('turn/completed', { threadId: pending.threadId, turn: { id: pending.turnId, status: 'interrupted' } });
+    return;
+  }
   if (typeof request.id !== 'number') return;
 
   if (request.method === 'initialize') {
     if (behavior === 'hang-initialize') return;
+    if (behavior === 'close-stdin-after-initialize') {
+      // 先关读端再回响应：client 收到响应时管道已无人读，它接下来的任何写入都是
+      // EPIPE。libuv 不会替 stdin.destroy() 关掉 0 号 fd，所以显式 closeSync(0)。
+      // 进程本身保持存活，由 client 负责回收。
+      process.stdin.destroy();
+      closeSync(0);
+      setTimeout(() => {}, 60_000);
+    }
     respond(request.id, { userAgent: 'fake-codex-app-server' });
     return;
   }
   if (request.method === 'thread/start') {
-    respond(request.id, { thread: { id: 'thread-fake' } });
+    respond(request.id, { thread: { id: 'thread-fake' }, model: 'gpt-6-astra' });
+    return;
+  }
+  if (request.method === 'model/list') {
+    if (behavior === 'effort-paginated' && !request.params.cursor) {
+      respond(request.id, { data: [], nextCursor: 'next-model-page' });
+      return;
+    }
+    if (behavior === 'effort-paginated' && request.params.cursor === 'next-model-page') {
+      respond(request.id, { data: [{ model: 'other-model' }], nextCursor: 'last-model-page' });
+      return;
+    }
+    respond(request.id, { data: [{ model: behavior === 'effort-model-missing' ? 'other-model' : 'gpt-6-astra', supportedReasoningEfforts:
+      (behavior === 'effort-empty-choices' ? [] : behavior === 'effort-invalid' ? ['low', 'medium'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+        .map(reasoningEffort => ({ reasoningEffort })) }], nextCursor: null });
+    return;
+  }
+  if (request.method === 'thread/settings/update') {
+    if (behavior === 'effort-unsupported') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-thread-rejected') reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    else respond(request.id, {});
+    return;
+  }
+  if (request.method === 'turn/settings/update') {
+    if (behavior === 'effort-partial') reject(request.id, -32601, 'Method not found');
+    else if (behavior === 'effort-feature-disabled' || behavior === 'effort-feature-disabled-complete') {
+      reject(request.id, -32600, 'turn settings updates require the step_model_switching feature');
+    } else if (behavior === 'effort-rejected') reject(request.id, -32600, 'another invalid request');
+    else if (behavior === 'effort-serial') setTimeout(() => respond(request.id, { status: 'applied' }), 100);
+    else respond(request.id, { status: behavior === 'effort-race' ? 'targetUnavailable' : 'applied' });
+    if ((behavior === 'effort-complete' || behavior === 'effort-feature-disabled-complete') && activeTurn) {
+      const turn = activeTurn;
+      activeTurn = undefined;
+      setTimeout(() => emitTurnCompletion(turn.threadId, turn.turnId, turn.outputSchema), 100);
+    }
     return;
   }
   if (request.method === 'thread/resume') {
@@ -350,7 +553,15 @@ function handle(request) {
       reject(request.id, -32001, `thread ${request.params.threadId} not found`);
       return;
     }
-    respond(request.id, { thread: { id: request.params.threadId } });
+    if (behavior === 'resume-active-writer') {
+      reject(request.id, -32600, `thread ${request.params.threadId} already has an active writer`);
+      return;
+    }
+    if (behavior === 'resume-different-thread') {
+      respond(request.id, { thread: { id: 'thread-unexpected' } });
+      return;
+    }
+    respond(request.id, { thread: { id: request.params.threadId }, model: 'gpt-6-astra' });
     return;
   }
   if (request.method === 'thread/read') {
@@ -363,20 +574,40 @@ function handle(request) {
       reject(request.id, -32600, `thread not loaded: ${request.params.threadId}`);
       return;
     }
-    respond(request.id, {
+    const sendThreadRead = () => respond(request.id, {
       thread: {
         id: request.params.threadId,
+        ...(process.env.FAKE_CODEX_THREAD_PATH ? { path: process.env.FAKE_CODEX_THREAD_PATH } : {}),
         name: currentThreadName ?? null,
         preview: threadReadAttempt > previewDelayReads ? '<botmux_routing> 首条消息预览' : '',
         updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
       },
     });
+    // 慢响应只作用在「第一次 thread/name/set 之前」的等待阶段；写入后的
+    // 校验 thread/read 必须保持即时，否则调用方短预算会卡在校验环节而不
+    // 是待测的等待环节。
+    if (threadReadDelayMs > 0 && threadReadAttempt <= threadReadDelayReads && !nameSetSeen) {
+      setTimeout(sendThreadRead, threadReadDelayMs);
+      return;
+    }
+    if (verifyReadDelayMs > 0 && nameSetSeen) {
+      setTimeout(sendThreadRead, verifyReadDelayMs);
+      return;
+    }
+    sendThreadRead();
+    return;
+  }
+  if (request.method === 'thread/archive' || request.method === 'thread/unarchive') {
+    if (behavior === 'archive-error') reject(request.id, -32600, 'archive failed');
+    else if (behavior !== 'hang-archive') respond(request.id, request.method === 'thread/archive' ? {} : { thread: { id: request.params.threadId } });
     return;
   }
   if (request.method === 'thread/name/set') {
     if (behavior === 'hang-name') return;
     currentThreadName = request.params.name;
-    respond(request.id, {});
+    nameSetSeen = true;
+    if (nameSetDelayMs > 0) setTimeout(() => respond(request.id, {}), nameSetDelayMs);
+    else respond(request.id, {});
     return;
   }
   if (request.method === 'turn/interrupt' || request.method === 'thread/unsubscribe') {
@@ -397,6 +628,21 @@ function handle(request) {
     return;
   }
   if (request.method === 'turn/steer') {
+    if (behavior === 'async-user-input-live-steer') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expected turn is not active'); return;
+      }
+      const { threadId, turnId } = activeTurn;
+      groupClientIds.push(request.params.clientUserMessageId);
+      respond(request.id, { turnId });
+      notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed', itemsView: 'full', error: null,
+        items: [
+          ...groupClientIds.map((clientId, i) => ({ id: `user-${i}`, type: 'userMessage', clientId, content: [] })),
+          { id: 'answered-final', type: 'agentMessage', phase: 'final_answer', text: 'Answer incorporated before task finished' },
+        ] } });
+      activeTurn = undefined;
+      return;
+    }
     // THEIRS: explicit steer scenario drives a pending turn/start (activeTurn)
     // to completion after the 2nd steer. steer-started-first completes after 1.
     if (behavior === 'steer' || behavior === 'steer-started-first') {
@@ -411,6 +657,86 @@ function handle(request) {
         emitTurnCompletion(activeTurn.threadId, activeTurn.turnId, activeTurn.outputSchema);
         activeTurn = undefined;
       }
+      return;
+    }
+    if (behavior === 'steer-admit-reject-buffered' || behavior === 'steer-admit-reject-noncanon') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      // The race this repro pins: the turn actually COMPLETED at the exact moment
+      // tryAdmitSteer's steer RPC lands. Emit turn/completed AND a definite steer
+      // rejection in ONE stdout chunk. The runner buffers the completion while
+      // steerInFlight is set, then the rejection catch must settle it —
+      // accepted.length is still 1 here (first steer never appended), so any
+      // inGroupMode-gated resume path would strand it (hang).
+      const { threadId, turnId } = activeTurn;
+      // noncanon: a DIFFERENT native id with NO full items. The rejection branch
+      // must NOT blindly trust it (that would attribute foreign/streamed text);
+      // it must route to bounded-history reconcile and fail closed (no match).
+      const completion = behavior === 'steer-admit-reject-noncanon'
+        ? {
+            method: 'turn/completed',
+            params: { threadId, turn: { id: 'turn-foreign-nc', status: 'completed' } },
+          }
+        : {
+            method: 'turn/completed',
+            params: {
+              threadId,
+              turn: {
+                id: turnId,
+                status: 'completed',
+                itemsView: 'full',
+                error: null,
+                items: [
+                  { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+                  { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'buffered canonical answer' },
+                ],
+              },
+            },
+          };
+      writeBatch([
+        completion,
+        { id: request.id, error: { code: -32601, message: 'active turn not steerable' } },
+      ]);
+      activeTurn = undefined;
+      return;
+    }
+    if (behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      steerCount += 1;
+      groupClientIds.push(request.params.clientUserMessageId ?? null);
+      respond(request.id, { turnId: activeTurn.turnId });
+      const { threadId, turnId } = activeTurn;
+      const failedGroupTurn = {
+        id: turnId,
+        status: 'failed',
+        itemsView: 'full',
+        // steer-failed-no-error: protocol variant with NO error key at all.
+        ...(behavior === 'steer-failed-no-error'
+          ? {}
+          : { error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } }),
+        items: [
+          { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+          { id: 'user-follow', type: 'userMessage', clientId: groupClientIds[1], content: [] },
+        ],
+      };
+      if (behavior === 'steer-capacity-history') {
+        // Non-canonical completion id; the authoritative failed full-group turn
+        // is reachable only via thread/turns/list, exercising the runner's
+        // reconcileSteeredGroupFromHistory group settle path.
+        reconciledTurn = failedGroupTurn;
+        notify('turn/completed', {
+          threadId,
+          turn: { id: 'turn-foreign-noncanonical', status: 'completed' },
+        });
+      } else {
+        notify('turn/completed', { threadId, turn: failedGroupTurn });
+      }
+      activeTurn = undefined;
       return;
     }
     if (behavior === 'steer-group-mismatch') {
@@ -610,15 +936,18 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
-    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+    if (behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
       groupClientIds = [request.params.clientUserMessageId ?? null];
     }
     respond(request.id, { turn: { id: turnId } });
     notify('turn/started', { threadId, turn: { id: turnId } });
+    if (behavior.startsWith('effort-')) {
+      notify('item/agentMessage/delta', { threadId, turnId, itemId: 'effort-progress', delta: 'effort task running' });
+    }
     return;
   }
   if (behavior === 'steer-started-first') {
@@ -670,6 +999,201 @@ function handle(request) {
       },
     });
     setTimeout(() => respond(request.id, { turn: { id: 'turn-response-B' } }), 120);
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion' && turnAttempt === 1) {
+    // A STALE completion (previous/autonomous turn, NO client items, id unrelated
+    // to this turn) arrives BEFORE the turn/start response. The runner buffers it
+    // (requestAccepted=false). After the response binds the real native id, the
+    // pendingCompletions replay must NOT fail-closed on it: the accepted turn is
+    // still running, so bounded history cannot yet contain its terminal record.
+    // 100ms later the REAL completion arrives and must settle the turn with the
+    // real answer — the stale completion must be ignored, not kill the turn.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    setTimeout(() => {
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: `message-real-${turnAttempt}`,
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer after response',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: `user-${turnAttempt}`, type: 'userMessage', clientId, content: request.params.input },
+            { id: `message-real-${turnAttempt}`, type: 'agentMessage', phase: 'final_answer', text: 'real answer after response' },
+          ],
+        },
+      });
+    }, 100);
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-goal-switch' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending exit condition: a STALE foreign completion
+    // (no client items, unrelated id) arrives BEFORE the start response and is
+    // replayed into reconcile with keepPendingWhileActive. 250ms later an
+    // autonomous Goal turn/started flips the GLOBAL nativeActiveTurnId slot;
+    // 1.5s later THIS turn's real completion arrives. The global slot flip is
+    // NOT proof this turn terminated — the runner must keep the turn pending
+    // and settle it with the real answer, not fail-closed on the Goal's
+    // turn/started (which would discard the real completion).
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    setTimeout(() => {
+      notify('turn/started', {
+        threadId,
+        turn: { id: 'turn-goal-auto', status: 'inProgress', itemsView: 'full', items: [] },
+      });
+    }, 250);
+    setTimeout(() => {
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: `message-real-${turnAttempt}`,
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer despite goal switch',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: `user-${turnAttempt}`, type: 'userMessage', clientId, content: request.params.input },
+            { id: `message-real-${turnAttempt}`, type: 'agentMessage', phase: 'final_answer', text: 'real answer despite goal switch' },
+          ],
+        },
+      });
+    }, 1500);
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-hang' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending re-scan bound: a STALE foreign completion
+    // before the start response replays into reconcile with keepPendingWhileActive,
+    // and the accepted native turn NEVER completes (hang). The re-scan loop must
+    // stop after its wall-clock ceiling and fail-closed (identity conflict +
+    // turn.done settles) — not poll thread/turns/list (~5Hz) forever.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-unbound-id' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending arm guard: the turn/start response SUCCEEDS
+    // but carries NO native id (protocol anomaly: result.turn.id and
+    // result.turnId both absent), and no exact turn/started proved the id first.
+    // The runner binds turn.nativeTurnId = undefined, then arms keep-pending on
+    // the stale foreign completion. handleNotification's progress-reset guard
+    // (notificationTurnId !== turn.nativeTurnId) falls fully open on the unset
+    // id, so a FOREIGN turn's periodic progress would otherwise keep resetting
+    // the deadline forever while acceptedTurnWentTerminal can never fire — an
+    // unbounded hang. The fix refuses to arm keep-pending without a native id,
+    // so the loop fails closed immediately instead of hanging on foreign activity.
+    const threadId = request.params.threadId;
+    // Stale foreign completion BEFORE the response (buffered, requestAccepted=false).
+    notify('turn/completed', { threadId, turn: { id: 'turn-stale-unbound', status: 'completed' } });
+    // Success response with NO native id (anomaly).
+    respond(request.id, {});
+    // A foreign turn emits progress forever; our turn never speaks / goes terminal.
+    setInterval(() => {
+      notify('item/agentMessage/delta', {
+        threadId,
+        turnId: 'turn-foreign-keepalive',
+        itemId: 'message-foreign',
+        delta: '.',
+      });
+    }, 300);
+    return;
+  }
+  if (behavior === 'pre-response-foreign-completion-long-progress' && turnAttempt === 1) {
+    // REGRESSION for the keep-pending ceiling semantics: a STALE foreign
+    // completion before the start response replays into reconcile with
+    // keepPendingWhileActive. The accepted turn then emits periodic progress
+    // (item/agentMessage/delta) for ~5s — LONGER than the test's 3s keep-pending
+    // ceiling — and only then sends its REAL completion. A fixed ceiling would
+    // kill the turn at 3s (identity conflict, real answer discarded); a
+    // progress-resettable ceiling must keep the turn pending and deliver the
+    // real answer.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: { id: 'turn-stale-pre-response', status: 'completed' },
+    });
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    // Periodic progress every 1s — each delta resets the keep-pending ceiling.
+    const progressTimer = setInterval(() => {
+      notify('item/agentMessage/delta', {
+        threadId,
+        turnId,
+        itemId: 'message-progress',
+        delta: '.',
+      });
+    }, 1000);
+    // Real completion after 5s — beyond the 3s test ceiling but within the
+    // progress-resettable window (ceiling refreshed at 1s/2s/3s/4s).
+    setTimeout(() => {
+      clearInterval(progressTimer);
+      notify('item/completed', {
+        threadId,
+        turnId,
+        item: {
+          id: 'message-final',
+          type: 'agentMessage',
+          phase: 'final_answer',
+          text: 'real answer after long progress',
+        },
+      });
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: 'user-root', type: 'userMessage', clientId, content: request.params.input },
+            { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'real answer after long progress' },
+          ],
+        },
+      });
+    }, 5000);
     return;
   }
   if (behavior === 'completion-A-started-B') {
@@ -761,6 +1285,21 @@ function handle(request) {
     });
     // The original turn/start is answered later — as an explicit RPC error — from
     // the turn/steer handler, after the steer is accepted.
+    return;
+  }
+  if ((behavior === 'steer-admit-reject-buffered' || behavior === 'steer-admit-reject-noncanon') && turnAttempt === 1) {
+    // Canonical proven by the START RESPONSE (not an exact turn/started): respond
+    // with the canonical id and emit only a BARE turn/started (no exact-client
+    // items), then HOLD the turn open. identityProof stays 'start_response', so
+    // the tryAdmitSteer rejection catch is the SOLE settle point for the buffered
+    // canonical completion. The follow-up (turnAttempt 2) that falls back after
+    // the rejection completes normally through completeTurn.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+    groupClientIds = [request.params.clientUserMessageId ?? null];
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
     return;
   }
   completeTurn(request);

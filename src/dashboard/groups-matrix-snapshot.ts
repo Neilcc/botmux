@@ -20,6 +20,23 @@ export interface CompactGroupsSnapshot {
   chats: GroupPresentation[];
 }
 
+/**
+ * `?view=names` 的响应形状：**名称/头像专用**投影。
+ *
+ * 与 {@link CompactGroupsSnapshot} 的关键区别是它**带 `bots`**。
+ * `compact` 只有 `chats`（会话名称回填用），而 `loadNameMaps()`（web/ui.ts）
+ * 恰恰是读 `data.bots` 拿 bot 名称与头像的——所以名称/头像链路**不能**复用
+ * `compact`，否则 56 个 bot 的名字和头像会全部退化成 raw appId（MEASURED：
+ * `compact` 的顶层 key 只有 `['chats']`，`bots` 是 undefined）。
+ *
+ * 摘掉的只有 `memberBots`：完整矩阵里 1420 群 × 56 bot 的成员关系占
+ * 12341KB / 12.59MB（MEASURED），而名称/头像一个字节都不需要它。
+ */
+export interface GroupsNamesSnapshot {
+  chats: GroupPresentation[];
+  bots: unknown[];
+}
+
 interface CachedMatrix {
   matrix: GroupsMatrix;
   presentationByChatId: ReadonlyMap<string, GroupPresentation>;
@@ -38,6 +55,22 @@ export interface GroupsMatrixSnapshot {
   warm: () => void;
   invalidate: () => void;
   peekPresentation: () => ReadonlyMap<string, GroupPresentation>;
+}
+
+/**
+ * 群矩阵按 chatId 汇总各 daemon 的回包，群级字段取第一个回包。会话群标记和摘要只有
+ * 注册了这个会话群的 bot 才给得出；群里还有别的 bot 时，先回包的若是那个 bot，
+ * 会话群就会被当成普通群。后到的回包带着会话群字段时补到已汇总的群上。
+ */
+export function adoptSessionGroupFields(target: Record<string, unknown>, incoming: Record<string, unknown>): void {
+  if (incoming.sessionGroup !== true || target.sessionGroup === true) return;
+  target.sessionGroup = true;
+  if (incoming.sessionGroupMeta !== undefined) target.sessionGroupMeta = incoming.sessionGroupMeta;
+}
+
+/** 会让聚合后的群矩阵过期的 daemon SSE 事件（目前只有回复模式策略变化）。 */
+export function dashboardEventInvalidatesGroupsMatrix(event: { type: string }): boolean {
+  return event.type === "groups.reply-policy.changed";
 }
 
 function optionalTrimmedString(value: unknown): string | undefined {
@@ -97,6 +130,23 @@ export function compactGroupsMatrix(matrix: GroupsMatrix): CompactGroupsSnapshot
 
 function presentationMap(matrix: GroupsMatrix): ReadonlyMap<string, GroupPresentation> {
   return new Map(compactGroupsMatrix(matrix).chats.map((chat) => [chat.chatId, chat]));
+}
+
+/**
+ * 名称/头像投影：chats 走 {@link compactGroupsMatrix} 的同一条白名单
+ * （chatId/name/avatar），bots **整行原样保留**。
+ *
+ * bots 行本身很轻（MEASURED：56 行合计 11KB，字段只有 larkAppId / botName /
+ * botAvatarUrl / cliId），没有裁剪价值；而裁剪它反而会引入「今天够用、明天
+ * 加个字段就静默缺失」的风险——bot 身份字段是名称/头像链路的全部输入，这里
+ * 宁可整行透传。真正的 12.34MB 大头在 chats[].memberBots，被上面那条白名单
+ * 天然挡掉。
+ */
+export function groupsNamesMatrix(matrix: GroupsMatrix): GroupsNamesSnapshot {
+  return {
+    chats: compactGroupsMatrix(matrix).chats,
+    bots: matrix.bots,
+  };
 }
 
 export function enrichSessionsWithGroupNames<T extends Record<string, unknown>>(

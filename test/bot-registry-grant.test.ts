@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
+import { parseBotConfigsFromText, getConfiguredOwnerOpenId, getOwnerOpenId, getDashboardAdminOpenIds, registerBot } from '../src/bot-registry.js';
 import { GRANT_DURATION_OPTIONS } from '../src/services/grant-policy.js';
 
 describe('bot-registry grant additions', () => {
@@ -16,12 +16,60 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm3', larkAppSecret: 's', chatReplyModes: { oc_1: 'nope' } }]))[0].chatReplyModes).toBeUndefined();
   });
 
+  it('parseBotConfigsFromText preserves & filters chatMentionModes (four-state)', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'mm1', larkAppSecret: 's',
+      chatMentionModes: {
+        oc_1: 'always', oc_2: 'topic', oc_3: 'never', oc_4: 'ambient',
+        // Case/padding are normalized; unknown values and blank chat ids are dropped.
+        oc_5: '  NEVER  ', oc_6: 'bogus', oc_7: 42, '': 'never', '   ': 'always',
+      },
+    }]));
+    expect(cfgs[0].chatMentionModes).toEqual({
+      oc_1: 'always', oc_2: 'topic', oc_3: 'never', oc_4: 'ambient', oc_5: 'never',
+    });
+  });
+
+  it('parseBotConfigsFromText leaves chatMentionModes undefined when absent/all-invalid/not-an-object', () => {
+    const at = (entry: Record<string, unknown>) =>
+      parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mm2', larkAppSecret: 's', ...entry }]))[0].chatMentionModes;
+    expect(at({})).toBeUndefined();
+    expect(at({ chatMentionModes: { oc_1: 'nope' } })).toBeUndefined();
+    // An array is an object in JS — the parser must still reject it.
+    expect(at({ chatMentionModes: ['always'] })).toBeUndefined();
+  });
+
   it('parseBotConfigsFromText preserves & filters chatGrants', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'a1', larkAppSecret: 's',
       chatGrants: { oc_1: ['ou_a', 'ou_b', 123], oc_2: 'bad', oc_3: ['ou_c'], oc_4: [] },
     }]));
     expect(cfgs[0].chatGrants).toEqual({ oc_1: ['ou_a', 'ou_b'], oc_3: ['ou_c'] });
+  });
+
+  it('preserves explicit solo-group mention overrides across config round trips', () => {
+    const parse = (entry: object) => parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'solo-policy', larkAppSecret: 's', ...entry,
+    }]))[0];
+    const cfg = parse({
+      soloGroupMentionBypass: false,
+      chatSoloGroupMentionBypass: {
+        oc_enabled: true, oc_disabled: false, oc_invalid: 'false', oc_null: null,
+        '': false, '   ': true,
+      },
+    });
+    expect(cfg.soloGroupMentionBypass).toBe(false);
+    expect(cfg.chatSoloGroupMentionBypass).toEqual({ oc_enabled: true, oc_disabled: false });
+    expect(parse(cfg)).toMatchObject({
+      soloGroupMentionBypass: false,
+      chatSoloGroupMentionBypass: { oc_enabled: true, oc_disabled: false },
+    });
+    for (const value of [undefined, true, 'false', 0, null]) {
+      expect(parse({ soloGroupMentionBypass: value }).soloGroupMentionBypass).toBeUndefined();
+    }
+    for (const value of [undefined, [], false, { oc_invalid: 'false' }]) {
+      expect(parse({ chatSoloGroupMentionBypass: value }).chatSoloGroupMentionBypass).toBeUndefined();
+    }
   });
 
   it('parseBotConfigsFromText leaves chatGrants undefined when absent', () => {
@@ -44,6 +92,26 @@ describe('bot-registry grant additions', () => {
       plugins: ['agent-chrome', 'bad/id', 'agent-chrome', 'gitlab'],
     }]));
     expect(cfgs[0].plugins).toEqual(['agent-chrome', 'gitlab']);
+  });
+
+  it('normalizes host-only plugin runtime options without exposing invalid entries', () => {
+    const [config] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'plugin-runtime',
+      larkAppSecret: 's',
+      pluginRuntime: {
+        report: {
+          env: { PROFILE: 'prod', RETRIES: 3, 'bad-key': 'drop' },
+          toolTimeoutMs: 120_000,
+        },
+        'bad/id': { toolTimeoutMs: 10_000 },
+        toolong: { toolTimeoutMs: 2_147_483_648 },
+        fractional: { toolTimeoutMs: 1.5 },
+        empty: { env: { 'bad-key': 'drop' }, toolTimeoutMs: 0 },
+      },
+    }]));
+    expect(config.pluginRuntime).toEqual({
+      report: { env: { PROFILE: 'prod', RETRIES: '3' }, toolTimeoutMs: 120_000 },
+    });
   });
 
   it('parseBotConfigsFromText leaves globalGrants undefined when absent / all-invalid / non-array', () => {
@@ -90,6 +158,42 @@ describe('bot-registry grant additions', () => {
     expect((cfgs[5] as any).showUsageInCardFooter).toBeUndefined();
   });
 
+  it('parses pinStreamingCard only as strict boolean true', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin1', larkAppSecret: 's', pinStreamingCard: true },
+    ]))[0].pinStreamingCard).toBe(true);
+
+    for (const bad of [undefined, false, 'true', 1, null]) {
+      const [cfg] = parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'pin2', larkAppSecret: 's', pinStreamingCard: bad },
+      ]));
+      expect(cfg.pinStreamingCard).toBeUndefined();
+    }
+  });
+
+  it('parses noPinStreamingCardChats as a trimmed, deduplicated string list', () => {
+    const [cfg] = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'pin_chat_1',
+      larkAppSecret: 's',
+      noPinStreamingCardChats: [' oc_chat_a ', 'oc_chat_b', '', '   ', 'oc_chat_a', 1, null],
+    }]));
+    expect(cfg.noPinStreamingCardChats).toEqual(['oc_chat_a', 'oc_chat_b']);
+  });
+
+  it('leaves noPinStreamingCardChats undefined when absent, non-array, or all invalid', () => {
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_2', larkAppSecret: 's' },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
+
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_3', larkAppSecret: 's', noPinStreamingCardChats: 'oc_chat_a' },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
+
+    expect(parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'pin_chat_4', larkAppSecret: 's', noPinStreamingCardChats: ['', '  ', 1, null] },
+    ]))[0].noPinStreamingCardChats).toBeUndefined();
+  });
+
   it('getOwnerOpenId returns first ou_ in resolvedAllowedUsers', () => {
     registerBot({ larkAppId: 'a2', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com', 'ou_owner', 'ou_2'] });
     expect(getOwnerOpenId('a2')).toBe('ou_owner');
@@ -98,6 +202,45 @@ describe('bot-registry grant additions', () => {
   it('getOwnerOpenId undefined when no resolved ou_', () => {
     registerBot({ larkAppId: 'a3', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com'] });
     expect(getOwnerOpenId('a3')).toBeUndefined();
+  });
+
+  it('getOwnerOpenId prioritizes explicit ownerOpenId while it remains allowed', () => {
+    const bot = registerBot({
+      larkAppId: 'a4',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_first', 'ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_first', 'ou_owner_explicit', 'ou_second'];
+    expect(getOwnerOpenId('a4')).toBe('ou_owner_explicit');
+  });
+
+  it('falls back to the resolved allowlist after explicit owner removal', () => {
+    const bot = registerBot({
+      larkAppId: 'a5',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_first', 'ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_second'];
+    expect(getOwnerOpenId('a5')).toBe('ou_second');
+    expect(getDashboardAdminOpenIds('a5')).toEqual(['ou_second']);
+  });
+
+  it('keeps raw explicit owner available only for DM fallback', () => {
+    const bot = registerBot({
+      larkAppId: 'a6',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      ownerOpenId: 'ou_owner_explicit',
+      allowedUsers: ['ou_second'],
+    });
+    bot.resolvedAllowedUsers = ['ou_second'];
+    expect(getConfiguredOwnerOpenId('a6')).toBe('ou_owner_explicit');
+    expect(getOwnerOpenId('a6')).toBe('ou_second');
+    expect(getDashboardAdminOpenIds('a6')).toEqual(['ou_second']);
   });
 
   it('parses messageQuota.defaultLimit only when a positive integer', () => {

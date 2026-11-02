@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import {
-  normalizeCreateMode,
   normalizeCreateColumn,
   deriveSessionTitleFromContent,
   deriveCreateGroupName,
@@ -14,12 +13,8 @@ import {
   buildCollabNote,
 } from '../src/core/session-create.js';
 
-describe('normalizeCreateMode / normalizeCreateColumn', () => {
+describe('normalizeCreateColumn', () => {
   it('accepts only the valid literals', () => {
-    expect(normalizeCreateMode('all')).toBe('all');
-    expect(normalizeCreateMode('lead')).toBe('lead');
-    expect(normalizeCreateMode('solo')).toBeNull();
-    expect(normalizeCreateMode(123)).toBeNull();
     expect(normalizeCreateColumn('in_progress')).toBe('in_progress');
     expect(normalizeCreateColumn('backlog')).toBe('backlog');
     expect(normalizeCreateColumn('todo')).toBeNull();
@@ -37,6 +32,16 @@ describe('deriveSessionTitleFromContent', () => {
     expect(title.length).toBe(51); // 50 chars + …
     expect(title.endsWith('…')).toBe(true);
   });
+  it('does not split an emoji at the title boundary', () => {
+    const title = deriveSessionTitleFromContent('a'.repeat(49) + '😀x');
+    expect(title.isWellFormed()).toBe(true);
+    expect(title).toBe('a'.repeat(49) + '…');
+  });
+  it('repairs an isolated surrogate in a short title', () => {
+    const title = deriveSessionTitleFromContent('短标题\ud83d');
+    expect(title.isWellFormed()).toBe(true);
+    expect(title).toBe('短标题\ufffd');
+  });
   it('falls back to a placeholder for blank content', () => {
     expect(deriveSessionTitleFromContent('   \n  ')).toBeTruthy();
   });
@@ -48,6 +53,11 @@ describe('deriveCreateGroupName', () => {
   });
   it('falls back to the first non-empty content line when blank', () => {
     expect(deriveCreateGroupName('   ', '\n  修复创建会话  \n详情')).toBe('修复创建会话');
+  });
+  it('does not split an emoji at the explicit-name boundary', () => {
+    const name = deriveCreateGroupName('a'.repeat(59) + '😀x', '内容首行');
+    expect(name.isWellFormed()).toBe(true);
+    expect(name).toBe('a'.repeat(59));
   });
 });
 
@@ -95,6 +105,15 @@ describe('parseSpawnRequest', () => {
     const r = parseSpawnRequest({ ...base, content: huge });
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.value.content.length).toBe(50000);
+  });
+
+  it('does not split an emoji in the explicit title', () => {
+    const r = parseSpawnRequest({ ...base, title: 'a'.repeat(199) + '😀x' });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.title?.isWellFormed()).toBe(true);
+      expect(r.value.title).toBe('a'.repeat(199));
+    }
   });
 
   it('rejects bad column / role', () => {

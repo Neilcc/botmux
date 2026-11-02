@@ -5,6 +5,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { linuxIsolationDetected } from './linux-isolation.js';
 
 export const RELAY_ORIGIN_CAPABILITY_BASENAME = '.botmux-origin-capability.json';
 export const MANAGED_ORIGIN_ISOLATION_MARKER_BASENAME = '.botmux-read-isolated-v1';
@@ -15,6 +16,22 @@ export interface ManagedOriginCapabilityClaim {
   sessionId: string;
   channelId?: string;
   capability: string;
+  policyCapability?: string;
+  larkAppId?: string;
+  bootInstanceId?: string;
+  turnId?: string;
+  dispatchAttempt?: number;
+  linkRefMode?: 'observe' | 'enabled';
+  /** Current daemon port, host-written on every capability rotation. */
+  ipcPort?: number;
+}
+
+export interface ManagedOriginPolicyCapabilityClaim {
+  sessionId: string;
+  channelId?: string;
+  policyCapability: string;
+  larkAppId?: string;
+  bootInstanceId?: string;
   turnId?: string;
   dispatchAttempt?: number;
   /** Current daemon port, host-written on every capability rotation. */
@@ -48,8 +65,25 @@ export function managedOriginCapabilityPath(
   sessionId: string,
   channelId: string,
 ): string {
+  return join(
+    managedOriginCapabilityDirectory(dataDir, sessionId, channelId),
+    RELAY_ORIGIN_CAPABILITY_BASENAME,
+  );
+}
+
+/**
+ * Stable per-pane directory that can be mounted read-only into a
+ * credential-only bwrap child. Binding the directory (instead of the file)
+ * keeps atomic capability rotations visible while the hidden parent prevents
+ * the child from enumerating another session's channel.
+ */
+export function managedOriginCapabilityDirectory(
+  dataDir: string,
+  sessionId: string,
+  channelId: string,
+): string {
   const digest = managedOriginChannelDigest(sessionId, channelId);
-  return join(dataDir, 'read-isolation', `origin-${digest}.json`);
+  return join(dataDir, 'read-isolation', `origin-${digest}`);
 }
 
 /** Host-written, child-read-only proof directory for live daemon attestation. */
@@ -317,6 +351,43 @@ export function managedOriginLegacyIsolationProbeAccess(
   }
 }
 
+/**
+ * True when this process runs inside a botmux sandbox / read-isolated pane and
+ * therefore cannot act as a session store host (it may only SEND commands to
+ * the owning daemon). Positive signals only: the sandbox outbox marker, the
+ * host-stamped read-isolation env, the host-stamped origin channel, or a
+ * kernel denial on a probe inode or the inherited Linux seccomp probe.
+ * `missing_or_unsafe` — an
+ * absent `~/.botmux`, a secret never created because no daemon ran here, a
+ * foreign HOME — is NEVER isolation: a genuine host shell must keep its
+ * offline close / abandon / prune.
+ *
+ * `BOTMUX_ORIGIN_CHANNEL_ID` is stamped by the worker onto the session CLI
+ * child for every isolation flavour (full sandbox, credential-only
+ * Seatbelt/bwrap, read isolation). Device enrollment does NOT put this in
+ * the host shell — a user's `botmux delete` in a normal terminal stays a
+ * host even on a registered machine.
+ *
+ * Fail-closed is a confused-deputy gate, not a filesystem consolation.
+ * Credential-only bwrap masks `device-auth` and leaves `BOTMUX_HOME` itself
+ * live and writable (`worker.ts` prepares that shape). A prompt-injected
+ * agent in that child can still write the session store; this predicate
+ * is what stops `botmux delete` from becoming an offline store host when
+ * the daemon is down. Do not delete the origin-channel arm on the reading
+ * "it couldn't write anyway".
+ */
+export function isIsolatedCliProcess(
+  env: NodeJS.ProcessEnv,
+  osUserHomeDir: string,
+): boolean {
+  if (env.BOTMUX_SEND_RELAY) return true;
+  if (env.BOTMUX_READ_ISOLATED === '1') return true;
+  if (env.BOTMUX_ORIGIN_CHANNEL_ID?.trim()) return true;
+  return linuxIsolationDetected()
+    || managedOriginLegacyIsolationProbeAccess(osUserHomeDir) === 'sandbox_denied'
+    || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+}
+
 /** Strict bounded reader for host-owned authority metadata. It never follows a
  * leaf symlink and opens FIFOs/devices nonblocking before rejecting them by
  * inode type, ownership, link count, mode, and size. */
@@ -372,6 +443,8 @@ export function hasManagedOriginIsolationMarker(
       domain?: unknown;
       sessionId?: unknown;
       channelId?: unknown;
+      larkAppId?: unknown;
+      bootInstanceId?: unknown;
     };
     return parsed.domain === 'botmux.read-isolation-origin.v1'
       && parsed.sessionId === sessionId
@@ -474,8 +547,27 @@ export function sweepManagedOriginAttestationProofs(
  * symlinks for user-managed dotfiles; authority files need the opposite
  * contract so an isolated child cannot redirect the worker's next rotation.
  */
+function ensureManagedOriginChannelParent(parent: string): void {
+  if (!/^origin-[a-f0-9]{64}$/.test(basename(parent))) return;
+  const channelParent = dirname(parent);
+  try {
+    const channelParentStat = lstatSync(channelParent);
+    if (!channelParentStat.isDirectory() || channelParentStat.isSymbolicLink()) {
+      throw new Error(`managed origin capability parent is not a real directory: ${channelParent}`);
+    }
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+    mkdirSync(channelParent, { recursive: true, mode: 0o700 });
+    const channelParentStat = lstatSync(channelParent);
+    if (!channelParentStat.isDirectory() || channelParentStat.isSymbolicLink()) {
+      throw new Error(`managed origin capability parent is not a real directory: ${channelParent}`);
+    }
+  }
+}
+
 export function replaceManagedOriginCapabilityFile(filePath: string, body: string): void {
   const parent = dirname(filePath);
+  ensureManagedOriginChannelParent(parent);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
   const parentStat = lstatSync(parent);
   if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
@@ -499,6 +591,7 @@ export function replaceManagedOriginCapabilityFile(filePath: string, body: strin
  * current-worker publication path. */
 export function ensureManagedOriginCapabilityLeafSafe(filePath: string): void {
   const parent = dirname(filePath);
+  ensureManagedOriginChannelParent(parent);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
   const parentStat = lstatSync(parent);
   if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
@@ -537,19 +630,115 @@ export function readManagedOriginCapability(
       sessionId?: unknown;
       token?: unknown;
       capability?: unknown;
+      policyCapability?: unknown;
+      turnId?: unknown;
+      dispatchAttempt?: unknown;
+      linkRefMode?: unknown;
+      ipcPort?: unknown;
+      channelId?: unknown;
+      larkAppId?: unknown;
+      bootInstanceId?: unknown;
+    };
+    if (parsed.sessionId !== undefined && parsed.sessionId !== sessionId) return null;
+    if (channelId && parsed.channelId !== channelId) return null;
+    const policyCapability = typeof parsed.policyCapability === 'string'
+      && /^[a-f0-9]{32,128}$/i.test(parsed.policyCapability)
+      ? parsed.policyCapability
+      : undefined;
+    const capability = typeof parsed.capability === 'string'
+      ? parsed.capability
+      : parsed.token;
+    const validatedCapability = typeof capability === 'string'
+      && /^[a-f0-9]{32,128}$/i.test(capability)
+      ? capability
+      : undefined;
+    if (!validatedCapability) return null;
+    const turnId = typeof parsed.turnId === 'string'
+      && parsed.turnId.length > 0
+      && parsed.turnId.length <= 256
+      ? parsed.turnId
+      : undefined;
+    const dispatchAttempt = typeof parsed.dispatchAttempt === 'number'
+      && Number.isSafeInteger(parsed.dispatchAttempt)
+      && parsed.dispatchAttempt > 0
+      ? parsed.dispatchAttempt
+      : undefined;
+    const linkRefMode = parsed.linkRefMode === 'observe' || parsed.linkRefMode === 'enabled'
+      ? parsed.linkRefMode
+      : undefined;
+    const ipcPort = typeof parsed.ipcPort === 'number'
+      && Number.isSafeInteger(parsed.ipcPort)
+      && parsed.ipcPort > 0 && parsed.ipcPort <= 65_535
+      ? parsed.ipcPort
+      : undefined;
+    const parsedChannelId = typeof parsed.channelId === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.channelId)
+      ? parsed.channelId
+      : undefined;
+    if (relay && channelId && parsedChannelId !== channelId) return null;
+    const larkAppId = typeof parsed.larkAppId === 'string'
+      && parsed.larkAppId.length > 0 && parsed.larkAppId.length <= 256
+      ? parsed.larkAppId
+      : undefined;
+    const bootInstanceId = typeof parsed.bootInstanceId === 'string'
+      && /^[A-Za-z0-9_-]{43}$/.test(parsed.bootInstanceId)
+      ? parsed.bootInstanceId
+      : undefined;
+    return {
+      sessionId,
+      capability: validatedCapability,
+      ...(parsedChannelId ? { channelId: parsedChannelId } : {}),
+      ...(policyCapability ? { policyCapability } : {}),
+      ...(larkAppId ? { larkAppId } : {}),
+      ...(bootInstanceId ? { bootInstanceId } : {}),
+      ...(turnId ? { turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(linkRefMode ? { linkRefMode } : {}),
+      ...(ipcPort !== undefined ? { ipcPort } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read only the session-lifetime runtime-policy lookup authority. This is a
+ * distinct credential from the live send capability and is intentionally kept
+ * out of the legacy reader so old call sites do not silently widen to an
+ * optional send token contract.
+ */
+export function readManagedOriginPolicyCapability(
+  dataDir: string,
+  sessionId: string | undefined,
+  relayDir?: string,
+  channelId?: string,
+): ManagedOriginPolicyCapabilityClaim | null {
+  if (!sessionId) return null;
+  const relay = !!relayDir;
+  if (!relay && !channelId) return null;
+  const path = relay
+    ? join(relayDir!, RELAY_ORIGIN_CAPABILITY_BASENAME)
+    : managedOriginCapabilityPath(dataDir, sessionId, channelId!);
+  try {
+    const body = readManagedOriginAuthorityFile(path, 8 * 1024);
+    if (!body) return null;
+    const parsed = JSON.parse(body) as {
+      sessionId?: unknown;
+      policyCapability?: unknown;
       turnId?: unknown;
       dispatchAttempt?: unknown;
       ipcPort?: unknown;
       channelId?: unknown;
+      larkAppId?: unknown;
+      bootInstanceId?: unknown;
     };
-    if (!relay && parsed.sessionId !== sessionId) return null;
-    if (!relay && parsed.channelId !== channelId) return null;
-    const capability = typeof parsed.capability === 'string'
-      ? parsed.capability
-      : parsed.token;
-    if (typeof capability !== 'string' || !/^[a-f0-9]{32,128}$/i.test(capability)) {
-      return null;
-    }
+    if (parsed.sessionId !== undefined && parsed.sessionId !== sessionId) return null;
+    if (channelId && parsed.channelId !== channelId) return null;
+    const policyCapability = typeof parsed.policyCapability === 'string'
+      && /^[a-f0-9]{32,128}$/i.test(parsed.policyCapability)
+      ? parsed.policyCapability
+      : undefined;
+    if (!policyCapability) return null;
     const turnId = typeof parsed.turnId === 'string'
       && parsed.turnId.length > 0
       && parsed.turnId.length <= 256
@@ -565,10 +754,25 @@ export function readManagedOriginCapability(
       && parsed.ipcPort > 0 && parsed.ipcPort <= 65_535
       ? parsed.ipcPort
       : undefined;
+    const parsedChannelId = typeof parsed.channelId === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.channelId)
+      ? parsed.channelId
+      : undefined;
+    if (relay && channelId && parsedChannelId !== channelId) return null;
+    const larkAppId = typeof parsed.larkAppId === 'string'
+      && parsed.larkAppId.length > 0 && parsed.larkAppId.length <= 256
+      ? parsed.larkAppId
+      : undefined;
+    const bootInstanceId = typeof parsed.bootInstanceId === 'string'
+      && /^[A-Za-z0-9_-]{43}$/.test(parsed.bootInstanceId)
+      ? parsed.bootInstanceId
+      : undefined;
     return {
       sessionId,
-      ...(!relay && channelId ? { channelId } : {}),
-      capability,
+      policyCapability,
+      ...(parsedChannelId ? { channelId: parsedChannelId } : {}),
+      ...(larkAppId ? { larkAppId } : {}),
+      ...(bootInstanceId ? { bootInstanceId } : {}),
       ...(turnId ? { turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       ...(ipcPort !== undefined ? { ipcPort } : {}),

@@ -103,10 +103,61 @@ describe('canRunDaemonCommand gate', () => {
     expect(canRunDaemonCommand('ct1', 'oc_other', 'ou_stranger', undefined, '/status')).toBe(false);
   });
 
+  it('schema talk-level command (/resume) needs only canTalk, without any downgrade list', () => {
+    getBot('ct1').config.canTalkDaemonCommands = undefined;
+    expect(canOperate('ct1', 'oc_1', 'ou_guest')).toBe(false);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/resume')).toBe(true);
+    expect(canRunDaemonCommand('ct1', 'oc_oncall', 'ou_stranger', undefined, '/resume')).toBe(true);
+    // Still gated on talk: a sender who cannot talk here cannot resume either.
+    expect(canRunDaemonCommand('ct1', 'oc_other', 'ou_stranger', undefined, '/resume')).toBe(false);
+    // Other commands keep the operator gate.
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/restart')).toBe(false);
+  });
+
   it('no list configured → behaves exactly like canOperate', () => {
     getBot('ct1').config.canTalkDaemonCommands = undefined;
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/status')).toBe(false);
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_owner', undefined, '/status')).toBe(true);
+  });
+
+  it('trigger-user auth enabled → talk-only sender can run /login without an explicit downgrade', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.triggerUserAuth = {
+      enabled: true,
+      tools: ['bytedcli'],
+      fallback: 'bot-identity',
+    };
+
+    expect(canTalk('ct1', 'oc_1', 'ou_guest')).toBe(true);
+    expect(canOperate('ct1', 'oc_1', 'ou_guest')).toBe(false);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(true);
+  });
+
+  it('trigger-user auth disabled → /login remains operator-only', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.triggerUserAuth = {
+      enabled: false,
+      tools: ['bytedcli'],
+      fallback: 'bot-identity',
+    };
+
+    expect(canTalk('ct1', 'oc_1', 'ou_guest')).toBe(true);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(false);
+  });
+
+  it('trigger-user auth never lowers unrelated daemon commands to canTalk', () => {
+    const bot = getBot('ct1');
+    bot.config.canTalkDaemonCommands = undefined;
+    bot.config.triggerUserAuth = {
+      enabled: true,
+      tools: ['bytedcli'],
+      fallback: 'bot-identity',
+    };
+
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/restart')).toBe(false);
+    expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/botconfig')).toBe(false);
   });
 
   it('p2pOpen leg works only when chatType is passed (fail-closed without)', () => {
@@ -117,6 +168,28 @@ describe('canRunDaemonCommand gate', () => {
     expect(canRunDaemonCommand('ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/status')).toBe(false);
     // p2p 里名单外的命令仍拒
     expect(canRunDaemonCommand('ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/restart', undefined, 'p2p')).toBe(false);
+  });
+
+  it('p2pOpen alone never reaches a dangerous command — only an explicit downgrade does', () => {
+    const bot = getBot('ct1');
+    bot.config.p2pOpen = true;
+    const stranger = () =>
+      canRunDaemonCommand('ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/restart', undefined, 'p2p', false, false);
+
+    // 只开 p2pOpen：陌生私聊者拿到 canTalk，但 /restart 不在降级名单 → 仍走 canOperate，拒。
+    expect(canTalk('ct1', 'p2p_chat', 'ou_p2p_user', undefined, undefined, 'p2p')).toBe(true);
+    expect(canOperate('ct1', 'p2p_chat', 'ou_p2p_user')).toBe(false);
+    expect(stranger()).toBe(false);
+
+    // owner 显式把 /restart 降级到「能对话即可用」后，p2pOpen 这条 talk 腿就能命中它。
+    // 这是 canTalkDaemonCommands 的既定语义（见 event-dispatcher 的 canRunDaemonCommand 注释），
+    // 所以 p2pOpen 的文案不能承诺「管理动作永远只认管理员」——本例就是那个例外。
+    bot.config.canTalkDaemonCommands = ['/status', '/help', '/restart'];
+    expect(stranger()).toBe(true);
+
+    // 收回降级即恢复：名单是唯一开关，p2pOpen 自己不放大命令面。
+    bot.config.canTalkDaemonCommands = ['/status', '/help'];
+    expect(stranger()).toBe(false);
   });
 });
 

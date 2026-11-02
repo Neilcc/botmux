@@ -1,63 +1,65 @@
 import type React from 'react';
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
-  useId,
   useLayoutEffect,
   useMemo,
-  useReducer,
   useRef,
   useState,
-  type DragEvent,
   type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
   type CSSProperties,
-  type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
+import { daemonVersionDiffersFromDisk, stripBotmuxVersionPrefix } from '../../utils/daemon-version-display.js';
 import {
   IDLE_CLEANUP_HOUR_OPTIONS,
+  idleCleanupHoursLabel,
   parseIdleCleanupHours,
-  selectIdleCleanupCandidates,
+  selectCleanupCandidates,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
+import { FeedGroupPicker } from './feed-group-picker.js';
+import { ModalDialog } from './modal-dialog.js';
+import { FeedGroupAuthOverlay, FeedGroupAuthPrompt, useFeedGroups } from './feed-groups.js';
+import { BotMultiSelect } from './bot-multi-select.js';
+import { SessionHorizontalScrollbar } from './session-horizontal-scrollbar.js';
 import {
-  KANBAN_TEAM_STORAGE_KEY,
-  normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
-  readStoredBoardOrder,
   readStoredCreateKeepOpen,
   readStoredHiddenTableColumns,
-  readStoredKanbanGroupBy,
   readStoredSessionsShowUnknownChats,
   readStoredSessionsViewMode,
-  type KanbanGroupBy,
   type SessionsViewMode,
-  writeStoredBoardOrder,
   writeStoredCreateKeepOpen,
   writeStoredHiddenTableColumns,
-  writeStoredKanbanGroupBy,
   writeStoredSessionsShowUnknownChats,
   writeStoredSessionsViewMode,
 } from './preferences.js';
 import { OPEN_CREATE_SESSION_EVENT, consumePendingCreateSession } from './create-session-entry.js';
+import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import {
-  BOARD_COLUMNS,
   CLI_FILTER_OPTIONS,
   ICON,
   SESSION_STATUS_OPTIONS,
   canRestartSession,
+  clearSessionFilters,
   cssToken,
-  deriveSessionBoardColumn,
+  filterSessionRows,
+  hasActiveSessionFilters,
+  normalizeStatusFilterForView,
+  SESSION_STATUS_ANY,
+  type SessionRowFilters,
   fetchPickerBots,
   formatTokenCount,
-  groupSessionsByTopic,
   historySenderKey,
   isUnknownChatSession,
   lockActionLabel,
@@ -65,23 +67,18 @@ import {
   copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
+  restartErrorMessage,
+  resumeErrorMessage,
   sessionLocationText,
+  preferChatFilterLabel,
   sessionLocationTitle,
-  sessionExchangePreview,
   sessionRuntimeCounts,
-  sessionSearchText,
-  sessionTopicKey,
   sessionStatusText,
   shouldOpenWritableTerminal,
-  previewOverlayReducer,
-  previewOverlayInitialState,
   terminalHref,
   tokenCount,
-  type BoardColumnId,
   type PickerBot,
-  type SessionTopicGroup,
 } from './sessions.js';
-import { previewMarkdownHtml } from './preview-markdown.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
 import { dashboardShellAllowsWebTerminal } from './client-shell.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
@@ -95,48 +92,35 @@ import {
 } from './create-session-composer.js';
 import { store } from './store.js';
 import {
-  attentionWaitSince,
   botAvatarHtml,
   botDisplayName,
-  chatAvatarHtml,
-  chatDisplayTitle,
   loadNameMaps,
   relTime,
   stripMentionPrefix,
   t,
   ui,
 } from './ui.js';
-import type { SessionKanbanColumn } from './kanban-model.js';
+import { isOffBoardDormant, type SessionKanbanColumn } from './kanban-model.js';
 import {
   SessionsKanbanView,
+  type SessionsKanbanIcons,
   type SessionsKanbanMove,
-  type SessionsKanbanTeam,
-  type SessionsKanbanTeamBoardData,
 } from './sessions-kanban.js';
+import { SandboxDriftChip } from './session-sandbox-drift-chip.js';
+import { toast } from './toast.js';
+import { confirm } from './confirm-modal.js';
+import { SessionEnvLiveModal } from './session-env-editor.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
 
-type FiltersState = {
-  q: string;
-  status: string;
-  adopt: string;
-  chat: string;
-  multiBotTopics: boolean;
-  botTriggeredTopics: boolean;
-  showUnknownChats: boolean;
-  active: boolean;
-  cli: Set<string>;
-};
+type FiltersState = SessionRowFilters;
 
 type ChatFilterOption = { value: string; label: string };
 
-type ChatBotsMap = Map<string, { botIds: Set<string>; observedNames: Set<string> }>;
-
-type TeamBoardState = {
-  data: SessionsKanbanTeamBoardData | null;
-  key: string;
-  fetchedAt: number;
-};
+function initialFilters(q: string, showUnknownChats: boolean): FiltersState {
+  return { q, status: '', adopt: '', bot: '', chat: '', cli: '', showUnknownChats };
+}
 
 type HistoryState = {
   sessionId: string;
@@ -144,7 +128,7 @@ type HistoryState = {
   messages: any[];
   ownerOpenId?: string;
   error?: string;
-  stale?: boolean;
+  staleHint?: { running: string; disk: string };
 };
 
 type TerminalState = {
@@ -184,19 +168,17 @@ function imageFileDataUrl(file: File): Promise<string> {
   });
 }
 
+type IdleCleanupCounts = { idle: number; dormant: number };
+
 type IdleCleanupBarProps = {
   busy: boolean;
   hours: IdleCleanupHours;
   status: string;
-  countForHours: (hours: IdleCleanupHours) => number;
+  countForHours: (hours: IdleCleanupHours) => IdleCleanupCounts;
   onRun: (hours: IdleCleanupHours) => Promise<void>;
 };
 
 type IdleCleanupHoursValue = `${IdleCleanupHours}`;
-
-function idleCleanupHoursLabel(hours: IdleCleanupHours): string {
-  return hours === 168 ? '7d' : `${hours}H`;
-}
 
 const idleCleanupThresholdOptions = IDLE_CLEANUP_HOUR_OPTIONS.map(hours => ({
   value: String(hours) as IdleCleanupHoursValue,
@@ -214,6 +196,134 @@ function windowStorage(): Storage | undefined {
 function StatusBadge(props: { status: unknown }): React.JSX.Element {
   const raw = String(props.status ?? 'unknown');
   return <span className={`status status-${cssToken(raw)}`}>{sessionStatusText(raw)}</span>;
+}
+
+/** 任务态徽标：机器可能空闲，但 transcript 里还有未完成的 TODO。挂在卡片上让人
+ *  一眼看出「为什么这张卡在待办列」——运行态（空闲）与任务态（未完成 TODO）正交，
+ *  单看运行态徽标解释不了列归属。openTodos 缺失或已全部完成时不渲染。 */
+function TodoBadge(props: { row: any }): React.JSX.Element | null {
+  const todos = props.row?.openTodos;
+  // 两种打开态：hover=悬浮预览（移开即关）；pinned=点击固定（不自动消失，可选中复制）。
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const [pinned, setPinned] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const anchorRef = useRef<HTMLSpanElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+
+  // 固定态下：点浮层与徽标之外关闭；Esc 关闭。
+  useEffect(() => {
+    if (!pinned) return;
+    const onDown = (e: globalThis.MouseEvent) => {
+      const tgt = e.target as Node;
+      if (popRef.current?.contains(tgt) || anchorRef.current?.contains(tgt)) return;
+      setPinned(false);
+      setPos(null);
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') { setPinned(false); setPos(null); }
+    };
+    document.addEventListener('mousedown', onDown, true);
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown, true);
+      document.removeEventListener('keydown', onKey, true);
+    };
+  }, [pinned]);
+
+  if (!todos || typeof todos.remaining !== 'number' || todos.remaining <= 0) return null;
+  const total = Number(todos.total ?? 0);
+  const done = Number(todos.done ?? 0);
+  const label = t('sessions.board.todoBadge', { done, total });
+  const title = t('sessions.board.todoBadgeTitle', { remaining: todos.remaining, total, done });
+  const items: Array<{ status: string; text: string }> = Array.isArray(todos.items) ? todos.items : [];
+  const glyph = (s: string) => (s === 'completed' ? '✓' : s === 'in_progress' ? '▶' : '○');
+  // 卡片/列都是 overflow:hidden，纯 CSS 绝对定位浮层会被裁。改用 fixed + 打开时按
+  // 徽标位置定位，再 portal 到 body 逃出裁剪。
+  const locate = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    setPos({ x: r.left, y: r.bottom + 6 });
+  };
+  // 复制用纯文本清单：每行「[状态] 文字」，含顶部摘要，方便贴到别处。
+  const plainText = (): string => {
+    const mark = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[>]' : '[ ]');
+    const lines = items.map((it, i) => `${mark(it.status)} ${it.text || `#${i + 1}`}`);
+    return `${title}\n${lines.join('\n')}`;
+  };
+  const doCopy = async () => {
+    const text = plainText();
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 复制失败静默：用户仍可手动选中浮层文字。
+    }
+  };
+  const showPop = pinned || pos;
+  return (
+    <span
+      ref={anchorRef}
+      className={`session-todo-badge${todos.hasInProgress ? ' active' : ''}${pinned ? ' pinned' : ''}`}
+      tabIndex={0}
+      onMouseEnter={e => { if (!pinned) locate(e.currentTarget); }}
+      onFocus={e => { if (!pinned) locate(e.currentTarget); }}
+      onMouseLeave={() => { if (!pinned) setPos(null); }}
+      onBlur={() => { if (!pinned) setPos(null); }}
+      onClick={e => {
+        e.stopPropagation();
+        if (pinned) { setPinned(false); setPos(null); }
+        else { locate(e.currentTarget); setPinned(true); }
+      }}
+    >
+      {todos.hasInProgress ? <span className="session-todo-dot" aria-hidden="true" /> : null}
+      {label}
+      {showPop && items.length
+        ? createPortal(
+            <div
+              ref={popRef}
+              className={`session-todo-pop${pinned ? ' pinned' : ''}`}
+              role={pinned ? 'dialog' : 'tooltip'}
+              style={{ left: `${pos?.x ?? 0}px`, top: `${pos?.y ?? 0}px` }}
+              onMouseDown={e => e.stopPropagation()}
+            >
+              <div className="session-todo-pop-head">
+                <span className="session-todo-pop-title">{title}</span>
+                {pinned ? (
+                  <button
+                    type="button"
+                    className="session-todo-pop-copy"
+                    onClick={e => { e.stopPropagation(); void doCopy(); }}
+                  >
+                    {copied ? t('sessions.board.todoCopied') : t('sessions.board.todoCopy')}
+                  </button>
+                ) : (
+                  <span className="session-todo-pop-hint">{t('sessions.board.todoClickHint')}</span>
+                )}
+              </div>
+              <div className="session-todo-pop-list">
+                {items.map((it, i) => (
+                  <div key={i} className={`session-todo-pop-item st-${cssToken(it.status)}`}>
+                    <span className="session-todo-pop-glyph" aria-hidden="true">{glyph(it.status)}</span>
+                    <span className="session-todo-pop-text">{it.text || `#${i + 1}`}</span>
+                  </div>
+                ))}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
+    </span>
+  );
 }
 
 function LockChip(props: { row: any }): React.JSX.Element | null {
@@ -246,57 +356,6 @@ function IconActionButton(props: {
         props.onClick(event.currentTarget);
       }}
       dangerouslySetInnerHTML={rawHtml(props.icon)}
-    />
-  );
-}
-
-function TerminalControls(props: { row: any; url: string | null }): React.JSX.Element | null {
-  if (!props.url || !dashboardShellAllowsWebTerminal()) return null;
-  const canOpenWritable = shouldOpenWritableTerminal();
-  return (
-    <span className="term-pill">
-      <a
-        className="term-btn term-open"
-        href={props.url}
-        target="_blank"
-        rel="noopener"
-        data-action="terminal"
-        data-tip={t('sessions.openReadonlyTerminal')}
-        aria-label={t('sessions.openReadonlyTerminal')}
-        onClick={event => event.stopPropagation()}
-        dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
-      />
-      {canOpenWritable ? (
-        <button
-          type="button"
-          className="term-btn term-write"
-          data-action="write-link"
-          data-tip={t('sessions.openWritableTerminal')}
-          aria-label={t('sessions.openWritableTerminal')}
-          onClick={(event) => {
-            event.stopPropagation();
-            void openWriteLink(props.row, event.currentTarget);
-          }}
-          dangerouslySetInnerHTML={rawHtml(ICON.key)}
-        />
-      ) : null}
-    </span>
-  );
-}
-
-function ChatScopeLink(props: { row: any; className?: string }): React.JSX.Element | null {
-  const row = props.row;
-  if (row.scope !== 'chat' || !row.feishuChatLink) return null;
-  return (
-    <a
-      className={props.className ?? 'card-act'}
-      href={row.feishuChatLink}
-      target="_blank"
-      rel="noopener"
-      data-tip={t('sessions.openChat')}
-      aria-label={t('sessions.openChat')}
-      onClick={event => event.stopPropagation()}
-      dangerouslySetInnerHTML={rawHtml(ICON.feishu)}
     />
   );
 }
@@ -347,23 +406,6 @@ function compareRows(a: any, b: any, sortKey: string, sortDir: 'asc' | 'desc'): 
   return sortDir === 'asc' ? cmp : -cmp;
 }
 
-function boardSignalLabel(s: any): string {
-  if (s.agentAttention?.reason) return s.agentAttention.reason;
-  if (s.agentAttention) return t('sessions.board.signalAgent');
-  if (s.pendingRepo) return t('sessions.board.signalRepo');
-  if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
-  if (s.status === 'limited') return t('sessions.board.signalLimited');
-  if (s.status === 'stalled') return t('sessions.board.signalStalled');
-  return '';
-}
-
-function compareBoardRows(a: any, b: any, column: BoardColumnId): number {
-  const av = column === 'needs-you' ? attentionWaitSince(a) : Number(a.lastMessageAt ?? 0);
-  const bv = column === 'needs-you' ? attentionWaitSince(b) : Number(b.lastMessageAt ?? 0);
-  if (av !== bv) return column === 'needs-you' ? av - bv : bv - av;
-  return String(a.title ?? a.sessionId).localeCompare(String(b.title ?? b.sessionId));
-}
-
 function historyTime(v: unknown): string {
   if (v === undefined || v === null || v === '') return '';
   const n = Number(v);
@@ -378,28 +420,14 @@ function insightDur(ms?: number): string {
   return `${Math.floor(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s`;
 }
 
-function useDialogVisibility(ref: React.RefObject<HTMLDialogElement | null>, open: boolean): void {
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return;
-    if (open) {
-      if (!dialog.open) {
-        try { dialog.showModal(); } catch { /* already opening/unsupported */ }
-      }
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [open, ref]);
-}
-
 function CopyButton(props: { value: string }): React.JSX.Element {
   const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"
       data-copy={props.value}
-      onClick={() => {
-        void copyText(props.value, t('sessions.copy')).then(didCopy => {
+      onClick={(event) => {
+        void copyText(props.value, t('sessions.copy'), event.currentTarget).then(didCopy => {
           if (!didCopy) return;
           setCopied(true);
           window.setTimeout(() => setCopied(false), 800);
@@ -436,229 +464,101 @@ function LocateButton(props: { row: any; locateSession: (row: any) => Promise<bo
   );
 }
 
-// Icon variant of LocateButton for board/list cards: same React-owned busy+30s
-// cooldown, but renders the pin icon via IconActionButton (no imperative DOM writes).
-function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boolean> }): React.JSX.Element {
-  const [cooldown, setCooldown] = useState(0);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    if (cooldown <= 0) return undefined;
-    const timer = window.setTimeout(() => setCooldown(cooldown - 1), 1000);
-    return () => window.clearTimeout(timer);
-  }, [cooldown]);
+/** 筛选条上的一个下拉：没选时只显示维度名，选了就显示「维度：值」并高亮。
+ *  复用全站的 DropdownMenu（自绘弹层 + 视口内定位 + 可搜索），不再用原生 <select>。 */
+function FilterChip(props: {
+  name: string;
+  value: string;
+  options: ChatFilterOption[];
+  allLabel: string;
+  searchable?: boolean;
+  onChange: (value: string) => void;
+}): React.JSX.Element {
+  const current = props.options.find(option => option.value === props.value);
+  const active = props.value !== '' && !!current;
   return (
-    <IconActionButton
-      action="locate"
-      icon={ICON.pin}
-      label={cooldown > 0 ? t('sessions.cooldown', { seconds: cooldown }) : t('sessions.locate')}
-      disabled={busy || cooldown > 0}
-      onClick={async () => {
-        setBusy(true);
-        const ok = await props.onLocate(props.row);
-        setBusy(false);
-        if (ok) setCooldown(30);
-      }}
+    <DropdownMenu
+      className={`sessions-filter-chip${active ? ' is-active' : ''}`}
+      ariaLabel={props.name}
+      label={active ? `${props.name}${ui.locale === 'zh' ? '：' : ': '}${current!.label}` : props.name}
+      value={props.value}
+      options={[{ value: '', label: props.allLabel }, ...props.options]}
+      searchable={props.searchable}
+      searchPlaceholder={t('sessions.filters.searchOption')}
+      searchEmptyLabel={t('sessions.filters.noMatch')}
+      onChange={props.onChange}
     />
   );
 }
 
-export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): React.JSX.Element {
-  const checked = CLI_FILTER_OPTIONS.filter(cli => props.selected.has(cli)).length;
-  const detailsRef = useRef<HTMLDetailsElement>(null);
-  const [query, setQuery] = useState('');
-
-  useEffect(() => {
-    const close = () => {
-      if (detailsRef.current?.open) detailsRef.current.open = false;
-    };
-    const onPointerDown = (event: PointerEvent) => {
-      const details = detailsRef.current;
-      if (details?.open && !details.contains(event.target as Node)) close();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
-    };
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, []);
-
-  const q = query.trim().toLowerCase();
-  const visible = q ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(q)) : CLI_FILTER_OPTIONS;
-
-  return (
-    <details className="filter-cli" ref={detailsRef}>
-      <summary>{t('sessions.cli')} · <b id="cli-filter-count" className={checked === CLI_FILTER_OPTIONS.length ? undefined : 'cli-filter-active'}>
-        {checked === CLI_FILTER_OPTIONS.length ? t('common.all') : `${checked}/${CLI_FILTER_OPTIONS.length}`}
-      </b></summary>
-      <div className="filter-cli-pop" role="group" aria-label={t('sessions.cli')}>
-        <div className="filter-cli-head">
-          <input
-            type="search"
-            className="filter-cli-search"
-            placeholder={t('sessions.cliSearch')}
-            value={query}
-            autoFocus
-            onChange={event => setQuery(event.currentTarget.value)}
-            onClick={event => event.stopPropagation()}
-          />
-          <div className="filter-cli-bulk">
-            <button
-              type="button"
-              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (!props.selected.has(cli)) props.onToggle(cli, true); }}
-            >{t('sessions.cliSelectAll')}</button>
-            <button
-              type="button"
-              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (props.selected.has(cli)) props.onToggle(cli, false); }}
-            >{t('sessions.cliClear')}</button>
-          </div>
-        </div>
-        <div className="filter-cli-options">
-          {visible.length === 0 ? (
-            <span className="filter-cli-empty">{t('sessions.cliNoMatch')}</span>
-          ) : visible.map(cli => (
-            <label key={cli} className="filter-check">
-              <input
-                type="checkbox"
-                name="cli"
-                value={cli}
-                checked={props.selected.has(cli)}
-                onChange={event => props.onToggle(cli, event.currentTarget.checked)}
-              />
-              <span>{cli}</span>
-            </label>
-          ))}
-        </div>
-      </div>
-    </details>
-  );
-}
-
+// 工具栏：搜索 + 一排筛选下拉 + 清理空闲。看板的列本身就是状态分组、表格表头自带排序，
+// 以前的「待处理/进行中/全部」快捷分段、排序下拉和「筛选」弹窗都和它们重复，已去掉。
 function SessionsFilters(props: {
+  botOptions: ChatFilterOption[];
   chatOptions: ChatFilterOption[];
   filters: FiltersState;
+  viewMode: SessionsViewMode;
   idleCleanup: IdleCleanupBarProps;
   setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
 }): React.JSX.Element {
-  const statusOptions = [
-    { value: '', label: t('sessions.anyStatus') },
+  const { filters, setFilters } = props;
+  // 看板恒保留已关闭会话（给「已完成」列），状态下拉里「全部」本就含已关闭，
+  // 不再提供与默认项完全等价的「全部（含已关闭）」；默认项文案也按视图区分。
+  const kanbanKeepsClosed = props.viewMode === 'kanban';
+  const statusOptions: ChatFilterOption[] = [
     ...SESSION_STATUS_OPTIONS.map(status => ({ value: status, label: sessionStatusText(status) })),
+    ...(kanbanKeepsClosed ? [] : [{ value: SESSION_STATUS_ANY, label: t('sessions.filters.statusAnyInclClosed') }]),
   ];
-  const adoptOptions = [
-    { value: '', label: t('sessions.adoptAny') },
-    { value: 'yes', label: t('sessions.adoptYes') },
-    { value: 'no', label: t('sessions.adoptNo') },
+  const cliOptions: ChatFilterOption[] = CLI_FILTER_OPTIONS.map(cli => ({ value: cli, label: cli }));
+  const adoptOptions: ChatFilterOption[] = [
+    { value: 'no', label: t('sessions.filters.sourceNative') },
+    { value: 'yes', label: t('sessions.filters.sourceAdopt') },
   ];
-  const statusLabel = statusOptions.find(option => option.value === props.filters.status)?.label ?? t('sessions.anyStatus');
-  const adoptLabel = adoptOptions.find(option => option.value === props.filters.adopt)?.label ?? t('sessions.adoptAny');
-  const chatOptions = [
-    { value: '', label: t('sessions.chatAny') },
-    ...props.chatOptions,
-  ];
-  const chatLabel = chatOptions.find(option => option.value === props.filters.chat)?.label ?? t('sessions.chatAny');
+  const set = (key: 'status' | 'bot' | 'chat' | 'cli' | 'adopt') => (value: string) =>
+    setFilters(prev => ({ ...prev, [key]: value }));
+  const hasActive = hasActiveSessionFilters(filters);
 
   return (
-    <form id="filters" className="filters dashboard-toolbar sessions-filters" onSubmit={event => event.preventDefault()}>
+    <form id="filters" className="filters dashboard-toolbar sessions-filters sessions-toolbar" onSubmit={event => event.preventDefault()}>
       <input
         type="search"
         name="q"
         placeholder={t('sessions.search')}
-        value={props.filters.q}
+        value={filters.q}
         onChange={event => {
           const q = event.currentTarget.value;
-          props.setFilters(prev => ({ ...prev, q }));
+          setFilters(prev => ({ ...prev, q }));
         }}
       />
-      <DropdownMenu
-        label={statusLabel}
-        value={props.filters.status}
-        options={statusOptions}
-        onChange={value => props.setFilters(prev => ({ ...prev, status: value }))}
-      />
-      <DropdownMenu
-        label={adoptLabel}
-        value={props.filters.adopt}
-        options={adoptOptions}
-        onChange={value => props.setFilters(prev => ({ ...prev, adopt: value }))}
-      />
-      <DropdownMenu
-        ariaLabel={t('sessions.location')}
-        className="filter-chat-menu"
-        label={chatLabel}
-        value={props.filters.chat}
-        options={chatOptions}
-        searchable
-        searchPlaceholder={t('sessions.chatSearch')}
-        searchEmptyLabel={t('sessions.chatNoMatch')}
-        onChange={value => props.setFilters(prev => ({ ...prev, chat: value }))}
-      />
-      <CliFilterGroup
-        selected={props.filters.cli}
-        onToggle={(cli, checked) => {
-          props.setFilters(prev => {
-            const next = new Set(prev.cli);
-            if (checked) next.add(cli);
-            else next.delete(cli);
-            return { ...prev, cli: next };
-          });
-        }}
-      />
-      <label className="filter-toggle">
-        <input
-          type="checkbox"
-          name="multiBotTopics"
-          checked={props.filters.multiBotTopics}
-          onChange={event => {
-            const multiBotTopics = event.currentTarget.checked;
-            props.setFilters(prev => ({ ...prev, multiBotTopics }));
+      <div className="sessions-filter-chips" role="group" aria-label={t('sessions.filters.title')}>
+        <FilterChip name={t('sessions.status')} value={filters.status} options={statusOptions} allLabel={kanbanKeepsClosed ? t('sessions.filters.all') : t('sessions.filters.statusOpen')} onChange={set('status')} />
+        <FilterChip name={t('sessions.filters.bot')} value={filters.bot} options={props.botOptions} allLabel={t('sessions.filters.all')} searchable onChange={set('bot')} />
+        <FilterChip name={t('sessions.location')} value={filters.chat} options={props.chatOptions} allLabel={t('sessions.filters.all')} searchable onChange={set('chat')} />
+        <FilterChip name={t('sessions.cli')} value={filters.cli} options={cliOptions} allLabel={t('sessions.filters.all')} searchable onChange={set('cli')} />
+        <FilterChip name={t('sessions.filters.source')} value={filters.adopt} options={adoptOptions} allLabel={t('sessions.filters.all')} onChange={set('adopt')} />
+        <button
+          type="button"
+          className={`sessions-filter-toggle${filters.showUnknownChats ? ' is-active' : ''}`}
+          aria-pressed={filters.showUnknownChats}
+          title={t('sessions.filters.unknownChatsHint')}
+          onClick={() => {
+            const next = !filters.showUnknownChats;
+            writeStoredSessionsShowUnknownChats(windowStorage(), next);
+            setFilters(prev => ({ ...prev, showUnknownChats: next }));
           }}
-        />
-        <span className="filter-toggle-label">{t('sessions.multiBotTopics')}</span>
-        <span className="filter-toggle-switch" aria-hidden="true" />
-      </label>
-      <label className="filter-toggle">
-        <input
-          type="checkbox"
-          name="botTriggeredTopics"
-          checked={props.filters.botTriggeredTopics}
-          onChange={event => {
-            const botTriggeredTopics = event.currentTarget.checked;
-            props.setFilters(prev => ({ ...prev, botTriggeredTopics }));
-          }}
-        />
-        <span className="filter-toggle-label">{t('sessions.botTriggeredTopics')}</span>
-        <span className="filter-toggle-switch" aria-hidden="true" />
-      </label>
-      <label className="filter-toggle">
-        <input
-          type="checkbox"
-          name="showUnknownChats"
-          checked={props.filters.showUnknownChats}
-          onChange={event => {
-            const checked = event.currentTarget.checked;
-            writeStoredSessionsShowUnknownChats(windowStorage(), checked);
-            props.setFilters(prev => ({ ...prev, showUnknownChats: checked }));
-          }}
-        />
-        <span className="filter-toggle-label">{t('sessions.showUnknownChats')}</span>
-        <span className="filter-toggle-switch" aria-hidden="true" />
-      </label>
-      <label className="filter-toggle">
-        <input
-          type="checkbox"
-          name="active"
-          checked={props.filters.active}
-          onChange={event => {
-            const active = event.currentTarget.checked;
-            props.setFilters(prev => ({ ...prev, active }));
-          }}
-        />
-        <span className="filter-toggle-label">{t('sessions.activeOnly')}</span>
-        <span className="filter-toggle-switch" aria-hidden="true" />
-      </label>
+        >
+          {t('sessions.showUnknownChats')}
+        </button>
+        {hasActive ? (
+          <button
+            type="button"
+            className="sessions-filter-clear"
+            onClick={() => setFilters(prev => clearSessionFilters(prev))}
+          >
+            {t('sessions.filters.clear')}
+          </button>
+        ) : null}
+      </div>
       <IdleCleanupBar {...props.idleCleanup} />
     </form>
   );
@@ -705,7 +605,9 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const popRef = useRef<HTMLDivElement | null>(null);
-  const count = props.countForHours(draftHours);
+  // 只在弹层打开时才数候选：它要扫一遍全部会话，放在每次渲染里等于每条 SSE 都跑一遍。
+  const counts = open ? props.countForHours(draftHours) : null;
+  const count = counts ? counts.idle + counts.dormant : null;
 
   useEffect(() => {
     if (open) setDraftHours(props.hours);
@@ -787,7 +689,7 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
         </svg>
         <span>{t('sessions.idleCleanupRun')}</span>
       </button>
-      {open && typeof document !== 'undefined' ? createPortal((
+      {open && counts && typeof document !== 'undefined' ? createPortal((
         <div
           ref={popRef}
           className="idle-cleanup-pop"
@@ -799,9 +701,14 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
             <span className="idle-cleanup-pop-title">{t('sessions.idleCleanupRun')}</span>
             <span id="idle-cleanup-count" className="idle-cleanup-count">
               <span className="idle-cleanup-dot" aria-hidden="true" />
-              {t('sessions.idleCleanupCount', { count })}
+              {t('cleanupDormant.countIdle', { count: counts.idle })}
+              {' · '}
+              {t('cleanupDormant.countDormant', { count: counts.dormant })}
             </span>
           </div>
+          <p style={{ margin: 0, color: 'var(--muted)', fontSize: 12, lineHeight: 1.5 }}>
+            {t('cleanupDormant.semanticsHint')}
+          </p>
           <div className="idle-cleanup-pop-field">
             <span className="idle-cleanup-label">{t('sessions.idleCleanupOlderThan')}</span>
             <div
@@ -852,8 +759,18 @@ function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   );
 }
 
-function SessionsTable(props: {
+// 表格 memo 化：此前每次页面渲染都全量重绘，于是「打开/关闭详情」这种只动抽屉状态的
+// 操作也要重排上千行 DOM。memo 生效的前提是下面传进来的 props 引用稳定——页面侧的
+// table*/list* 回调就是为此存在的。
+// 注意：memo 会挡住父组件触发的重渲染，而表格内部直接调 t()。所以要 useT() 自己订阅
+// locale，否则切语言时文案会停在旧语言上。
+/** 表格每次多渲染多少行。几千行一次性铺开要 7 万个 DOM 节点，切到列表就卡一秒多。 */
+const TABLE_PAGE_SIZE = 200;
+
+export function SessionsTableBase(props: {
   rows: any[];
+  limit: number;
+  onShowMore: () => void;
   selected: Set<string>;
   hidden: boolean;
   sortKey: string;
@@ -869,6 +786,7 @@ function SessionsTable(props: {
   onSelectAll: (selected: boolean) => void;
   onSort: (key: string) => void;
 }): React.JSX.Element {
+  useT();
   const selectAllRef = useRef<HTMLInputElement | null>(null);
   useLayoutEffect(() => {
     if (selectAllRef.current) selectAllRef.current.indeterminate = props.selectAllIndeterminate;
@@ -914,7 +832,7 @@ function SessionsTable(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /></td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':
@@ -983,7 +901,7 @@ function SessionsTable(props: {
         </tr>
       </thead>
       <tbody>
-        {props.rows.length ? props.rows.map(row => {
+        {props.rows.length ? props.rows.slice(0, props.limit).map(row => {
           const closed = row.status === 'closed';
           const id = String(row.sessionId);
           return (
@@ -1006,519 +924,34 @@ function SessionsTable(props: {
         }) : (
           <tr><td colSpan={colSpan} className="empty">{t('sessions.empty')}</td></tr>
         )}
+        {props.rows.length > props.limit ? (
+          <tr className="sessions-table-more-row">
+            <td colSpan={colSpan}>
+              <button type="button" className="sessions-table-more" onClick={props.onShowMore}>
+                {t('sessions.kanban.showMore', { count: props.rows.length - props.limit })}
+              </button>
+            </td>
+          </tr>
+        ) : null}
       </tbody>
     </table>
   );
 }
 
-type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
+const SessionsTable = memo(SessionsTableBase);
 
-function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): React.JSX.Element | null {
-  const { exchange } = props;
-  const triggerRef = useRef<HTMLDivElement>(null);
-  const tooltipRef = useRef<HTMLDivElement>(null);
-  const hideTimerRef = useRef<number | null>(null);
-  // open + one-shot focus-suppress live in one reducer (see sessions.ts) so the
-  // Escape→refocus race is driven by the SAME transitions the unit tests cover:
-  // Escape closes and arms suppress, and the trigger's refocus consumes it
-  // instead of reopening.
-  const [overlay, dispatch] = useReducer(previewOverlayReducer, previewOverlayInitialState);
-  const open = overlay.open;
-  const [position, setPosition] = useState<{
-    left: number;
-    placement: 'top' | 'bottom';
-    top: number;
-  } | null>(null);
-  const tooltipId = `session-exchange-tooltip-${useId().replace(/[^a-zA-Z0-9_-]/g, '-')}`;
-
-  const clearHide = useCallback(() => {
-    if (hideTimerRef.current === null) return;
-    window.clearTimeout(hideTimerRef.current);
-    hideTimerRef.current = null;
-  }, []);
-  const show = useCallback(() => {
-    clearHide();
-    dispatch('open');
-  }, [clearHide]);
-  const hide = useCallback(() => {
-    clearHide();
-    dispatch('close');
-    setPosition(null);
-  }, [clearHide]);
-  const scheduleHide = useCallback(() => {
-    clearHide();
-    hideTimerRef.current = window.setTimeout(hide, 120);
-  }, [clearHide, hide]);
-  const updatePosition = useCallback(() => {
-    const trigger = triggerRef.current;
-    const tooltip = tooltipRef.current;
-    if (!trigger || !tooltip) return;
-    const triggerRect = trigger.getBoundingClientRect();
-    const tooltipRect = tooltip.getBoundingClientRect();
-    const margin = 12;
-    const gap = 9;
-    const roomAbove = triggerRect.top - margin - gap;
-    const roomBelow = window.innerHeight - triggerRect.bottom - margin - gap;
-    const placement = roomAbove >= tooltipRect.height || roomAbove > roomBelow ? 'top' : 'bottom';
-    const desiredLeft = triggerRect.left + triggerRect.width / 2 - tooltipRect.width / 2;
-    const left = Math.min(
-      Math.max(desiredLeft, margin),
-      Math.max(margin, window.innerWidth - tooltipRect.width - margin),
-    );
-    const desiredTop = placement === 'top'
-      ? triggerRect.top - tooltipRect.height - gap
-      : triggerRect.bottom + gap;
-    const top = Math.min(
-      Math.max(desiredTop, margin),
-      Math.max(margin, window.innerHeight - tooltipRect.height - margin),
-    );
-    setPosition({ left, placement, top });
-  }, []);
-
-  useLayoutEffect(() => {
-    if (!open) return;
-    updatePosition();
-    window.addEventListener('resize', updatePosition);
-    window.addEventListener('scroll', updatePosition, true);
-    return () => {
-      window.removeEventListener('resize', updatePosition);
-      window.removeEventListener('scroll', updatePosition, true);
-    };
-  }, [exchange.botFullText, exchange.userFullText, open, updatePosition]);
-  useEffect(() => () => clearHide(), [clearHide]);
-  useEffect(() => {
-    if (!open) return;
-    const closeOnOutsidePointer = (event: PointerEvent) => {
-      const target = event.target;
-      if (!(target instanceof Node)) return;
-      if (
-        triggerRef.current?.contains(target)
-        || tooltipRef.current?.contains(target)
-      ) return;
-      hide();
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') hide();
-    };
-    document.addEventListener('pointerdown', closeOnOutsidePointer);
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('pointerdown', closeOnOutsidePointer);
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [hide, open]);
-
-  if (!exchange.userText && !exchange.botText) return null;
-  return (
-    <>
-      <div className="session-card-exchange-wrap">
-        <div
-          ref={triggerRef}
-          className="session-card-exchange"
-          role="button"
-          tabIndex={0}
-          aria-label={t('sessions.preview.showFull')}
-          aria-haspopup="dialog"
-          aria-controls={open ? tooltipId : undefined}
-          aria-expanded={open}
-          onClick={event => {
-            event.stopPropagation();
-            open ? hide() : show();
-          }}
-          onFocus={() => {
-            // Reducer consumes the one-shot suppress armed by Escape, so a
-            // programmatic refocus after Escape does not reopen the overlay.
-            clearHide();
-            dispatch('focus');
-          }}
-          onBlur={scheduleHide}
-          onPointerEnter={event => {
-            if (event.pointerType !== 'touch') show();
-          }}
-          onPointerLeave={event => {
-            if (event.pointerType !== 'touch') scheduleHide();
-          }}
-          onKeyDown={event => {
-            if (event.key === 'Escape') hide();
-            else if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault();
-              open ? hide() : show();
-            }
-          }}
-        >
-          {exchange.userText ? (
-            <div className="session-card-exchange-line">
-              <span>{t('sessions.history.user')}</span>
-              <p>{exchange.userText}</p>
-            </div>
-          ) : null}
-          {exchange.botText ? (
-            <div className="session-card-exchange-line bot">
-              <span>{t('sessions.history.bot')}</span>
-              <p>{exchange.botText}</p>
-            </div>
-          ) : null}
-        </div>
-      </div>
-      {open && typeof document !== 'undefined' ? createPortal(
-        <div
-          ref={tooltipRef}
-          id={tooltipId}
-          className="session-card-exchange-tooltip"
-          role="dialog"
-          aria-label={t('sessions.preview.latestExchange')}
-          data-placement={position?.placement ?? 'top'}
-          style={{
-            left: position?.left ?? -10_000,
-            top: position?.top ?? -10_000,
-            visibility: position ? 'visible' : 'hidden',
-          }}
-          onPointerEnter={clearHide}
-          onPointerLeave={event => {
-            if (event.pointerType !== 'touch') scheduleHide();
-          }}
-          // Keyboard: Tab into a rendered Markdown link keeps the overlay open
-          // (focus entering the panel cancels the trigger's blur-close timer);
-          // it only closes once focus leaves the panel entirely. Escape closes
-          // and returns focus to the trigger.
-          onFocusCapture={clearHide}
-          onBlur={event => {
-            const next = event.relatedTarget as Node | null;
-            if (next && (tooltipRef.current?.contains(next) || triggerRef.current?.contains(next))) return;
-            scheduleHide();
-          }}
-          onKeyDown={event => {
-            if (event.key === 'Escape') {
-              event.stopPropagation();
-              // Close + arm the one-shot suppress, THEN refocus the trigger; its
-              // focus handler dispatches 'focus', which the reducer consumes
-              // (no reopen). Order is race-free because suppress is reducer state.
-              clearHide();
-              dispatch('escape-refocus');
-              setPosition(null);
-              triggerRef.current?.focus();
-            }
-          }}
-        >
-          <div className="session-card-exchange-tooltip-scroll">
-            {exchange.userFullText ? (
-              <div className="session-card-exchange-tooltip-line">
-                <span>{t('sessions.history.user')}</span>
-                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.userFullText))} />
-              </div>
-            ) : null}
-            {exchange.botFullText ? (
-              <div className="session-card-exchange-tooltip-line bot">
-                <span>{t('sessions.history.bot')}</span>
-                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.botFullText))} />
-              </div>
-            ) : null}
-          </div>
-        </div>,
-        document.body,
-      ) : null}
-    </>
-  );
-}
-
-function BoardCard(props: {
-  row: any;
-  selected: boolean;
-  onToggleSelect: (row: any) => void;
-  onOpen: (row: any) => void;
-  onHistory: (row: any) => void;
-  onLocate: (row: any) => Promise<boolean>;
-  onRestart: (row: any, button?: HTMLButtonElement) => void;
-  onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
-  onClose: (row: any, button?: HTMLButtonElement) => void;
-}): React.JSX.Element {
-  const row = props.row;
-  const title = stripMentionPrefix(row.title) || row.sessionId;
-  const botName = botDisplayName(row);
-  const chatTitle = chatDisplayTitle(row);
-  const term = terminalHref(row);
-  const signal = boardSignalLabel(row);
-  const repo = repoBasename(row.workingDir);
-  const exchange = sessionExchangePreview(row);
-  const onCardClick = (event: MouseEvent<HTMLElement>) => {
-    const target = event.target as HTMLElement;
-    if (target.closest('a, button, input, label')) return;
-    props.onToggleSelect(row);
-  };
-  return (
-    <article
-      className={`session-card${props.selected ? ' selected' : ''}${row.locked ? ' locked' : ''}`}
-      data-id={row.sessionId}
-      aria-pressed={props.selected}
-      onClick={onCardClick}
-    >
-      <div className="session-card-top">
-        <span dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name: botName, larkAppId: row.larkAppId, size: 'sm' }))} />
-        <div className="session-card-title">
-          <strong title={String(row.title ?? title)}>{String(title).slice(0, 72)}</strong>
-          <span>{botName} · {chatTitle ?? sessionCliDisplayName(row)}</span>
-        </div>
-        <span className="session-card-status-group">
-          <StatusBadge status={row.status} />
-          <LockChip row={row} />
-        </span>
-      </div>
-      {repo !== '-' || row.adopt || signal ? (
-        <div className="session-card-meta">
-          {repo !== '-' ? <span title={row.workingDir ?? ''}>{repo}</span> : null}
-          {row.adopt ? <span className="badge">adopt</span> : null}
-          {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
-        </div>
-      ) : null}
-      <SessionExchangePreview exchange={exchange} />
-      <div className="session-card-time">
-        <span>{row.agentAttention?.at
-          ? `${t('sessions.board.waiting')} ${relTime(attentionWaitSince(row))}`
-          : `${t('sessions.last')}: ${relTime(row.lastMessageAt)}`}</span>
-      </div>
-      <div className="session-card-actions">
-        <ChatScopeLink row={row} />
-        {!row.feishuChatLink || row.scope !== 'chat' ? (
-          <LocateIconButton row={row} onLocate={props.onLocate} />
-        ) : null}
-        <IconActionButton action="details" icon={ICON.details} label={t('sessions.details')} onClick={() => props.onOpen(row)} />
-        {canRestartSession(row) ? (
-          <IconActionButton action="restart" icon={ICON.restart} label={t('sessions.restart')} onClick={button => props.onRestart(row, button)} />
-        ) : null}
-        <TerminalControls row={row} url={term} />
-        {row.status !== 'closed' ? (
-          <>
-            <IconActionButton
-              action="lock"
-              icon={row.locked ? ICON.unlock : ICON.lock}
-              label={lockActionLabel(row)}
-              kind={row.locked ? 'locked' : ''}
-              onClick={button => props.onLock(row, !row.locked, button)}
-            />
-            <IconActionButton action="close" icon={ICON.close} label={t('sessions.close')} kind="danger" onClick={button => props.onClose(row, button)} />
-          </>
-        ) : null}
-      </div>
-    </article>
-  );
-}
-
-function BoardView(props: {
-  rows: any[];
-  selected: Set<string>;
-  hidden: boolean;
-  order: string[];
-  animated: boolean;
-  dragColId: string | null;
-  dragOverCol: string | null;
-  onAnimated: () => void;
-  onMoveColumn: (id: string, delta: number) => void;
-  onMoveColumnTo: (id: string, targetId: string) => void;
-  onDragCol: (id: string | null) => void;
-  onDragOverCol: (id: string | null) => void;
-  onToggleSelect: (row: any) => void;
-  onOpen: (row: any) => void;
-  onHistory: (row: any) => void;
-  onLocate: (row: any) => Promise<boolean>;
-  onRestart: (row: any, button?: HTMLButtonElement) => void;
-  onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
-  onClose: (row: any, button?: HTMLButtonElement) => void;
-}): React.JSX.Element {
-  useEffect(() => {
-    if (!props.hidden && !props.animated) props.onAnimated();
-  }, [props.animated, props.hidden, props.onAnimated]);
-  const groups = new Map<BoardColumnId, any[]>(BOARD_COLUMNS.map(column => [column.id, []]));
-  for (const row of props.rows) {
-    const column = deriveSessionBoardColumn(row);
-    if (column) groups.get(column)!.push(row);
-  }
-  const columns = props.order
-    .map(id => BOARD_COLUMNS.find(column => column.id === id))
-    .filter((column): column is typeof BOARD_COLUMNS[number] => !!column);
-  return (
-    <div id="sessions-board" className={`sessions-board${props.animated || props.hidden ? '' : ' board-enter'}`} hidden={props.hidden}>
-      {columns.map((column, idx) => {
-        const columnRows = (groups.get(column.id) ?? []).sort((a, b) => compareBoardRows(a, b, column.id));
-        return (
-          <section
-            key={column.id}
-            className={`session-board-column session-board-${column.id}${props.dragColId === column.id ? ' dragging' : ''}${props.dragOverCol === column.id ? ' drag-over' : ''}`}
-            data-col={column.id}
-            onDragOver={(event) => {
-              if (!props.dragColId) return;
-              event.preventDefault();
-              if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-              if (props.dragColId !== column.id) props.onDragOverCol(column.id);
-            }}
-            onDrop={(event) => {
-              if (!props.dragColId) return;
-              event.preventDefault();
-              props.onMoveColumnTo(props.dragColId, column.id);
-              props.onDragCol(null);
-              props.onDragOverCol(null);
-            }}
-          >
-            <header
-              draggable
-              title={t('sessions.board.dragHint')}
-              onDragStart={(event: DragEvent<HTMLElement>) => {
-                props.onDragCol(column.id);
-                if (event.dataTransfer) {
-                  event.dataTransfer.effectAllowed = 'move';
-                  event.dataTransfer.setData('text/plain', column.id);
-                }
-              }}
-              onDragEnd={() => {
-                props.onDragCol(null);
-                props.onDragOverCol(null);
-              }}
-            >
-              <div>
-                <h2>{t(column.labelKey)}</h2>
-                <p>{t(column.hintKey)}</p>
-              </div>
-              <span className="session-board-head-right">
-                <span className="session-board-move">
-                  <button
-                    type="button"
-                    data-move-col={column.id}
-                    data-dir="-1"
-                    aria-label={t('sessions.board.moveLeft')}
-                    disabled={idx === 0}
-                    onClick={() => props.onMoveColumn(column.id, -1)}
-                  >‹</button>
-                  <button
-                    type="button"
-                    data-move-col={column.id}
-                    data-dir="1"
-                    aria-label={t('sessions.board.moveRight')}
-                    disabled={idx === columns.length - 1}
-                    onClick={() => props.onMoveColumn(column.id, 1)}
-                  >›</button>
-                </span>
-                <span className="session-board-count">{columnRows.length}</span>
-              </span>
-            </header>
-            <div className="session-board-list">
-              {columnRows.length ? columnRows.map(row => (
-                <BoardCard
-                  key={row.sessionId}
-                  row={row}
-                  selected={props.selected.has(row.sessionId)}
-                  onToggleSelect={props.onToggleSelect}
-                  onOpen={props.onOpen}
-                  onHistory={props.onHistory}
-                  onLocate={props.onLocate}
-                  onRestart={props.onRestart}
-                  onLock={props.onLock}
-                  onClose={props.onClose}
-                />
-              )) : <div className="session-board-empty">{t('sessions.board.emptyColumn')}</div>}
-            </div>
-          </section>
-        );
-      })}
-    </div>
-  );
-}
-
-type TopicGroupsViewProps = {
-  rows: SessionRow[];
-  relationRows?: SessionRow[];
-  selected: Set<string>;
-  hidden: boolean;
-  onToggleSelect: (row: SessionRow) => void;
-  onOpen: (row: SessionRow) => void;
-  onHistory: (row: SessionRow) => void;
-  onLocate: (row: SessionRow) => Promise<boolean>;
-  onRestart: (row: SessionRow, button?: HTMLButtonElement) => void;
-  onLock: (row: SessionRow, locked: boolean, button?: HTMLButtonElement) => void;
-  onClose: (row: SessionRow, button?: HTMLButtonElement) => void;
+// 看板卡片的图标集。以前是渲染体里的对象字面量：每次渲染都换一个新引用，
+// 于是每张卡片的 callbacks 都"变了"，React.memo 全部失效。图标本身是常量，
+// 提到模块级即可让 memo 真正命中。
+const KANBAN_ICONS: SessionsKanbanIcons = {
+  feishu: ICON.feishu,
+  history: ICON.history,
+  lock: ICON.lock,
+  restart: ICON.restart,
+  close: ICON.close,
+  terminal: ICON.terminal,
+  unlock: ICON.unlock,
 };
-
-function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
-  const title = stripMentionPrefix(group.title).trim();
-  if (title) return title;
-  if (group.kind === 'thread') return t('sessions.topic.untitled');
-  return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
-}
-
-export function TopicGroupsView(props: TopicGroupsViewProps): React.JSX.Element {
-  const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
-  const relationGroups = useMemo(
-    () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
-    [props.relationRows, props.rows],
-  );
-  return (
-    <div id="sessions-topics" className="sessions-topic-view" hidden={props.hidden}>
-      {groups.length ? groups.map(group => {
-        // Member cards respect the current session filters. Header metadata is
-        // derived from the complete store so a hidden closed sibling does not
-        // erase the topic's multi-Bot relationship.
-        const relation = relationGroups.get(group.key) ?? group;
-        const representative = group.rows[0];
-        const location = sessionLocationText(representative);
-        const title = topicGroupTitle(relation);
-        const anchor = relation.rootMessageId || relation.chatId;
-        return (
-          <section
-            key={group.key}
-            className={`session-topic-group${relation.multiBot ? ' multi-bot' : ''}${relation.inferredBotTriggered ? ' inferred-bot-trigger' : ''}`}
-            data-topic-key={group.key}
-          >
-            <header>
-              <span
-                className="session-topic-avatar"
-                dangerouslySetInnerHTML={rawHtml(chatAvatarHtml({ chatId: group.chatId, name: location, size: 'sm' }))}
-              />
-              <div className="session-topic-heading">
-                <span className="session-topic-location">{location}</span>
-                <h2 title={relation.title}>{title}</h2>
-                <code title={anchor}>{relation.kind === 'thread'
-                  ? anchor
-                  : relation.kind === 'chat'
-                    ? t('sessions.topic.wholeChat')
-                    : t('sessions.topic.singleSession')}</code>
-              </div>
-              <div className="session-topic-summary" aria-label={t('sessions.topic.summary')}>
-                {relation.multiBot ? <span className="topic-chip collaboration">{t('sessions.topic.collaboration')}</span> : null}
-                <span className="topic-chip">{t('sessions.topic.sessions', { count: relation.rows.length })}</span>
-                <span className="topic-chip">{t('sessions.topic.bots', { count: relation.botCount })}</span>
-                <span className="topic-chip active">{t('sessions.topic.active', { count: relation.activeCount })}</span>
-                {relation.closedCount ? <span className="topic-chip">{t('sessions.topic.closed', { count: relation.closedCount })}</span> : null}
-                {relation.inferredBotInputCount ? (
-                  <span className="topic-chip inferred" title={t('sessions.topic.inferredHint')}>
-                    {t('sessions.topic.botInputs', { count: relation.inferredBotInputCount })}
-                  </span>
-                ) : null}
-                <span className="session-topic-updated">{t('sessions.last')}: {relTime(relation.latestActivityAt)}</span>
-              </div>
-            </header>
-            <div className="session-topic-members">
-              {group.rows.map(row => (
-                <BoardCard
-                  key={row.sessionId}
-                  row={row}
-                  selected={props.selected.has(row.sessionId)}
-                  onToggleSelect={candidate => {
-                    if (candidate.status !== 'closed') props.onToggleSelect(candidate);
-                    else props.onOpen(candidate);
-                  }}
-                  onOpen={props.onOpen}
-                  onHistory={props.onHistory}
-                  onLocate={props.onLocate}
-                  onRestart={props.onRestart}
-                  onLock={props.onLock}
-                  onClose={props.onClose}
-                />
-              ))}
-            </div>
-          </section>
-        );
-      }) : <div className="sessions-topic-empty">{t('sessions.topic.empty')}</div>}
-    </div>
-  );
-}
 
 function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): React.JSX.Element {
   const m = props.message;
@@ -1544,8 +977,6 @@ function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: 
 }
 
 function HistoryModal(props: { state: HistoryState | null; onClose: () => void }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const loaded = !!props.state && !props.state.loading && !props.state.error && props.state.messages.length > 0;
@@ -1556,12 +987,11 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
     if (el) el.scrollTop = el.scrollHeight;
   }, [loaded, props.state?.sessionId, props.state?.messages.length]);
   return (
-    <dialog
+    <ModalDialog
       id="history-modal"
       className="history-modal"
-      ref={dialogRef}
+      open={!!props.state}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {props.state && row ? (
         <>
@@ -1580,7 +1010,9 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
             {!props.state.loading && props.state.error ? (
               <div className="history-error">
                 {t('sessions.history.fail')}: {props.state.error}
-                {props.state.stale ? <><br /><span>{t('sessions.history.staleHint')}</span></> : null}
+                {props.state.staleHint ? (
+                  <><br /><span>{t('sessions.history.staleHint', props.state.staleHint)}</span></>
+                ) : null}
               </div>
             ) : null}
             {!props.state.loading && !props.state.error && props.state.messages.length === 0 ? (
@@ -1601,11 +1033,11 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
           </div>
         </>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
-function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
+export function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1616,6 +1048,11 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
     const input = inputRef.current;
     input.focus();
     input.select();
+  }, [editing]);
+
+  useLayoutEffect(() => {
+    if (!editing || !inputRef.current) return;
+    const input = inputRef.current;
     const fit = () => {
       const cs = getComputedStyle(input);
       const span = document.createElement('span');
@@ -1674,20 +1111,17 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
 }
 
 function TerminalModal(props: { state: TerminalState | null; onClose: () => void; onRename: (row: any, title: string) => void }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
   const readonlyUrl = row ? terminalHref(row) : null;
   const url = props.state?.url ?? readonlyUrl ?? '';
   const rowCli = row ? sessionCliDisplayName(row) : '';
   const rowRepo = row ? repoBasename(row.workingDir) : '';
   return (
-    <dialog
+    <ModalDialog
       id="term-modal"
       className="term-modal"
-      ref={dialogRef}
+      open={!!props.state}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {props.state && row ? (
         <>
@@ -1740,7 +1174,7 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
           </div>
         </>
       ) : null}
-    </dialog>
+    </ModalDialog>
   );
 }
 
@@ -1856,17 +1290,20 @@ function Drawer(props: {
   closeSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
   setSessionLocked: (row: any, locked: boolean, button?: HTMLButtonElement) => Promise<boolean>;
   startSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
+  onTakeover: (row: any, button?: HTMLButtonElement) => void;
 }): React.JSX.Element {
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-  useDialogVisibility(dialogRef, !!props.row);
   const row = props.row;
   const terminal = row ? terminalHref(row) : null;
+  const closed = !!row && row.status === 'closed';
+  const canTakeover = !!row && !closed && !!terminal;
+  const [envOpen, setEnvOpen] = useState(false);
+  useEffect(() => { setEnvOpen(false); }, [row?.sessionId]);
   return (
-    <dialog
+    <>
+    <ModalDialog
       id="drawer"
-      ref={dialogRef}
+      open={!!props.row}
       onClose={props.onClose}
-      onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {row ? (
         <article>
@@ -1877,49 +1314,144 @@ function Drawer(props: {
             </div>
             <span className="drawer-status-line">
               <StatusBadge status={row.status} />
+              <TodoBadge row={row} />
               <LockChip row={row} />
             </span>
             <p><code>{row.sessionId}</code> <CopyButton value={row.sessionId} /></p>
           </header>
-          <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {sessionCliDisplayName(row)}</p>
-          <p><b>{t('sessions.location')}:</b> {sessionLocationText(row)}</p>
-          <p><b>chatId:</b> <code>{row.chatId ?? ''}</code> <CopyButton value={row.chatId ?? ''} /></p>
-          <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p>
-          {row.threadId ? <p><b>threadId:</b> <code>{row.threadId}</code></p> : null}
-          <p><b>{t('sessions.workingDir')}:</b> {row.workingDir ?? '-'}</p>
-          <div className="actions">
-            <ChatScopeLink row={row} />
-            {!row.feishuChatLink || row.scope !== 'chat' ? <LocateButton row={row} locateSession={props.locateSession} /> : null}
-            <button id="history-drawer-btn" type="button" onClick={() => props.openHistory(row)}>{t('sessions.history.title')}</button>
-            <TerminalControls row={row} url={terminal} />
-            {shouldOpenWritableTerminal() && row.status !== 'closed' ? (
-              <button
-                id="copy-cmd-btn"
-                type="button"
-                data-tip={t('sessions.copyCommandHint')}
-                onClick={event => void copySpawnCommand(row, event.currentTarget)}
-              >
-                {t('sessions.copyCommand')}
-              </button>
-            ) : null}
-            {canRestartSession(row) ? (
-              <button id="restart-btn" type="button" onClick={async event => { if (await props.restartSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.restart')}</button>
-            ) : null}
-            <button id="lock-btn" type="button" onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}>{lockActionLabel(row)}</button>
-            {row.queued && row.status !== 'closed' ? (
-              <button id="start-btn" type="button" className="primary" onClick={async event => { if (await props.startSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.create.start')}</button>
-            ) : null}
-            {row.status === 'closed' ? (
-              <button id="resume-btn" type="button" className="primary" onClick={async event => { if (await props.resumeSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.resume')}</button>
-            ) : null}
-            {row.status !== 'closed' ? (
-              <button id="close-btn" type="button" className="contrast" onClick={async event => { if (await props.closeSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.close')}</button>
-            ) : null}
+          <div className="drawer-body">
+            <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {sessionCliDisplayName(row)}</p>
+            <p><b>{t('sessions.location')}:</b> {sessionLocationText(row)}</p>
+            <p><b>chatId:</b> <code>{row.chatId ?? ''}</code> <CopyButton value={row.chatId ?? ''} /></p>
+            <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p>
+            {row.threadId ? <p><b>threadId:</b> <code>{row.threadId}</code></p> : null}
+            <p><b>{t('sessions.workingDir')}:</b> {row.workingDir ?? '-'}</p>
             <InsightPanel row={row} />
           </div>
+          <footer className="drawer-foot">
+            <div className="drawer-foot-actions">
+              {closed ? (
+                <button
+                  id="resume-btn"
+                  type="button"
+                  className="primary drawer-btn-primary"
+                  onClick={async event => { if (await props.resumeSession(row, event.currentTarget)) props.onClose(); }}
+                >
+                  {t('sessions.resume')}
+                </button>
+              ) : (
+                <>
+                  <button
+                    id="takeover-btn"
+                    type="button"
+                    className="primary drawer-btn-primary"
+                    disabled={!canTakeover}
+                    title={canTakeover ? undefined : t('sessions.openReadonlyTerminal')}
+                    onClick={event => props.onTakeover(row, event.currentTarget)}
+                  >
+                    {t('sessions.takeoverTerminal')}
+                  </button>
+                  {canRestartSession(row) ? (
+                    <button
+                      id="restart-btn"
+                      type="button"
+                      className="drawer-btn-secondary"
+                      onClick={async event => { if (await props.restartSession(row, event.currentTarget)) props.onClose(); }}
+                    >
+                      {t('sessions.restart')}
+                    </button>
+                  ) : null}
+                  <button
+                    id="close-btn"
+                    type="button"
+                    className="drawer-btn-danger"
+                    onClick={async event => { if (await props.closeSession(row, event.currentTarget)) props.onClose(); }}
+                  >
+                    {t('sessions.close')}
+                  </button>
+                </>
+              )}
+            </div>
+            <details className="drawer-more">
+              <summary aria-label={t('sessions.more')}>{t('sessions.more')}</summary>
+              <div className="drawer-more-pop" role="menu">
+                <button
+                  id="history-drawer-btn"
+                  type="button"
+                  role="menuitem"
+                  onClick={() => props.openHistory(row)}
+                >
+                  {t('sessions.history.title')}
+                </button>
+                {shouldOpenWritableTerminal() && !closed ? (
+                  <button
+                    id="copy-cmd-btn"
+                    type="button"
+                    role="menuitem"
+                    data-tip={t('sessions.copyCommandHint')}
+                    onClick={event => void copySpawnCommand(row, event.currentTarget)}
+                  >
+                    {t('sessions.copyCommand')}
+                  </button>
+                ) : null}
+                <button
+                  id="lock-btn"
+                  type="button"
+                  role="menuitem"
+                  onClick={event => void props.setSessionLocked(row, !row.locked, event.currentTarget)}
+                >
+                  {lockActionLabel(row)}
+                </button>
+                {!row.feishuChatLink || row.scope !== 'chat' ? (
+                  <span className="drawer-more-item"><LocateButton row={row} locateSession={props.locateSession} /></span>
+                ) : (
+                  <a
+                    className="drawer-more-item drawer-more-link"
+                    href={row.feishuChatLink}
+                    target="_blank"
+                    rel="noopener"
+                    role="menuitem"
+                  >
+                    {t('sessions.openChat')}
+                  </a>
+                )}
+                {row.queued && !closed ? (
+                  <button
+                    id="start-btn"
+                    type="button"
+                    role="menuitem"
+                    onClick={async event => { if (await props.startSession(row, event.currentTarget)) props.onClose(); }}
+                  >
+                    {t('sessions.create.start')}
+                  </button>
+                ) : null}
+                {!closed && row.larkAppId ? (
+                  <button
+                    id="session-env-btn"
+                    type="button"
+                    role="menuitem"
+                    data-action="open-session-env"
+                    onClick={() => setEnvOpen(true)}
+                  >
+                    {t('sessionEnv.viewLive')}
+                  </button>
+                ) : null}
+              </div>
+            </details>
+          </footer>
         </article>
       ) : null}
-    </dialog>
+    </ModalDialog>
+    {row ? (
+      <SessionEnvLiveModal
+        open={envOpen}
+        larkAppId={String(row.larkAppId ?? '')}
+        sessionId={String(row.sessionId)}
+        title={stripMentionPrefix(row.title) || undefined}
+        onClose={() => setEnvOpen(false)}
+      />
+    ) : null}
+    </>
   );
 }
 
@@ -1971,18 +1503,13 @@ function CreateSessionDialog(props: {
   const [bindWorkingDir, setBindWorkingDir] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [botQuery, setBotQuery] = useState('');
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
-  const [feedGroups, setFeedGroups] = useState<Array<{ groupId: string; name: string }>>([]);
-  const [feedGroupAppId, setFeedGroupAppId] = useState('');
-  const [feedGroupId, setFeedGroupId] = useState('');
-  const [newFeedGroupName, setNewFeedGroupName] = useState('');
-  const [feedGroupError, setFeedGroupError] = useState('');
-  const [feedGroupLoading, setFeedGroupLoading] = useState(false);
-  const [feedGroupAuthSubmitting, setFeedGroupAuthSubmitting] = useState(false);
-  const [feedGroupAuthUrl, setFeedGroupAuthUrl] = useState('');
-  const [feedGroupCallbackUrl, setFeedGroupCallbackUrl] = useState('');
+  const feed = useFeedGroups({
+    enabled: !!state && !state.loading && !state.success,
+    reloadKey: state,
+    onAuthError: (_kind, reason) => toast(reason, { kind: 'error' }),
+  });
   const [mentionTrigger, setMentionTrigger] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -2000,91 +1527,12 @@ function CreateSessionDialog(props: {
     setBindWorkingDir('');
     setAdvancedOpen(false);
     setSubmitting(false);
-    setBotQuery('');
     setKeptSuccess(null);
-    setFeedGroupId('');
-    setNewFeedGroupName('');
-    setFeedGroupError('');
-    setFeedGroupAuthUrl('');
-    setFeedGroupCallbackUrl('');
+    feed.reset();
     setMentionTrigger(null);
     setMentionIndex(0);
     nextImageOrdinalRef.current = 1;
   }, [state]);
-
-  useEffect(() => {
-    if (!feedGroupAuthUrl) return;
-    let alive = true;
-    const timer = window.setInterval(() => {
-      void fetch('/api/feed-groups')
-        .then(async response => {
-          const body = await response.json().catch(() => ({}));
-          if (!response.ok || !body.ok || !alive) return;
-          setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
-          setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
-          setFeedGroupError('');
-          setFeedGroupAuthUrl('');
-          setFeedGroupCallbackUrl('');
-        })
-        .catch(() => { /* remote/manual fallback remains visible */ });
-    }, 1_000);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, [feedGroupAuthUrl]);
-
-  useEffect(() => {
-    if (!state || state.loading || state.success) return;
-    let alive = true;
-    setFeedGroupLoading(true);
-    void fetch('/api/feed-groups')
-      .then(async response => {
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
-        if (!alive) return;
-        setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
-        setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
-        setFeedGroupError('');
-      })
-      .catch(error => { if (alive) setFeedGroupError(error instanceof Error ? error.message : String(error)); })
-      .finally(() => { if (alive) setFeedGroupLoading(false); });
-    return () => { alive = false; };
-  }, [state]);
-
-  const openFeedGroupLogin = async (): Promise<void> => {
-    const query = feedGroupAppId ? `?larkAppId=${encodeURIComponent(feedGroupAppId)}` : '';
-    const response = await fetch(`/api/feed-groups/auth-url${query}`);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || !body.authUrl) {
-      alert(body.error ?? `HTTP ${response.status}`);
-      return;
-    }
-    setFeedGroupAuthUrl(String(body.authUrl));
-    setFeedGroupCallbackUrl('');
-  };
-
-  const completeFeedGroupLogin = async (callbackUrl: string): Promise<void> => {
-    setFeedGroupAuthSubmitting(true);
-    try {
-      const response = await fetch('/api/feed-groups/oauth-callback', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ callbackUrl: callbackUrl.trim() }),
-      });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
-      const groupsResponse = await fetch('/api/feed-groups');
-      const groupsBody = await groupsResponse.json().catch(() => ({}));
-      if (!groupsResponse.ok || !groupsBody.ok) throw new Error(groupsBody.message ?? groupsBody.error ?? `HTTP ${groupsResponse.status}`);
-      setFeedGroups(Array.isArray(groupsBody.groups) ? groupsBody.groups : []);
-      setFeedGroupAppId(typeof groupsBody.larkAppId === 'string' ? groupsBody.larkAppId : '');
-      setFeedGroupError('');
-      setFeedGroupAuthUrl('');
-      setFeedGroupCallbackUrl('');
-    } catch (error) {
-      alert(error instanceof Error ? error.message : String(error));
-    } finally {
-      setFeedGroupAuthSubmitting(false);
-    }
-  };
 
   if (!state) return null;
   if (state.success) {
@@ -2122,11 +1570,6 @@ function CreateSessionDialog(props: {
   const checkedIds = [...selectedBots];
   const leadOptions = checkedIds;
   const nameOf = (id: string) => bots.find(bot => bot.larkAppId === id)?.botName ?? id;
-  const botQueryNorm = botQuery.trim().toLowerCase();
-  const visibleBots = botQueryNorm
-    ? bots.filter(bot =>
-      bot.botName.toLowerCase().includes(botQueryNorm) || bot.larkAppId.toLowerCase().includes(botQueryNorm))
-    : bots;
   const mentionBots = mentionTrigger
     ? filterMentionBots(bots, mentionTrigger.query).slice(0, 8)
     : [];
@@ -2174,21 +1617,21 @@ function CreateSessionDialog(props: {
     const pasteEnd = event.currentTarget.selectionEnd ?? pasteStart;
     const supported = pasted.filter(file => CREATE_IMAGE_TYPES.has(file.type.toLowerCase()));
     if (supported.length !== pasted.length) {
-      alert(t('sessions.create.imageUnsupported'));
+      toast(t('sessions.create.imageUnsupported'), { kind: 'warning' });
       return;
     }
     if (images.length + supported.length > CREATE_IMAGE_MAX_COUNT) {
-      alert(t('sessions.create.imageCountLimit', { n: String(CREATE_IMAGE_MAX_COUNT) }));
+      toast(t('sessions.create.imageCountLimit', { n: String(CREATE_IMAGE_MAX_COUNT) }), { kind: 'warning' });
       return;
     }
     if (supported.some(file => file.size > CREATE_IMAGE_MAX_BYTES)) {
-      alert(t('sessions.create.imageSizeLimit'));
+      toast(t('sessions.create.imageSizeLimit'), { kind: 'warning' });
       return;
     }
     const nextTotal = images.reduce((sum, image) => sum + image.size, 0)
       + supported.reduce((sum, file) => sum + file.size, 0);
     if (nextTotal > CREATE_IMAGE_MAX_TOTAL_BYTES) {
-      alert(t('sessions.create.imageTotalLimit'));
+      toast(t('sessions.create.imageTotalLimit'), { kind: 'warning' });
       return;
     }
     try {
@@ -2221,16 +1664,16 @@ function CreateSessionDialog(props: {
         textarea.setSelectionRange(inserted.caret, inserted.caret);
       });
     } catch {
-      alert(t('sessions.create.imageReadFailed'));
+      toast(t('sessions.create.imageReadFailed'), { kind: 'error' });
     }
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const text = content.trim();
-    if (!text) { alert(t('sessions.create.errContent')); return; }
-    if (checkedIds.length === 0) { alert(t('sessions.create.errNoBot')); return; }
+    if (!text) { toast(t('sessions.create.errContent'), { kind: 'warning' }); return; }
+    if (checkedIds.length === 0) { toast(t('sessions.create.errNoBot'), { kind: 'warning' }); return; }
     const leadLarkAppId = lead || checkedIds[0] || '';
-    if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { alert(t('sessions.create.errLead')); return; }
+    if (mode === 'lead' && (!leadLarkAppId || !checkedIds.includes(leadLarkAppId))) { toast(t('sessions.create.errLead'), { kind: 'warning' }); return; }
     setSubmitting(true);
     setKeptSuccess(null);
     try {
@@ -2245,9 +1688,9 @@ function CreateSessionDialog(props: {
           leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
           name: name.trim() || undefined,
           bindWorkingDir: bindWorkingDir.trim() || undefined,
-          feedGroupId: feedGroupId || undefined,
-          newFeedGroupName: newFeedGroupName.trim() || undefined,
-          feedGroupAppId: (feedGroupId || newFeedGroupName.trim()) ? feedGroupAppId : undefined,
+          feedGroupId: feed.selectedId || undefined,
+          newFeedGroupName: feed.newName.trim() || undefined,
+          feedGroupAppId: (feed.selectedId || feed.newName.trim()) ? feed.appId : undefined,
           images: images.map(image => ({
             name: image.name,
             mimeType: image.mimeType,
@@ -2267,9 +1710,9 @@ function CreateSessionDialog(props: {
         } else {
           props.onSuccess(body);
         }
-      } else if (r.status !== 401) alert(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`);
+      } else if (r.status !== 401) toast(`${t('sessions.create.failed')}: ${body?.error ?? r.status}`, { kind: 'error' });
     } catch (e) {
-      alert(`${t('sessions.create.failed')}: ${e}`);
+      toast(`${t('sessions.create.failed')}: ${e}`, { kind: 'error' });
     } finally {
       setSubmitting(false);
     }
@@ -2364,44 +1807,23 @@ function CreateSessionDialog(props: {
         </fieldset>
         <fieldset className="cs-bots">
           <legend>{t('sessions.create.bots')}</legend>
-          {bots.length ? (
-            <>
-              <input
-                className="cs-bot-search"
-                type="search"
-                name="botSearch"
-                placeholder={t('sessions.create.botSearchPlaceholder')}
-                aria-label={t('sessions.create.botSearchPlaceholder')}
-                value={botQuery}
-                onChange={event => setBotQuery(event.currentTarget.value)}
-              />
-              {visibleBots.length ? (
-                <div className="cs-bot-list">
-                  {visibleBots.map(bot => (
-                    <label key={bot.larkAppId} className="cs-bot">
-                      <input
-                        type="checkbox"
-                        name="bot"
-                        value={bot.larkAppId}
-                        checked={selectedBots.has(bot.larkAppId)}
-                        onChange={event => {
-                          const checked = event.currentTarget.checked;
-                          setSelectedBots(prev => {
-                            const next = new Set(prev);
-                            if (checked) next.add(bot.larkAppId);
-                            else next.delete(bot.larkAppId);
-                            if (!next.has(lead)) setLead(next.values().next().value ?? '');
-                            return next;
-                          });
-                        }}
-                      /> <span>{bot.botName}</span>
-                    </label>
-                  ))}
-                </div>
-              ) : <p className="cs-empty">{t('sessions.create.noBotMatch')}</p>}
-              {checkedIds.length ? <small>{t('sessions.create.selectedCount', { n: String(checkedIds.length) })}</small> : null}
-            </>
-          ) : <p className="cs-empty">{t('sessions.create.noBots')}</p>}
+          <BotMultiSelect
+            bots={bots}
+            selected={selectedBots}
+            onToggle={(id, checked) => {
+              setSelectedBots(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(id);
+                else next.delete(id);
+                if (!next.has(lead)) setLead(next.values().next().value ?? '');
+                return next;
+              });
+            }}
+            searchPlaceholder={t('botPicker.searchPlaceholder')}
+            noMatchLabel={t('botPicker.noMatch')}
+            emptyLabel={t('sessions.create.noBots')}
+            selectedCountLabel={n => t('botPicker.selectedCount', { n: String(n) })}
+          />
         </fieldset>
         <fieldset className="cs-mode">
           <legend>{t('sessions.create.mode')}</legend>
@@ -2409,25 +1831,7 @@ function CreateSessionDialog(props: {
           <label><input type="radio" name="mode" value="all" checked={mode === 'all'} onChange={() => setMode('all')} /> {t('sessions.create.modeAll')}</label>
           <small>{t('sessions.create.modeHelp')}</small>
         </fieldset>
-        {feedGroupAuthUrl ? (
-          <div className="feed-group-auth-overlay">
-            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="session-feed-group-auth-title">
-              <h3 id="session-feed-group-auth-title">授权飞书标签</h3>
-              <p>点击下面的按钮，在飞书页面确认授权。如果 BotMux 与浏览器在同一台电脑，确认后会自动完成授权。如果 BotMux 运行在远程虚拟机上，浏览器会因无法访问本机地址 <code>127.0.0.1:9768</code> 而显示“无法访问”；此时请复制地址栏中的完整链接并粘贴到下方。</p>
-              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(feedGroupAuthUrl, '_blank', 'noopener')}>跳转飞书授权</button>
-              <label>
-                <span>请把点击授权后的完整链接粘贴在这里</span>
-                <input type="url" value={feedGroupCallbackUrl} placeholder="http://127.0.0.1:9768/callback?code=…&state=…" onChange={event => setFeedGroupCallbackUrl(event.currentTarget.value)} />
-              </label>
-              <div className="actions">
-                <button type="button" onClick={() => { setFeedGroupAuthUrl(''); setFeedGroupCallbackUrl(''); }}>取消</button>
-                <button type="button" className="primary" disabled={!feedGroupCallbackUrl.trim() || feedGroupAuthSubmitting} onClick={() => void completeFeedGroupLogin(feedGroupCallbackUrl)}>
-                  {feedGroupAuthSubmitting ? '正在完成授权…' : '完成授权'}
-                </button>
-              </div>
-            </section>
-          </div>
-        ) : null}
+        <FeedGroupAuthOverlay feed={feed} titleId="session-feed-group-auth-title" />
         <fieldset className="cs-lead-row" hidden={mode !== 'lead'}>
           <legend>{t('sessions.create.lead')}</legend>
           <select name="lead" disabled={leadOptions.length === 0} value={leadOptions.includes(lead) ? lead : ''} onChange={event => setLead(event.currentTarget.value)}>
@@ -2464,33 +1868,16 @@ function CreateSessionDialog(props: {
             </label>
             <fieldset className="cs-feed-group">
               <legend>飞书标签（可选）</legend>
-              <select
-                value={feedGroupId}
-                disabled={feedGroupLoading || !!feedGroupError}
-                onChange={event => { setFeedGroupId(event.currentTarget.value); if (event.currentTarget.value) setNewFeedGroupName(''); }}
-              >
-                <option value="">点击选择已有标签（可选）</option>
-                {feedGroups.map(group => <option key={group.groupId} value={group.groupId}>{group.name}</option>)}
-              </select>
-              <input
-                type="text"
-                value={newFeedGroupName}
-                maxLength={60}
-                placeholder="或输入新标签名称"
-                disabled={!!feedGroupId || feedGroupLoading || !!feedGroupError}
-                onChange={event => setNewFeedGroupName(event.currentTarget.value.trimStart())}
+              <FeedGroupPicker
+                groups={feed.groups}
+                selectedId={feed.selectedId}
+                newName={feed.newName}
+                disabled={feed.loading || !!feed.error}
+                onChange={feed.select}
               />
-              <small>点击下拉框可选择已有标签，将新建群聊归入该标签；也可以输入名称创建新标签。</small>
-              {feedGroupLoading ? <small>正在读取飞书标签…</small> : null}
-              {feedGroupError ? (
-                <div className="cs-warn">
-                  <small>{feedGroupError}</small>{' '}
-                  <button type="button" disabled={feedGroupAuthSubmitting} onClick={() => void openFeedGroupLogin()}>
-                    {feedGroupAuthSubmitting ? '正在完成授权…' : '立即授权'}
-                  </button>
-                  <small> 授权后会弹窗提示你粘贴回调地址。</small>
-                </div>
-              ) : null}
+              <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
+              {feed.loading ? <small>正在读取飞书标签…</small> : null}
+              <FeedGroupAuthPrompt feed={feed} className="cs-warn" />
             </fieldset>
             <label className="cs-advanced-field">
               <span>{t('sessions.create.workingDir')}</span>
@@ -2535,53 +1922,48 @@ function CreateSessionDialog(props: {
   );
 }
 
+/** 首屏骨架屏：首个 /api/sessions 快照到达前不闪「空」。布局模仿看板的五列，
+ *  纯展示，无交互。 */
+function SessionsSkeleton(): React.JSX.Element {
+  return (
+    <div className="sessions-skeleton" aria-busy="true" aria-label={t('sessions.loadingSessions')}>
+      {[0, 1, 2, 3, 4].map(column => (
+        <div key={column} className="sessions-skeleton-col">
+          <div className="skel skel-head" />
+          <div className="skel skel-card" />
+          <div className="skel skel-card skel-card-short" />
+          <div className="skel skel-card" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function SessionsPage(): React.JSX.Element {
   useT();
   const storeRows = useStoreSelector(snapshot => [...snapshot.sessions.values()] as SessionRow[]);
+  const bootstrapped = useStoreSelector(snapshot => snapshot.bootstrapped);
   const [revision, setRevision] = useState(0);
   const refresh = useCallback(() => setRevision(v => v + 1), []);
-  const [filters, setFilters] = useState<FiltersState>({
-    q: '',
-    status: '',
-    adopt: '',
-    chat: '',
-    multiBotTopics: false,
-    botTriggeredTopics: false,
-    showUnknownChats: readStoredSessionsShowUnknownChats(windowStorage()),
-    active: true,
-    cli: new Set(CLI_FILTER_OPTIONS),
-  });
+  const [filters, setFilters] = useState<FiltersState>(() => initialFilters('', readStoredSessionsShowUnknownChats(windowStorage())));
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [sortKey, setSortKey] = useState('lastMessageAt');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(() => new Set(readStoredHiddenTableColumns(windowStorage())));
   const [viewMode, setViewMode] = useState<SessionsViewMode>(() => readStoredSessionsViewMode(windowStorage()));
-  const [boardOrder, setBoardOrder] = useState<string[]>(() => readStoredBoardOrder(windowStorage()));
-  const [boardAnimated, setBoardAnimated] = useState(false);
-  const [dragColId, setDragColId] = useState<string | null>(null);
-  const [dragOverCol, setDragOverCol] = useState<string | null>(null);
-  const [kanbanGroupBy, setKanbanGroupBy] = useState<KanbanGroupBy>(() => readStoredKanbanGroupBy(windowStorage()));
-  const viewStageSignature = `${viewMode}:${viewMode === 'kanban' ? kanbanGroupBy : '-'}`;
+  const [tableLimit, setTableLimit] = useState(TABLE_PAGE_SIZE);
   const viewStageInitialRef = useRef(true);
-  const [viewStageAnimKey, setViewStageAnimKey] = useState(0);
-  const [kanbanTeams, setKanbanTeams] = useState<SessionsKanbanTeam[]>([]);
-  const [kanbanChatBots, setKanbanChatBots] = useState<ChatBotsMap | null>(null);
-  const [kanbanTeamsLoaded, setKanbanTeamsLoaded] = useState(false);
-  const kanbanTeamsLoadingRef = useRef(false);
-  const [kanbanTeamKey, setKanbanTeamKey] = useState(() => {
-    try { return window.localStorage.getItem(KANBAN_TEAM_STORAGE_KEY) ?? ''; } catch { return ''; }
-  });
-  const [teamBoard, setTeamBoard] = useState<TeamBoardState>({ data: null, key: '', fetchedAt: 0 });
-  const teamBoardLoadingRef = useRef(false);
+  const viewStageRef = useRef<HTMLDivElement | null>(null);
   const restartCooldownIds = useRef(new Set<string>());
-  const [teamScopeText, setTeamScopeText] = useState('');
   const [bulkCloseProgress, setBulkCloseProgress] = useState<{ done: number; total: number } | null>(null);
   const [bulkLockProgress, setBulkLockProgress] = useState<{ locked: boolean; done: number; total: number } | null>(null);
   const [monitorRoomFeedback, setMonitorRoomFeedback] = useState<string | null>(null);
   const [idleCleanupBusy, setIdleCleanupBusy] = useState(false);
   const [idleCleanupHours, setIdleCleanupHours] = useState<IdleCleanupHours>(24);
   const [idleCleanupStatus, setIdleCleanupStatus] = useState('');
-  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(null);
+  // `#/sessions?session=<id>`（⌘K 全局搜索等跨页入口）直接打开该会话的详情抽屉；
+  // 会话还没进 store 时抽屉先不出，快照到了 rowsById 命中后自然弹出。
+  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(() => hashQueryParam('session'));
   const [historyState, setHistoryState] = useState<HistoryState | null>(null);
   const [termState, setTermState] = useState<TerminalState | null>(null);
   const [kanbanHost, setKanbanHost] = useState<HTMLElement | null>(null);
@@ -2590,13 +1972,32 @@ function SessionsPage(): React.JSX.Element {
   const [createLoading, setCreateLoading] = useState(false);
   const createRequestRef = useRef(0);
 
+  // 视图切换的入场动画。以前靠 `key={viewStageAnimKey}` 换 key 强制 remount 整个
+  // 舞台来重放 CSS animation——那等于每次切视图都把当前视图
+  // 连同全部卡片从零重建一遍，5000+ 会话下单次点击主线程阻塞 4~6.6s。
+  // 现在改成就地重启动画：摘掉 class、读一次 offsetWidth 触发 reflow、再加回去，
+  // DOM 不动，React 也不用重建子树。
+  // 入场 class 只由这里加，JSX 上的 className 保持静态——这正是本做法成立的前提：
+  // React 只在 className 的计算值变化时才写 DOM，值恒为 "sessions-view-stage"，
+  // 所以它不会把我们加上的 class 冲掉，也就不需要再拿一个 state 去驱动它。
   useLayoutEffect(() => {
     if (viewStageInitialRef.current) {
       viewStageInitialRef.current = false;
       return;
     }
-    setViewStageAnimKey(value => value + 1);
-  }, [viewStageSignature]);
+    const stage = viewStageRef.current;
+    if (!stage) return;
+    // The table's local scrollbar is a sibling, excluded from scrollable
+    // overflow. Animate their common host so the stage doesn't retain its own
+    // transform/opacity stacking context beneath the scrollbar after fill:both.
+    // Other views keep the original stage animation (their host is contents).
+    stage.classList.remove('sessions-view-stage-enter');
+    const host = stage.parentElement;
+    host?.classList.remove('sessions-view-stage-enter');
+    const animated = viewMode === 'table' && host ? host : stage;
+    void animated.offsetWidth;
+    animated.classList.add('sessions-view-stage-enter');
+  }, [viewMode]);
 
   useEffect(() => {
     setCreateDialogEl(document.getElementById('create-session-modal') as HTMLDialogElement | null);
@@ -2613,13 +2014,24 @@ function SessionsPage(): React.JSX.Element {
       if (!chatId) continue;
       if (!filters.showUnknownChats && isUnknownChatSession(row)) continue;
       const label = sessionLocationText(row);
-      const existing = options.get(chatId);
-      if (!existing || label < existing) options.set(chatId, label);
+      options.set(chatId, preferChatFilterLabel(options.get(chatId), label, chatId));
     }
     return [...options.entries()]
       .sort((a, b) => a[1].localeCompare(b[1]))
       .map(([value, label]) => ({ value, label }));
   }, [filters.showUnknownChats, revision, storeRows]);
+
+  // 机器人筛选项：只列当前有会话的 Bot，按显示名排序。
+  const botOptions = useMemo<ChatFilterOption[]>(() => {
+    const options = new Map<string, string>();
+    for (const row of storeRows) {
+      const id = String(row.larkAppId ?? '').trim();
+      if (id && !options.has(id)) options.set(id, botDisplayName(row));
+    }
+    return [...options.entries()]
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .map(([value, label]) => ({ value, label }));
+  }, [revision, storeRows]);
 
   useEffect(() => {
     if (!filters.chat) return;
@@ -2627,43 +2039,55 @@ function SessionsPage(): React.JSX.Element {
     setFilters(prev => ({ ...prev, chat: '' }));
   }, [chatOptions, filters.chat]);
 
-  const rows = useMemo(() => {
-    const q = filters.q.toLowerCase();
-    const cli = [...filters.cli];
-    const cliFilterActive = cli.length > 0 && cli.length < CLI_FILTER_OPTIONS.length;
-    const keepClosed = viewMode === 'kanban';
-    const acceptedTopicKeys = filters.multiBotTopics || filters.botTriggeredTopics
-      ? new Set(groupSessionsByTopic(storeRows)
-        .filter(group => !filters.multiBotTopics || group.multiBot)
-        .filter(group => !filters.botTriggeredTopics || group.inferredBotTriggered)
-        .map(group => group.key))
-      : null;
-    const base = storeRows
-      .filter(s => !cliFilterActive || cli.includes(s.cliId ?? 'unknown'))
-      .filter(s => filters.showUnknownChats || !isUnknownChatSession(s))
-      .filter(s => !filters.status || s.status === filters.status)
-      .filter(s => !filters.adopt || (filters.adopt === 'yes') === !!s.adopt)
-      .filter(s => !filters.chat || String(s.chatId ?? '') === filters.chat)
-      .filter(s => !filters.active || keepClosed || s.status !== 'closed')
-      .filter(s => !q || sessionSearchText(s).includes(q));
-    if (!acceptedTopicKeys) {
-      return base.sort((a, b) => compareRows(a, b, sortKey, sortDir));
-    }
-    return base
-      .filter(row => acceptedTopicKeys.has(sessionTopicKey(row)))
-      .sort((a, b) => compareRows(a, b, sortKey, sortDir));
-  }, [filters, revision, sortDir, sortKey, storeRows, viewMode]);
+  const rows = useMemo(() => (
+    // 看板要留着已关闭会话给「已完成」列；表格默认只看未关闭的（状态选「全部（含已关闭）」才带上）。
+    filterSessionRows(storeRows, filters, { keepClosed: viewMode === 'kanban' })
+      .sort((a, b) => compareRows(a, b, sortKey, sortDir))
+  ), [filters, revision, sortDir, sortKey, storeRows, viewMode]);
   const runtimeCounts = useMemo(() => sessionRuntimeCounts(storeRows), [storeRows]);
 
+  // 看板只放「还在手上」的会话：休眠会话（进程已退出、等下条消息冷恢复）动辄几千个，
+  // 全铺上去既看不过来、又让看板卡顿。手动拖进过某列的休眠会话例外，照旧留在原列。
+  // 明确筛了「休眠」状态时也照常显示，否则筛选结果会是一块空板。
+  const { kanbanRows, dormantOffBoard } = useMemo(() => {
+    if (viewMode !== 'kanban' || filters.status === 'dormant') return { kanbanRows: rows, dormantOffBoard: 0 };
+    const onBoard: SessionRow[] = [];
+    let off = 0;
+    for (const row of rows) {
+      if (isOffBoardDormant(row)) off += 1;
+      else onBoard.push(row);
+    }
+    return { kanbanRows: onBoard, dormantOffBoard: off };
+  }, [filters.status, rows, viewMode]);
+
+  useEffect(() => {
+    setTableLimit(TABLE_PAGE_SIZE);
+  }, [filters, sortDir, sortKey]);
+
   const rowsById = useMemo(() => new Map(storeRows.map(row => [row.sessionId, row])), [storeRows, revision]);
-  const boardRows = useMemo(() => rows.filter(row => row.status !== 'closed'), [rows]);
-  const visibleRows = viewMode === 'table' || viewMode === 'topics' ? rows : boardRows;
-  const selectableRows = visibleRows.filter(row => row.status !== 'closed');
-  const selectedRows = [...selected]
-    .map(id => rowsById.get(id))
-    .filter((row): row is SessionRow => !!row && row.status !== 'closed');
-  const selectAllChecked = selectableRows.length > 0 && selectableRows.every(row => selected.has(row.sessionId));
-  const selectAllIndeterminate = selectableRows.some(row => selected.has(row.sessionId)) && !selectAllChecked;
+  // 下面这几个派生集合原来都是裸表达式，每次渲染（含每条 SSE session.update）都要
+  // 在数千行上重跑一遍 filter/every/some。全部收进 useMemo：只有真正的输入变了才重算。
+  // 全选只作用于表格当前已渲染的行：没展开的行用户看不到，不能被一键批量关掉。
+  const selectableRows = useMemo(
+    () => rows.slice(0, tableLimit).filter(row => row.status !== 'closed'),
+    [rows, tableLimit],
+  );
+  const selectedRows = useMemo(
+    () => [...selected]
+      .map(id => rowsById.get(id))
+      .filter((row): row is SessionRow => !!row && row.status !== 'closed'),
+    [rowsById, selected],
+  );
+  const { selectAllChecked, selectAllIndeterminate } = useMemo(() => {
+    let anySelected = false;
+    let allSelected = selectableRows.length > 0;
+    for (const row of selectableRows) {
+      if (selected.has(row.sessionId)) anySelected = true;
+      else allSelected = false;
+      if (anySelected && !allSelected) break;
+    }
+    return { selectAllChecked: allSelected, selectAllIndeterminate: anySelected && !allSelected };
+  }, [selectableRows, selected]);
 
   useEffect(() => {
     setSelected(prev => {
@@ -2678,179 +2102,10 @@ function SessionsPage(): React.JSX.Element {
     });
   }, [rowsById]);
 
-  const teamChatIdsFor = useCallback((team: SessionsKanbanTeam | undefined): Set<string> => {
-    const teamChats = new Set<string>();
-    if (!team) return teamChats;
-    for (const chatId of team.groupChats) teamChats.add(chatId);
-    if (kanbanChatBots) {
-      for (const [chatId, c] of kanbanChatBots) {
-        if (teamChats.has(chatId)) continue;
-        let hasTeamBot = false;
-        for (const id of team.botIds) {
-          if (c.botIds.has(id)) { hasTeamBot = true; break; }
-        }
-        if (!hasTeamBot) continue;
-        for (const n of c.observedNames) {
-          if (team.botNames.has(n)) { teamChats.add(chatId); break; }
-        }
-      }
-    }
-    return teamChats;
-  }, [kanbanChatBots]);
-
-  const currentCleanupVisibleRows = useMemo(() => {
-    if (viewMode === 'kanban' && kanbanGroupBy === 'team') {
-      const team = kanbanTeams.find(tm => tm.key === kanbanTeamKey) ?? kanbanTeams[0];
-      const teamChats = teamChatIdsFor(team);
-      return rows.filter(row => teamChats.has(String(row.chatId)));
-    }
-    return rows;
-  }, [kanbanGroupBy, kanbanTeamKey, kanbanTeams, rows, teamChatIdsFor, viewMode]);
   const idleCleanupCandidatesFor = useCallback(
-    (hours: IdleCleanupHours) => selectIdleCleanupCandidates(currentCleanupVisibleRows, hours),
-    [currentCleanupVisibleRows],
+    (hours: IdleCleanupHours) => selectCleanupCandidates(rows, hours),
+    [rows],
   );
-
-  const loadKanbanTeams = useCallback(async (): Promise<void> => {
-    if (kanbanTeamsLoadingRef.current || kanbanTeamsLoaded) return;
-    kanbanTeamsLoadingRef.current = true;
-    try {
-      const [hosted, remote, groups] = await Promise.all([
-        fetch('/api/team/hosted').then(r => r.json()).catch(() => null),
-        fetch('/api/team/remote-roster').then(r => r.json()).catch(() => null),
-        fetch('/api/groups').then(r => r.json()).catch(() => null),
-      ]);
-      if (Array.isArray(groups?.chats)) {
-        setKanbanChatBots(new Map(groups.chats.map((c: any) => [
-          String(c.chatId),
-          {
-            botIds: new Set<string>((c.memberBots ?? []).filter((mb: any) => mb.inChat).map((mb: any) => String(mb.larkAppId))),
-            observedNames: new Set<string>((c.observedBotNames ?? []).map((n: any) => String(n))),
-          },
-        ])));
-      }
-      const rosterBots = (bots: any[]): { ids: Set<string>; names: Set<string> } => ({
-        ids: new Set<string>(bots.map((b: any) => String(b.larkAppId))),
-        names: new Set<string>(bots.map((b: any) => String(b.name ?? '')).filter(Boolean)),
-      });
-      const teams: SessionsKanbanTeam[] = [];
-      for (const tm of hosted?.teams ?? []) {
-        const { ids, names } = rosterBots(tm.bots ?? []);
-        teams.push({
-          key: `local:${tm.teamId}`,
-          label: tm.isDefault ? t('team.myHostedTeam') : String(tm.name ?? tm.teamId),
-          botIds: ids,
-          botNames: names,
-          groupChats: new Set<string>((tm.groupChatIds ?? []).map((c: any) => String(c))),
-        });
-      }
-      for (const m of remote?.memberships ?? []) {
-        const { ids, names } = rosterBots(m.roster?.bots ?? []);
-        teams.push({
-          key: `${m.hubUrl}::${m.teamId}`,
-          label: String(m.teamName ?? m.teamId ?? m.hubUrl),
-          botIds: ids,
-          botNames: names,
-          groupChats: new Set<string>(),
-        });
-      }
-      setKanbanTeams(teams);
-      setKanbanTeamKey(prev => (teams.length && !teams.some(tm => tm.key === prev)) ? teams[0].key : prev);
-    } finally {
-      setKanbanTeamsLoaded(true);
-      kanbanTeamsLoadingRef.current = false;
-    }
-  }, [kanbanTeamsLoaded]);
-
-  const persistTeamBoardMove = useCallback(async (
-    teamKey: string,
-    sessionId: string,
-    column: SessionKanbanColumn,
-    position: number,
-    prevEntry: { column: string; position: number } | undefined,
-  ): Promise<void> => {
-    try {
-      const isLocal = teamKey.startsWith('local:');
-      const r = isLocal
-        ? await fetch(`/api/team/board/local/${encodeURIComponent(teamKey.slice('local:'.length))}/move`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId, column, position }),
-          })
-        : await fetch('/api/team/remote-board-move', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ key: teamKey, sessionId, column, position }),
-          });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false) {
-        setTeamBoard(prev => {
-          if (!prev.data || prev.key !== teamKey) return prev;
-          const board = { ...prev.data.board };
-          if (prevEntry) board[sessionId] = prevEntry;
-          else delete board[sessionId];
-          return { ...prev, data: { ...prev.data, board } };
-        });
-        if (r.status !== 401) alert(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`);
-      }
-    } catch (e) {
-      setTeamBoard(prev => {
-        if (!prev.data || prev.key !== teamKey) return prev;
-        const board = { ...prev.data.board };
-        if (prevEntry) board[sessionId] = prevEntry;
-        else delete board[sessionId];
-        return { ...prev, data: { ...prev.data, board } };
-      });
-      alert(`${t('sessions.kanban.moveFail')}: ${e}`);
-    }
-  }, []);
-
-  const ensureTeamBoard = useCallback(async (team: { key: string }): Promise<void> => {
-    const fresh = teamBoard.key === team.key && Date.now() - teamBoard.fetchedAt < 30_000;
-    if (teamBoardLoadingRef.current || fresh) return;
-    teamBoardLoadingRef.current = true;
-    try {
-      const isLocal = team.key.startsWith('local:');
-      const u = isLocal
-        ? `/api/team/board/local/${encodeURIComponent(team.key.slice('local:'.length))}`
-        : `/api/team/remote-board?key=${encodeURIComponent(team.key)}`;
-      const r = await fetch(u);
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false) return;
-      const myDeploymentId = typeof body.deploymentId === 'string' ? body.deploymentId : null;
-      const remoteRows: any[] = [];
-      for (const rep of Array.isArray(body.reports) ? body.reports : []) {
-        if (myDeploymentId && rep.deploymentId === myDeploymentId) continue;
-        for (const s of Array.isArray(rep.sessions) ? rep.sessions : []) {
-          remoteRows.push({ ...s, remoteDeployment: rep.deploymentName || rep.deploymentId });
-        }
-      }
-      setTeamBoard({
-        key: team.key,
-        fetchedAt: Date.now(),
-        data: {
-          board: body.board && typeof body.board === 'object' ? body.board : {},
-          remoteRows,
-        },
-      });
-    } finally {
-      teamBoardLoadingRef.current = false;
-    }
-  }, [teamBoard.fetchedAt, teamBoard.key]);
-
-  useEffect(() => {
-    if (viewMode === 'kanban' && kanbanGroupBy === 'team' && !kanbanTeamsLoaded) void loadKanbanTeams();
-  }, [kanbanGroupBy, kanbanTeamsLoaded, loadKanbanTeams, viewMode]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (viewMode === 'kanban' && kanbanGroupBy === 'team') {
-        setTeamBoard(prev => ({ ...prev, fetchedAt: 0 }));
-        refresh();
-      }
-    }, 30_000);
-    return () => window.clearInterval(timer);
-  }, [kanbanGroupBy, refresh, viewMode]);
 
   const persistBoardMove = useCallback(async (
     row: any,
@@ -2869,13 +2124,13 @@ function SessionsPage(): React.JSX.Element {
         row.kanbanColumn = prev.column;
         row.kanbanPosition = prev.position;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       row.kanbanColumn = prev.column;
       row.kanbanPosition = prev.position;
       refresh();
-      alert(`${t('sessions.kanban.moveFail')}: ${e}`);
+      toast(`${t('sessions.kanban.moveFail')}: ${e}`, { kind: 'error' });
     }
   }, [refresh]);
 
@@ -2885,22 +2140,6 @@ function SessionsPage(): React.JSX.Element {
       const sessionId = String(move.row.sessionId);
       if (!sessionId) continue;
       if (move.row.status === 'closed' && move.column !== 'done') continue;
-      if (kanbanGroupBy === 'team') {
-        const team = kanbanTeams.find(tm => tm.key === kanbanTeamKey) ?? kanbanTeams[0];
-        if (!team) continue;
-        // Compute the prior slot from committed state and persist OUTSIDE the updater —
-        // updaters must be pure (a POST inside would double-fire under StrictMode).
-        const priorBoard = (teamBoard.key === team.key && teamBoard.data) ? teamBoard.data.board : {};
-        const previous = priorBoard[sessionId];
-        setTeamBoard(prev => {
-          const base = (prev.key === team.key && prev.data) ? prev.data : { board: {}, remoteRows: prev.data?.remoteRows ?? [] };
-          const board = { ...base.board, [sessionId]: { column: move.column, position: move.position } };
-          return { ...prev, key: team.key, data: { ...base, board } };
-        });
-        void persistTeamBoardMove(team.key, sessionId, move.column, move.position, previous);
-        changed = true;
-        continue;
-      }
       const row = store.sessions.get(sessionId);
       if (!row) continue;
       const prev = { column: row.kanbanColumn, position: row.kanbanPosition };
@@ -2910,7 +2149,7 @@ function SessionsPage(): React.JSX.Element {
       changed = true;
     }
     if (changed) refresh();
-  }, [kanbanGroupBy, kanbanTeamKey, kanbanTeams, teamBoard, persistBoardMove, persistTeamBoardMove, refresh]);
+  }, [persistBoardMove, refresh]);
 
   const persistRename = useCallback(async (row: any, title: string): Promise<void> => {
     const prevTitle = row.title;
@@ -2926,12 +2165,12 @@ function SessionsPage(): React.JSX.Element {
       if (!r.ok || body?.ok === false) {
         row.title = prevTitle;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.kanban.renameFail')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.kanban.renameFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       row.title = prevTitle;
       refresh();
-      alert(`${t('sessions.kanban.renameFail')}: ${e}`);
+      toast(`${t('sessions.kanban.renameFail')}: ${e}`, { kind: 'error' });
     }
   }, [refresh]);
 
@@ -2940,26 +2179,43 @@ function SessionsPage(): React.JSX.Element {
     // do NOT imperatively mutate the button here — the board's locate button renders
     // its icon via dangerouslySetInnerHTML and a textContent write permanently wipes it.
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/locate`, { method: 'POST' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/locate`, { method: 'POST', headers: controlCsrfHeaders() });
       const body = await r.json();
       if (body.ok) return true;
-      alert(`Locate failed: ${body.error ?? r.status}`);
+      toast(`Locate failed: ${body.error ?? r.status}`, { kind: 'error' });
       return false;
     } catch (e) {
-      alert(`Locate error: ${e}`);
+      toast(`Locate error: ${e}`, { kind: 'error' });
       return false;
     }
   }, []);
 
   const closeSession = useCallback(async (row: any, closeBtn?: HTMLButtonElement): Promise<boolean> => {
-    if (!confirm(t('sessions.closeConfirm'))) return false;
+    if (!await confirm({ title: '关闭会话', message: t('sessions.closeConfirm'), danger: true })) return false;
     if (closeBtn) closeBtn.disabled = true;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/close`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) alert(`Close failed: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`Close failed: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
+      }
+      if (body?.archiveError) {
+        const detail = body.archiveError === 'codex_archive_target_unverified'
+          ? t('sessions.codexArchiveTargetUnverified') : body.archiveError === 'codex_archive_target_invalid'
+            ? t('sessions.codexArchiveTargetInvalid') : body.archiveError;
+        toast(t('sessions.codexArchiveFailed', { count: 1, detail }), { kind: 'warning' });
+      }
+      // Closed locally, but a remote session was left running (its control plane
+      // could not be verified). The drawer is about to close, so this is the only
+      // moment the operator can be told.
+      const residual = parseCloseResidual(body);
+      if (residual) {
+        toast(closeResidualIsLocal(residual)
+          ? `⚠️ Closed locally, but a credentialed host subtree could NOT be proven terminated: `
+            + `${describeCloseResidual(residual)}. The remote session WAS cancelled — inspect the local host process.`
+          : `⚠️ Closed locally, but the remote session was NOT cancelled: `
+            + `${describeCloseResidual(residual)} — manual cleanup required.`, { kind: 'warning' });
       }
       setSelected(prev => {
         const next = new Set(prev);
@@ -2969,7 +2225,7 @@ function SessionsPage(): React.JSX.Element {
       refresh();
       return true;
     } catch (e) {
-      alert(`Close error: ${e}`);
+      toast(`Close error: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (closeBtn) closeBtn.disabled = false;
@@ -2992,7 +2248,7 @@ function SessionsPage(): React.JSX.Element {
       if (!r.ok || body?.ok === false) {
         row.locked = prev;
         refresh();
-        if (r.status !== 401) alert(`${t('sessions.lockFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.lockFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       row.locked = !!body.locked;
@@ -3001,7 +2257,7 @@ function SessionsPage(): React.JSX.Element {
     } catch (e) {
       row.locked = prev;
       refresh();
-      alert(`${t('sessions.lockFailed')}: ${e}`);
+      toast(`${t('sessions.lockFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (btn) btn.disabled = false;
@@ -3010,20 +2266,20 @@ function SessionsPage(): React.JSX.Element {
 
   const restartSession = useCallback(async (row: any, restartBtn?: HTMLButtonElement): Promise<boolean> => {
     if (restartCooldownIds.current.has(row.sessionId)) return false;
-    if (!confirm(restartConfirmMessage(row))) return false;
+    if (!await confirm({ title: '重启会话', message: restartConfirmMessage(row), danger: true })) return false;
     if (restartBtn) restartBtn.disabled = true;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) alert(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`);
+        if (r.status !== 401) toast(restartErrorMessage(body, r.status), { kind: 'error' });
         return false;
       }
       restartCooldownIds.current.add(row.sessionId);
       window.setTimeout(() => restartCooldownIds.current.delete(row.sessionId), 5000);
       return true;
     } catch (e) {
-      alert(`${t('sessions.restartFailed')}: ${e}`);
+      toast(`${t('sessions.restartFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (restartBtn) restartBtn.disabled = false;
@@ -3036,12 +2292,12 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/resume`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        alert(`${t('sessions.resumeFailed')}: ${body?.error ?? r.status}`);
+        toast(resumeErrorMessage(body?.error ?? r.status, t), { kind: 'error' });
         return false;
       }
       return true;
     } catch (e) {
-      alert(`${t('sessions.resumeFailed')}: ${e}`);
+      toast(`${t('sessions.resumeFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (button) button.disabled = false;
@@ -3054,12 +2310,12 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/start`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body.ok === false) {
-        if (r.status !== 401) alert(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.create.startFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         return false;
       }
       return true;
     } catch (e) {
-      alert(`${t('sessions.create.startFailed')}: ${e}`);
+      toast(`${t('sessions.create.startFailed')}: ${e}`, { kind: 'error' });
       return false;
     } finally {
       if (button) button.disabled = false;
@@ -3074,8 +2330,25 @@ function SessionsPage(): React.JSX.Element {
         const body = await r.json().catch(() => ({}));
         if (!r.ok || body?.ok === false) {
           const errCode = String(body?.error ?? r.status);
-          const stale = errCode === 'not_found_yet' || errCode === 'not_found';
-          setHistoryState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, loading: false, messages: [], error: errCode, stale } : prev);
+          let staleHint: HistoryState['staleHint'];
+          if ((errCode === 'not_found_yet' || errCode === 'not_found') && row.larkAppId) {
+            try {
+              // `diskVersion` is absent when the server cannot tell what is on
+              // disk (compiled binary): then no stale hint, never an inverted one.
+              const status = await fetch('/api/update/status', { cache: 'no-store' }).then(res => res.json()) as {
+                diskVersion?: string;
+                runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+              };
+              const running = status.runningDaemons?.find(d => d.larkAppId === row.larkAppId)?.version;
+              if (daemonVersionDiffersFromDisk(running, status.diskVersion)) {
+                staleHint = {
+                  running: stripBotmuxVersionPrefix(running!),
+                  disk: stripBotmuxVersionPrefix(status.diskVersion!),
+                };
+              }
+            } catch { /* raw not_found only */ }
+          }
+          setHistoryState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, loading: false, messages: [], error: errCode, staleHint } : prev);
           return;
         }
         const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -3096,17 +2369,26 @@ function SessionsPage(): React.JSX.Element {
     setTermState({ sessionId: row.sessionId, url: readonlyUrl, loading: false });
   }, []);
 
-  const openWritableTerminal = useCallback((row: any, button?: HTMLButtonElement): void => {
-    void openWriteLink(row, button);
-  }, []);
+  // 抽屉主操作「接管终端」：有权限直接开可写终端，否则退到只读终端弹窗。
+  const takeoverSession = useCallback((row: any, button?: HTMLButtonElement): void => {
+    if (shouldOpenWritableTerminal() && row.status !== 'closed') {
+      void openWriteLink(row, button);
+      return;
+    }
+    openTerminalModal(row);
+  }, [openTerminalModal]);
 
   const runBulkClose = useCallback(async (): Promise<void> => {
     const ids = [...selected];
     if (ids.length === 0) return;
-    if (!confirm(t('sessions.closeBulkConfirm', { count: ids.length }))) return;
+    if (!await confirm({ title: '关闭会话', message: t('sessions.closeBulkConfirm', { count: ids.length }), danger: true })) return;
     setBulkCloseProgress({ done: 0, total: ids.length });
     let done = 0;
     let failed = 0;
+    // Counted separately: a residual is NOT a failure (the row closed) but must
+    // never be folded into the silent success total.
+    const residualIds: string[] = [];
+    const archiveErrors: string[] = [];
     const queue = [...ids];
     async function worker() {
       while (queue.length) {
@@ -3114,7 +2396,13 @@ function SessionsPage(): React.JSX.Element {
         try {
           const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/close`, { method: 'POST' });
           const body = await r.json().catch(() => ({}));
-          if (!r.ok || body?.ok === false) failed += 1;
+          if (!r.ok || body?.ok === false) {
+            failed += 1;
+          } else {
+            if (body?.archiveError) archiveErrors.push(String(body.archiveError));
+            const residual = parseCloseResidual(body);
+            if (residual) residualIds.push(describeCloseResidual(residual));
+          }
         } catch {
           failed += 1;
         } finally {
@@ -3127,7 +2415,16 @@ function SessionsPage(): React.JSX.Element {
     setBulkCloseProgress(null);
     setSelected(new Set());
     refresh();
-    if (failed > 0) alert(`Failed: ${failed}/${ids.length}`);
+    if (failed > 0) toast(`Failed: ${failed}/${ids.length}`, { kind: 'error' });
+    if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.join(', ') }), { kind: 'warning' });
+    if (residualIds.length > 0) {
+      // Fires even when nothing failed — otherwise an all-residual batch is
+      // entirely silent and the operator believes everything is gone. Kind-neutral
+      // (a batch can mix a surviving remote session and a local host subtree); each
+      // label already states which.
+      toast(`⚠️ ${residualIds.length}/${ids.length} closed locally but left a residual `
+        + `requiring manual cleanup: ${residualIds.join(', ')}`, { kind: 'warning' });
+    }
   }, [refresh, selected]);
 
   const runBulkLock = useCallback(async (locked: boolean): Promise<void> => {
@@ -3168,7 +2465,7 @@ function SessionsPage(): React.JSX.Element {
     await Promise.all(Array.from({ length: Math.min(6, targetRows.length) }, () => worker()));
     setBulkLockProgress(null);
     refresh();
-    if (failed > 0) alert(`${t('sessions.lockFailed')}: ${failed}/${targetRows.length}`);
+    if (failed > 0) toast(`${t('sessions.lockFailed')}: ${failed}/${targetRows.length}`, { kind: 'error' });
   }, [refresh, rowsById, selected]);
 
   const addSelectedToMonitorRoom = useCallback((): void => {
@@ -3182,7 +2479,8 @@ function SessionsPage(): React.JSX.Element {
   const runIdleCleanup = useCallback(async (hours: IdleCleanupHours): Promise<void> => {
     const nextHours = parseIdleCleanupHours(hours);
     if (!nextHours) return;
-    const candidates = idleCleanupCandidatesFor(nextHours);
+    const groups = idleCleanupCandidatesFor(nextHours);
+    const candidates = [...groups.idle, ...groups.dormant];
     if (candidates.length === 0) return;
     setIdleCleanupHours(nextHours);
     setIdleCleanupBusy(true);
@@ -3195,7 +2493,7 @@ function SessionsPage(): React.JSX.Element {
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) {
-        if (r.status !== 401) alert(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`);
+        if (r.status !== 401) toast(`${t('sessions.idleCleanupFailed')}: ${body?.error ?? r.status}`, { kind: 'error' });
         setIdleCleanupStatus('');
         return;
       }
@@ -3210,9 +2508,24 @@ function SessionsPage(): React.JSX.Element {
         closed: Number(body?.closed ?? 0),
         failed: Number(body?.failed ?? 0),
       }));
+      const archiveErrors = (body?.results ?? []).filter((item: any) => item?.archiveError);
+      if (archiveErrors.length) toast(t('sessions.codexArchiveFailed', { count: archiveErrors.length, detail: archiveErrors.map((item: any) => item.archiveError === 'codex_archive_target_unverified'
+        ? t('sessions.codexArchiveTargetUnverified') : item.archiveError === 'codex_archive_target_invalid'
+          ? t('sessions.codexArchiveTargetInvalid') : item.archiveError).join(', ') }), { kind: 'warning' });
+      const idleResiduals = (body?.results ?? [])
+        .filter((item: any) => item?.ok && item?.residual)
+        .map((item: any) => describeCloseResidual(item.residual));
+      if (idleResiduals.length > 0) {
+        // "closed N, failed 0" would otherwise state that everything is gone,
+        // while some rows left a residual (a remote session still running, or a
+        // local host subtree not proven terminated) needing manual cleanup.
+        // Kind-neutral: a batch can mix both, and each label already says which.
+        toast(`⚠️ ${idleResiduals.length} session(s) closed locally but left a residual `
+          + `requiring manual cleanup: ${idleResiduals.join(', ')}`, { kind: 'warning' });
+      }
       refresh();
     } catch (e) {
-      alert(`${t('sessions.idleCleanupFailed')}: ${e}`);
+      toast(`${t('sessions.idleCleanupFailed')}: ${e}`, { kind: 'error' });
       setIdleCleanupStatus('');
     } finally {
       setIdleCleanupBusy(false);
@@ -3220,60 +2533,100 @@ function SessionsPage(): React.JSX.Element {
   }, [idleCleanupCandidatesFor, refresh]);
 
   const setView = (nextRaw: string | undefined): void => {
-    const next = normalizeSessionsViewMode(nextRaw) ?? 'board';
+    const next = normalizeSessionsViewMode(nextRaw) ?? 'kanban';
     if (next === viewMode) return;
     setViewMode(next);
     writeStoredSessionsViewMode(windowStorage(), next);
-  };
-  const moveColumn = (id: string, delta: number): void => {
-    setBoardOrder(prev => {
-      const from = prev.indexOf(id);
-      const to = from + delta;
-      if (from < 0 || to < 0 || to >= prev.length) return prev;
-      const next = [...prev];
-      next.splice(from, 1);
-      next.splice(to, 0, id);
-      writeStoredBoardOrder(windowStorage(), next);
-      return next;
+    // 看板下「全部（含已关闭）」没有对应选项，切过去时归一化，避免状态芯片悬空。
+    setFilters(prev => {
+      const status = normalizeStatusFilterForView(prev.status, next === 'kanban');
+      return status === prev.status ? prev : { ...prev, status };
     });
   };
-  const moveColumnTo = (id: string, targetId: string): void => {
-    if (id === targetId) return;
-    setBoardOrder(prev => {
-      const from = prev.indexOf(id);
-      const to = prev.indexOf(targetId);
-      if (from < 0 || to < 0) return prev;
-      const next = [...prev];
-      next.splice(from, 1);
-      next.splice(to, 0, id);
-      writeStoredBoardOrder(windowStorage(), next);
-      return next;
-    });
-  };
+  // 表格表头排序与筛选条排序下拉共用同一套 state 切换逻辑。
+  const handleSort = useCallback((key: string) => {
+    if (sortKey === key) setSortDir(dir => (dir === 'asc' ? 'desc' : 'asc'));
+    else {
+      setSortKey(key);
+      setSortDir(key === 'spawnedAt' || key === 'lastMessageAt' ? 'desc' : 'asc');
+    }
+  }, [sortKey]);
+  const showDormantInTable = useCallback(() => {
+    setFilters(prev => ({ ...prev, status: 'dormant' }));
+    setViewMode('table');
+    writeStoredSessionsViewMode(windowStorage(), 'table');
+  }, []);
+  const tableOnShowMore = useCallback(() => setTableLimit(limit => limit + TABLE_PAGE_SIZE), []);
 
-  const kanbanState = useMemo(() => ({
-    rows,
-    groupBy: kanbanGroupBy,
-    teams: kanbanTeams,
-    teamsLoaded: kanbanTeamsLoaded,
-    teamKey: kanbanTeamKey,
-    teamBoardData: teamBoard.data,
-    teamBoardKey: teamBoard.key,
-  }), [kanbanGroupBy, kanbanTeamKey, kanbanTeams, kanbanTeamsLoaded, rows, teamBoard.data, teamBoard.key]);
+  // 看板回调必须是稳定引用。以前这十个回调都是 <SessionsKanbanView> 上的内联箭头，
+  // 于是每次页面渲染（含每条 SSE）都生成一整套新函数 → 看板内部 props/display 换新
+  // 引用 → 每张卡片的 memo 全部失效。底层 helper 本身早就是 useCallback 了，这里只是
+  // 把「取 store 里的会话再转调」那层薄包装也固定下来。
+  const kanbanOnClose = useCallback((row: any, button?: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void closeSession(s, button);
+  }, [closeSession]);
+  const kanbanOnDetails = useCallback((row: any) => setDrawerSessionId(String(row.sessionId)), []);
+  const kanbanOnRename = useCallback((row: any, title: string) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void persistRename(s, title);
+  }, [persistRename]);
+  const kanbanOnRestart = useCallback((row: any, button: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void restartSession(s, button);
+  }, [restartSession]);
+  const kanbanOnToggleLock = useCallback((row: any, button: HTMLButtonElement) => {
+    const s = store.sessions.get(String(row.sessionId));
+    if (s) void setSessionLocked(s, !s.locked, button);
+  }, [setSessionLocked]);
+  const kanbanOnToggleSelect = useCallback((row: any) => setSelected(prev => {
+    const id = String(row.sessionId);
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  }), []);
+  // 表格的回调同样必须是稳定引用。它们过去都是 JSX 上的内联箭头，于是每次页面
+  // 渲染（含每条 SSE session.update、以及「打开/关闭详情」这种只改抽屉状态的操作）
+  // 都换一套新函数 → 视图 memo 全部失效 → 数千行整体重排。
+  const listOnOpen = useCallback((row: any) => setDrawerSessionId(String(row.sessionId)), []);
+  const listOnSelect = useCallback((id: string, checked: boolean) => setSelected(prev => {
+    const next = new Set(prev);
+    if (checked) next.add(id); else next.delete(id);
+    return next;
+  }), []);
+  const tableOnSelectAll = useCallback((checked: boolean) => setSelected(prev => {
+    const next = new Set(prev);
+    for (const row of selectableRows) {
+      if (checked) next.add(row.sessionId);
+      else next.delete(row.sessionId);
+    }
+    return next;
+  }), [selectableRows]);
+  const tableOnResetColumns = useCallback(() => {
+    setHiddenColumns(new Set());
+    writeStoredHiddenTableColumns(windowStorage(), []);
+  }, []);
+  const tableOnToggleColumn = useCallback((colId: string) => {
+    const willHide = !hiddenColumns.has(colId);
+    const next = new Set(hiddenColumns);
+    if (willHide) next.add(colId);
+    else next.delete(colId);
+    // 落盘放在 updater 外：updater 必须是纯函数（StrictMode 下会跑两次）。
+    writeStoredHiddenTableColumns(windowStorage(), Array.from(next));
+    setHiddenColumns(next);
+    // 如果当前排序列被隐藏，回退到默认 lastMessageAt desc
+    if (willHide && colId === sortKey) {
+      setSortKey('lastMessageAt');
+      setSortDir('desc');
+    }
+  }, [hiddenColumns, sortKey]);
+
+  // 看板卡片只有一个「终端」入口，和详情抽屉的「接管终端」同一套判定：有操作权限
+  // （已登录）且会话没关就开可操作终端，否则（公开只读的访客）退回只读终端。
+  // 开关来自 dashboard 配置，值在一次会话内不变，但函数引用必须固定。
+  const kanbanOnOpenTerminal = dashboardShellAllowsWebTerminal() ? takeoverSession : undefined;
 
   const drawerRow = drawerSessionId ? rowsById.get(drawerSessionId) ?? null : null;
-  const kanbanTeamOptions = useMemo(() => {
-    if (!kanbanTeamsLoaded) return [{ value: '__loading', label: t('sessions.kanban.teamLoading') }];
-    if (!kanbanTeams.length) return [{ value: '', label: t('sessions.kanban.noTeam') }];
-    return kanbanTeams.map(team => ({ value: team.key, label: team.label }));
-  }, [kanbanTeams, kanbanTeamsLoaded]);
-  const kanbanTeamDisabled = !kanbanTeamsLoaded || kanbanTeams.length === 0;
-  const kanbanTeamValue = kanbanTeams.some(team => team.key === kanbanTeamKey)
-    ? kanbanTeamKey
-    : (kanbanTeamOptions[0]?.value ?? '');
-  const kanbanTeamLabel = kanbanTeamOptions.find(option => option.value === kanbanTeamValue)?.label
-    ?? t('sessions.kanban.groupTeam');
-
   const closeCreateSession = useCallback(() => {
     createRequestRef.current += 1;
     setCreateLoading(false);
@@ -3291,34 +2644,6 @@ function SessionsPage(): React.JSX.Element {
       setCreateState({ bots });
     } finally {
       if (createRequestRef.current === requestId) setCreateLoading(false);
-    }
-  }, []);
-
-  // 调试终端：起一个 owner-only 裸 bash（不绑飞书话题），在新标签打开 xterm 页面。
-  // 让用户把「复制复现命令」拿到的命令粘进去改参数复现问题，用完关闭即回收。
-  const openDebugTerminal = useCallback(async (): Promise<void> => {
-    const input = window.prompt(t('sessions.debugTerminalPrompt'), '');
-    if (input === null) return; // 用户取消
-    const workingDir = input.trim();
-    const tab = window.open('about:blank', '_blank');
-    if (tab) tab.opener = null;
-    try {
-      const r = await fetch('/api/debug-terminal', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(workingDir ? { workingDir } : {}),
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok || body?.ok === false || !body?.url) {
-        tab?.close();
-        if (r.status !== 401) alert(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`);
-        return;
-      }
-      if (tab) tab.location.href = body.url;
-      else window.open(body.url, '_blank', 'noopener');
-    } catch (e) {
-      tab?.close();
-      alert(`${t('sessions.debugTerminalFail')}: ${e}`);
     }
   }, []);
 
@@ -3343,8 +2668,6 @@ function SessionsPage(): React.JSX.Element {
             <div className="segmented sessions-view-toggle" role="group" aria-label={t('sessions.viewMode')}>
               {([
                 ['kanban', t('sessions.viewKanban')],
-                ['board', t('sessions.viewBoard')],
-                ['topics', t('sessions.viewTopics')],
                 ['table', t('sessions.viewTable')],
               ] as const).map(([value, label]) => (
                 <button
@@ -3359,67 +2682,12 @@ function SessionsPage(): React.JSX.Element {
                 </button>
               ))}
             </div>
-            <div
-              className={`segmented kanban-groupby${viewMode === 'kanban' ? ' is-visible' : ' is-collapsed'}`}
-              id="kanban-groupby"
-              role="group"
-              aria-label={t('sessions.kanban.groupBy')}
-              aria-hidden={viewMode !== 'kanban'}
-            >
-              {([
-                ['flow', t('sessions.kanban.groupFlow')],
-                ['team', t('sessions.kanban.groupTeam')],
-                ['bot', t('sessions.kanban.groupBot')],
-              ] as const).map(([value, label]) => (
-                <button
-                  key={value}
-                  type="button"
-                  data-groupby={value}
-                  className={kanbanGroupBy === value ? 'active' : undefined}
-                  aria-pressed={kanbanGroupBy === value}
-                  onClick={() => {
-                    setKanbanGroupBy(value);
-                    writeStoredKanbanGroupBy(windowStorage(), value);
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <span id="kanban-team-stats" className="kanban-team-stats" hidden={!(viewMode === 'kanban' && kanbanGroupBy === 'team' && kanbanTeamsLoaded)}>
-              {teamScopeText}
-            </span>
-            <DropdownMenu
-              id="kanban-team"
-              className="kanban-team-menu"
-              ariaLabel={t('sessions.kanban.groupTeam')}
-              hidden={!(viewMode === 'kanban' && kanbanGroupBy === 'team')}
-              disabled={kanbanTeamDisabled}
-              label={kanbanTeamLabel}
-              value={kanbanTeamValue}
-              options={kanbanTeamOptions}
-              onChange={next => {
-                if (!kanbanTeams.some(team => team.key === next)) return;
-                setKanbanTeamKey(next);
-                try { window.localStorage.setItem(KANBAN_TEAM_STORAGE_KEY, next); } catch { /* current page only */ }
-              }}
-            />
           </div>
         </div>
         <div className="page-heading-actions sessions-page-actions">
           {dashboardShellAllowsWebTerminal() ? (
             <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
               {t('sessions.monitorRoom')}
-            </button>
-          ) : null}
-          {ui.authed ? (
-            <button
-              type="button"
-              className="debug-terminal-btn"
-              title={t('sessions.debugTerminalHint')}
-              onClick={() => void openDebugTerminal()}
-            >
-              {t('sessions.debugTerminal')}
             </button>
           ) : null}
           {ui.authed ? (
@@ -3441,14 +2709,19 @@ function SessionsPage(): React.JSX.Element {
       </div>
 
       <SessionsFilters
+        botOptions={botOptions}
         chatOptions={chatOptions}
         filters={filters}
+        viewMode={viewMode}
         setFilters={setFilters}
         idleCleanup={{
           busy: idleCleanupBusy,
           hours: idleCleanupHours,
           status: idleCleanupStatus,
-          countForHours: hours => idleCleanupCandidatesFor(hours).length,
+          countForHours: (hours) => {
+            const groups = idleCleanupCandidatesFor(hours);
+            return { idle: groups.idle.length, dormant: groups.dormant.length };
+          },
           onRun: runIdleCleanup,
         }}
       />
@@ -3465,159 +2738,81 @@ function SessionsPage(): React.JSX.Element {
         onLock={locked => void runBulkLock(locked)}
       />
 
+      <div className={viewMode === 'table' ? 'sessions-table-scroll-host' : 'sessions-scroll-host-contents'}>
       <div
-        key={viewStageAnimKey}
-        className={`sessions-view-stage${viewStageAnimKey > 0 ? ' sessions-view-stage-enter' : ''}`}
+        ref={viewStageRef}
+        className="sessions-view-stage"
         data-view={viewMode}
-        data-kanban-group={kanbanGroupBy}
+        data-local-horizontal-scrollbar={bootstrapped && viewMode === 'table' ? '' : undefined}
       >
+        {!bootstrapped ? <SessionsSkeleton /> : null}
+        {bootstrapped && viewMode === 'table' ? (
         <SessionsTable
           rows={rows}
+          limit={tableLimit}
+          onShowMore={tableOnShowMore}
           selected={selected}
-          hidden={viewMode !== 'table'}
+          hidden={false}
           sortKey={sortKey}
           sortDir={sortDir}
           selectAllChecked={selectAllChecked}
           selectAllIndeterminate={selectAllIndeterminate}
           selectAllDisabled={selectableRows.length === 0}
           hiddenColumns={hiddenColumns}
-          onToggleColumn={(colId) => {
-            const willHide = !hiddenColumns.has(colId);
-            const next = new Set(hiddenColumns);
-            if (willHide) next.add(colId);
-            else next.delete(colId);
-            writeStoredHiddenTableColumns(windowStorage(), Array.from(next));
-            setHiddenColumns(next);
-            // 如果当前排序列被隐藏，回退到默认 lastMessageAt desc
-            if (willHide && colId === sortKey) {
-              setSortKey('lastMessageAt');
-              setSortDir('desc');
-            }
-          }}
-          onResetColumns={() => {
-            setHiddenColumns(new Set());
-            writeStoredHiddenTableColumns(windowStorage(), []);
-          }}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
-          onSelect={(id, checked) => setSelected(prev => {
-            const next = new Set(prev);
-            if (checked) next.add(id);
-            else next.delete(id);
-            return next;
-          })}
-          onSelectAll={checked => setSelected(prev => {
-            const next = new Set(prev);
-            for (const row of selectableRows) {
-              if (checked) next.add(row.sessionId);
-              else next.delete(row.sessionId);
-            }
-            return next;
-          })}
-          onSort={(key) => {
-            if (sortKey === key) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
-            else {
-              setSortKey(key);
-              setSortDir(key === 'spawnedAt' || key === 'lastMessageAt' ? 'desc' : 'asc');
-            }
-          }}
+          onToggleColumn={tableOnToggleColumn}
+          onResetColumns={tableOnResetColumns}
+          onOpen={listOnOpen}
+          onSelect={listOnSelect}
+          onSelectAll={tableOnSelectAll}
+          onSort={handleSort}
         />
+        ) : null}
 
-        <BoardView
-          rows={boardRows}
-          selected={selected}
-          hidden={viewMode !== 'board'}
-          order={boardOrder}
-          animated={boardAnimated}
-          dragColId={dragColId}
-          dragOverCol={dragOverCol}
-          onAnimated={() => setBoardAnimated(true)}
-          onMoveColumn={moveColumn}
-          onMoveColumnTo={moveColumnTo}
-          onDragCol={setDragColId}
-          onDragOverCol={setDragOverCol}
-          onToggleSelect={row => setSelected(prev => {
-            const next = new Set(prev);
-            if (next.has(row.sessionId)) next.delete(row.sessionId);
-            else next.add(row.sessionId);
-            return next;
-          })}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
-          onHistory={openHistoryModal}
-          onLocate={row => locateSession(row)}
-          onRestart={(row, button) => void restartSession(row, button)}
-          onLock={(row, locked, button) => void setSessionLocked(row, locked, button)}
-          onClose={(row, button) => void closeSession(row, button)}
-        />
-
-        <TopicGroupsView
-          rows={rows}
-          relationRows={storeRows}
-          selected={selected}
-          hidden={viewMode !== 'topics'}
-          onToggleSelect={row => setSelected(prev => {
-            const next = new Set(prev);
-            if (next.has(row.sessionId)) next.delete(row.sessionId);
-            else next.add(row.sessionId);
-            return next;
-          })}
-          onOpen={row => setDrawerSessionId(row.sessionId)}
-          onHistory={openHistoryModal}
-          onLocate={row => locateSession(row)}
-          onRestart={(row, button) => void restartSession(row, button)}
-          onLock={(row, locked, button) => void setSessionLocked(row, locked, button)}
-          onClose={(row, button) => void closeSession(row, button)}
-        />
-
+        {bootstrapped && viewMode === 'kanban' ? (
         <div
           id="sessions-kanban"
           ref={setKanbanHost}
-          className={`sessions-kanban${kanbanGroupBy === 'bot' ? ' kanban-mode-bot' : ''}`}
-          hidden={viewMode !== 'kanban'}
+          className="sessions-kanban"
         >
-          {viewMode === 'kanban' ? (
-            <SessionsKanbanView
-              host={kanbanHost}
-              {...kanbanState}
-              canRestartSession={canRestartSession}
-              getTeamChatIds={teamChatIdsFor}
-              icons={{
-                details: ICON.details,
-                feishu: ICON.feishu,
-                history: ICON.history,
-                key: ICON.key,
-                lock: ICON.lock,
-                restart: ICON.restart,
-                terminal: ICON.terminal,
-                unlock: ICON.unlock,
-              }}
-              lockActionLabel={lockActionLabel}
-              sessionStatusText={sessionStatusText}
-              onDetails={row => setDrawerSessionId(String(row.sessionId))}
-              onHistory={openHistoryModal}
-              onMoveRows={handleKanbanMoves}
-              onNeedTeamBoard={team => { void ensureTeamBoard(team); }}
-              onNeedTeams={() => { void loadKanbanTeams(); }}
-              onOpenTerminal={dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined}
-              onOpenWritableTerminal={dashboardShellAllowsWebTerminal() && shouldOpenWritableTerminal() ? openWritableTerminal : undefined}
-              onRename={(row, title) => { const s = store.sessions.get(String(row.sessionId)); if (s) void persistRename(s, title); }}
-              onRestart={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void restartSession(s, button); }}
-              onTeamScope={scope => setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '')}
-              onToggleLock={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void setSessionLocked(s, !s.locked, button); }}
-              onToggleSelect={row => setSelected(prev => {
-                const id = String(row.sessionId);
-                const next = new Set(prev);
-                if (next.has(id)) next.delete(id); else next.add(id);
-                return next;
-              })}
-              selectedSessionIds={selected}
-            />
-          ) : null}
+          <SessionsKanbanView
+            host={kanbanHost}
+            rows={kanbanRows}
+            canRestartSession={canRestartSession}
+            icons={KANBAN_ICONS}
+            lockActionLabel={lockActionLabel}
+            sessionStatusText={sessionStatusText}
+            onClose={kanbanOnClose}
+            onDetails={kanbanOnDetails}
+            onHistory={openHistoryModal}
+            onMoveRows={handleKanbanMoves}
+            onOpenTerminal={kanbanOnOpenTerminal}
+            onRename={kanbanOnRename}
+            onRestart={kanbanOnRestart}
+            onToggleLock={kanbanOnToggleLock}
+            onToggleSelect={kanbanOnToggleSelect}
+            selectedSessionIds={selected}
+            namesVersion={revision}
+          />
         </div>
+        ) : null}
       </div>
+      {bootstrapped && viewMode === 'table' ? <SessionHorizontalScrollbar scrollRef={viewStageRef} /> : null}
+      </div>
+      {bootstrapped && viewMode === 'kanban' && dormantOffBoard > 0 ? (
+        <p className="sessions-dormant-hint">
+          {t('sessions.kanban.dormantOffBoard', { count: dormantOffBoard })}
+          <button type="button" onClick={showDormantInTable}>
+            {t('sessions.kanban.dormantShowInTable')}
+          </button>
+        </p>
+      ) : null}
 
       <Drawer
         row={drawerRow}
-        onClose={() => setDrawerSessionId(null)}
+        onClose={() => {
+          setDrawerSessionId(null);
+          clearHashQueryParam('session');
+        }}
         locateSession={locateSession}
         openHistory={openHistoryModal}
         resumeSession={resumeSession}
@@ -3625,6 +2820,7 @@ function SessionsPage(): React.JSX.Element {
         closeSession={closeSession}
         setSessionLocked={setSessionLocked}
         startSession={startSession}
+        onTakeover={takeoverSession}
       />
       <TerminalModal state={termState} onClose={() => setTermState(null)} onRename={persistRename} />
       <HistoryModal state={historyState} onClose={() => setHistoryState(null)} />

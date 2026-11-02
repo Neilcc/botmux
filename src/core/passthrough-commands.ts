@@ -10,7 +10,8 @@
  * chat) rather than relayed to the CLI. Used both for routing and to reject
  * `customPassthroughCommands` entries that would shadow a daemon command.
  */
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth', '/issue']);
+import { DAEMON_COMMANDS } from './command-schema.js';
+export { DAEMON_COMMANDS };
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -30,8 +31,9 @@ export const PASSTHROUGH_COMMANDS = new Set([
   // 推理强度调档。放全局（而非某个 adapter 的 defaultPassthroughCommands）是刻意的：
   //   ① 这里的命令本就是「尽力透传」——/plugin /mcp /btw 也并非所有 CLI 都支持，
   //      CLI 认得就生效、认不得顶多回一句 unknown-command（不崩溃 / 不损坏 / 不泄露）。
-  //      Claude Code(2.1.220+) / Seed / Relay 原生支持 /effort，Codex 亦有 reasoning
-  //      effort；未来别的 CLI 补上后零改动自动生效，无需再逐个 adapter 加。
+  //      Claude Code(2.1.220+) / Seed / Relay 原生支持 /effort。Codex 的 effort
+  //      通过 model_reasoning_effort / 原生模型菜单设置，不依赖此命令；误透传只会
+  //      得到 unknown-command，不会改写 Codex 配置。
   //   ② 全局集合刻意不带「空 topic 冷启动」能力（那只认 adapter 层的
   //      defaultPassthroughCommands，见 isInitialSessionPassthrough）——/effort 是
   //      「调档」而非「开一段工作」的命令，空话题里单发 /effort 不应凭空拉起会话。
@@ -64,37 +66,121 @@ export const PASSTHROUGH_COMMANDS = new Set([
  */
 export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
 
+/** Runner adapters speak a framed stdin protocol, not an interactive TUI; ebsd
+ * requires every user message to pass through its service-user envelope and
+ * structured turn ledger. Raw passthrough (a literal `/compact\n` written to the
+ * PTY) bypasses that framing entirely: dsh's runner logs `ignoring non-frame
+ * input` and drops it, while mira/mir enqueue the line as an ordinary USER
+ * MESSAGE and burn a turn asking the model about it.
+ *
+ * ⚠️ This set lives in this dependency-free leaf — not in command-handler — so
+ * the Lark card builder can gate its own `/compact` affordance on the SAME
+ * predicate the router uses. Importing command-handler from card-builder would
+ * cycle (command-handler imports card-builder). The `remote-cli-ids.ts` header
+ * documents what happens when a card open-codes a single id instead: adding mojo
+ * left 11 PTY quick-action buttons that silently did nothing. Any gate deciding
+ * "can this CLI receive typed input" must call the predicate below, never
+ * hand-write a member of this set. */
+const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd', 'minimax']);
+
+/**
+ * True for a CLI with no raw-passthrough surface (see
+ * {@link NO_RAW_PASSTHROUGH_CLI_IDS}).
+ *
+ * `dsh` is RUNTIME-DEPENDENT: a bot with `dshRuntime: 'tui'` runs the PTY-driven
+ * `dsh-tui` adapter — a genuine interactive TUI (same interaction model as
+ * claude-code) that DOES accept a raw `/compact`. That resolution happens inside
+ * the worker (`worker.ts`'s `cfg.cliId === 'dsh' && cfg.dshRuntime === 'tui'`),
+ * so daemon/card-side callers only ever see the bare `'dsh'` and must pass the
+ * runtime to get the right answer.
+ *
+ * `dshRuntime` is read from the LIVE bot config, never from
+ * `SessionCliLaunchSnapshotV1` — that snapshot has no such field, and the worker
+ * likewise pairs a frozen `cliId` with the live `dshRuntime`. Reading bot config
+ * therefore matches what actually spawns.
+ *
+ * Omitting `opts` is deliberately FAIL-CLOSED: bare `'dsh'` resolves to the
+ * headless JSON-RPC runner and returns true (no raw surface). Refusing a
+ * passthrough is recoverable; feeding one to a runner wedges the session or
+ * burns a turn.
+ */
+export function cliHasNoRawPassthroughSurface(
+  cliId: string | undefined,
+  opts?: { dshRuntime?: 'official' | 'tui' },
+): boolean {
+  if (!cliId) return false;
+  if (cliId === 'dsh' && opts?.dshRuntime === 'tui') return false;
+  return NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
+}
+
 /**
  * Normalize a single custom passthrough command: lowercase, must match the
  * slash-command shape, and must not shadow a daemon command (passthrough is
  * checked BEFORE DAEMON_COMMANDS in the router). Returns null for anything that
  * doesn't qualify. Does NOT prepend the leading `/` — callers that accept bare
  * user input should add it first (see {@link parseCustomPassthroughInput}).
+ *
+ * Internal whitespace joins with `-`: CLI slash commands are single tokens
+ * (`/ultra-goal`) while users naturally type the name with a space
+ * (`/Ultra Goal`). Collapsing before the shape test keeps the grant gate and
+ * router seeing only one well-formed token.
  */
 export function normalizePassthroughCommand(cmd: unknown): string | null {
   if (typeof cmd !== 'string') return null;
-  const normalized = cmd.trim().toLowerCase();
+  const normalized = cmd.trim().toLowerCase().replace(/\s+/g, '-');
   if (!SLASH_COMMAND_SHAPE.test(normalized)) return null;
   if (DAEMON_COMMANDS.has(normalized)) return null;
   return normalized;
 }
 
 /**
- * Parse free-text dashboard / `/botconfig` input (comma, space or newline
- * separated) into a normalized, deduped custom passthrough command list. The
- * leading `/` is optional per token (so users can type `goal export` or
- * `/goal, /export`); illegal and daemon-shadowing tokens are dropped. Mirrors
- * the normalization {@link ../bot-registry.js}'s parseBotConfigsFromText applies
- * when loading bots.json, so a round-trip through the card is stable.
+ * Parse free-text dashboard / `/botconfig` input into a normalized, deduped
+ * custom passthrough command list. Separators are comma/newline, plus a space
+ * whose next token starts with `/` (`/goal /export`). A space before a bare
+ * word is NOT a separator — the word belongs to the command name and joins
+ * with `-` ({@link normalizePassthroughCommand}), so `/Ultra Goal` parses as
+ * one command `/ultra-goal` instead of `/ultra` + `/goal`. The leading `/` is
+ * optional per entry; illegal and daemon-shadowing entries are dropped.
+ * Mirrors the normalization {@link ../bot-registry.js}'s
+ * parseBotConfigsFromText applies when loading bots.json, so a round-trip
+ * through the card is stable.
+ *
+ * A greedy entry can glue neighboring words onto punctuation that is not a
+ * separator (`/goal ; /export` → token `/goal ;`). When the whole entry fails
+ * normalization, it is retried word-by-word on whitespace — but only when its
+ * first word is itself a valid command. That guard keeps malformed leaders
+ * (`/ Ultra Goal`, whose joined shape starts with `-`) dropped as a whole,
+ * while legal commands glued onto trailing punctuation (`/goal (note)`) are
+ * rescued. A spaced name that normalizes fine (`/Ultra Goal`) never reaches
+ * the fallback, so mixed input like `/Ultra Goal /bad (note)` keeps both
+ * entries.
  */
 export function parseCustomPassthroughInput(raw: string): string[] {
   const out: string[] = [];
-  for (const tok of String(raw ?? '').split(/[\s,]+/)) {
-    const trimmed = tok.trim();
-    if (!trimmed) continue;
-    const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
-    const norm = normalizePassthroughCommand(withSlash);
-    if (norm) out.push(norm);
+  const normalize = (token: string) =>
+    normalizePassthroughCommand(token.startsWith('/') ? token : `/${token}`);
+  const add = (token: string) => {
+    const norm = normalize(token);
+    if (norm) {
+      out.push(norm);
+      return;
+    }
+    const parts = token.split(/\s+/).filter(Boolean);
+    const first = parts.length ? normalize(parts[0]) : null;
+    if (!first) return;
+    out.push(first);
+    for (const part of parts.slice(1)) {
+      const fallback = normalize(part);
+      if (fallback) out.push(fallback);
+    }
+  };
+  for (const segment of String(raw ?? '').split(/[,\r\n]+/)) {
+    // 一个 entry = 首个 token（带不带 `/` 都行）+ 后续「空白后不是 `/`」的词；
+    // 空白后的下一个 `/` 另起一条（`/goal /export`）。
+    for (const tok of segment.match(/\/?\S+(?:[^\S\r\n]+(?!\/)\S+)*/g) ?? []) {
+      const trimmed = tok.trim();
+      if (trimmed) add(trimmed);
+    }
   }
   return [...new Set(out)];
 }

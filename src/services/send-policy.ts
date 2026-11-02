@@ -35,6 +35,94 @@ export function resolveQuoteTarget(args: QuoteTargetArgs): string | null {
   return target && target.trim() ? target.trim() : null;
 }
 
+export interface ExplicitRecipientReplyArgs {
+  /** --quote is intentional routing and must always win. */
+  explicitQuote?: string;
+  /** Resolved real @ recipients for this outbound message. */
+  mentionOpenIds: Iterable<string>;
+  /** Sender of the inbound message this turn is replying to, when known. */
+  replyTargetSenderOpenId?: string;
+}
+
+/**
+ * An explicit recipient selection replaces the implicit reply addressee.
+ *
+ * This keeps a handoff or user-directed result from also notifying the bot (or
+ * human) that happened to trigger the turn. Explicitly mentioning that sender,
+ * or explicitly choosing --quote, preserves the reply relationship.
+ */
+export function shouldSuppressImplicitReplyTarget(args: ExplicitRecipientReplyArgs): boolean {
+  if (args.explicitQuote?.trim()) return false;
+  const recipients = new Set([...args.mentionOpenIds].filter(Boolean));
+  if (recipients.size === 0) return false;
+  return !args.replyTargetSenderOpenId || !recipients.has(args.replyTargetSenderOpenId);
+}
+
+export interface MentionableChatMember {
+  openId: string;
+  name?: string;
+}
+
+/** Resolve only an exact, unique display-name match inside the target chat. */
+export function matchUniqueChatMemberOpenId(
+  displayName: string,
+  members: Iterable<MentionableChatMember>,
+): string | undefined {
+  const wanted = displayName.trim();
+  if (!wanted) return undefined;
+  const matches = [...members].filter(member => member.name?.trim() === wanted);
+  return matches.length === 1 ? matches[0].openId : undefined;
+}
+
+export interface AfterTheFactTopicQuoteArgs {
+  /** The message id this send would quote (null ⇒ nothing to decide). */
+  quoteTargetId: string | null;
+  /**
+   * The frozen per-turn record's `inThread` for the turn that produced
+   * `quoteTargetId`: did the inbound message arrive from INSIDE a topic?
+   * `undefined` = unknown (pre-`inThread` session row).
+   */
+  quotedTurnInThread?: boolean;
+  /**
+   * `thread_id` the quote target carries RIGHT NOW, freshly probed from Lark.
+   * `null` = confirmed no topic. `undefined` = probe failed / not attempted.
+   */
+  currentThreadId?: string | null;
+  /** An explicit `--quote <id>` is the operator's own choice; never override it. */
+  explicitQuote?: string;
+}
+
+/**
+ * Whether a chat-scope send must DROP its quote and post flat instead.
+ *
+ * Lark's reply API makes a reply inherit the **current** topic membership of the
+ * message it quotes — `reply_in_thread: false` only declines to OPEN a new
+ * topic, it cannot escape an existing one. So when the user @s the bot at group
+ * top level and only AFTERWARDS opens a 话题 on that very message, quoting it
+ * drops the answer into a topic the user never @'d the bot in (the same
+ * user-reported bug the regular-group fold fixes on the dispatcher side — this
+ * is its `botmux send` half, which owns the visible prose reply).
+ *
+ * Requires BOTH halves, so it can only ever fire on the exact reported case:
+ *   • the quoted turn arrived at top level (`inThread === false`), and
+ *   • that message NOW carries a `thread_id` — i.e. the topic appeared later.
+ *
+ * Fails toward the pre-existing behavior (keep quoting) whenever either half is
+ * unknown: an old session row has no `inThread`, and a failed/skipped probe
+ * leaves `currentThreadId` undefined. Quoting is the long-standing default, so
+ * uncertainty must never silently change where every normal reply lands.
+ */
+export function shouldDropAfterTheFactTopicQuote(args: AfterTheFactTopicQuoteArgs): boolean {
+  if (!args.quoteTargetId) return false;
+  // `--quote <id>` is an explicit operator instruction; honor it verbatim.
+  if (args.explicitQuote) return false;
+  // Only a turn PROVEN to have arrived at top level can be a victim here.
+  // `undefined` (legacy row) must keep the old behavior, never guess.
+  if (args.quotedTurnInThread !== false) return false;
+  // The topic must actually exist now. `undefined` = we don't know ⇒ keep quoting.
+  return typeof args.currentThreadId === 'string' && args.currentThreadId.trim().length > 0;
+}
+
 export interface ManagedVcQuoteArgs {
   managed: boolean;
   durableDelivery: boolean;
@@ -69,6 +157,7 @@ export interface ManagedVcSendControlArgs {
   overrideChatId?: string;
   sendInto?: string;
   attentionRequested: boolean;
+  urgentRequested?: boolean;
   explicitMentionCount: number;
   mentionBack: boolean;
   noMention: boolean;
@@ -84,6 +173,9 @@ export function managedVcSendControlError(args: ManagedVcSendControlArgs): strin
   }
   if (args.attentionRequested) {
     return '--attention 不属于受管 VC 主消息 action。';
+  }
+  if (args.urgentRequested) {
+    return '--urgent 不属于受管 VC 主消息 action。';
   }
   if (args.explicitMentionCount > 0 || args.mentionBack || !args.noMention) {
     return '受管 VC 回复必须显式使用 --no-mention，不能使用 --mention/--mention-back。';
@@ -128,6 +220,70 @@ export function neutralizeLarkAtTags(content: string): string {
   return content
     .replace(/<at(?=\s|>)/giu, '＜at')
     .replace(/<\/at\s*>/giu, match => `＜${match.slice(1, -1)}＞`);
+}
+
+export interface RawMention {
+  /** open_id (ou_…), or a full email / union_id / mobile when the bot
+   *  enables arbitrary mention. */
+  identifier: string;
+  /** optional display name for inline <at> substitution */
+  name: string;
+}
+
+export interface MentionClassifyResult {
+  ok: boolean;
+  /** present when !ok — message to print before exit(2) */
+  error?: string;
+  /** literal open_id entries — always allowed, pass through untouched */
+  openIdMentions: RawMention[];
+  /** non-open_id entries that must be resolved + membership-gated (empty unless
+   *  the switch is on) */
+  toResolve: RawMention[];
+}
+
+/**
+ * Pure gate for `botmux send --mention` identifiers. Splits literal open_ids
+ * (always allowed) from non-open_id identifiers (email / union_id /
+ * mobile). Non-open_id identifiers are only permitted when the bot config sets
+ * `allowArbitraryMention`; otherwise this returns ok:false so the caller can
+ * reject before doing any Lark I/O. The actual email→open_id resolution and
+ * group-membership check are async side effects the caller performs on
+ * `toResolve`. Keeping the decision here makes it unit-testable without Lark.
+ */
+export function classifyMentionIdentifiers(
+  raw: RawMention[],
+  allowArbitraryMention: boolean,
+): MentionClassifyResult {
+  const openIdMentions = raw.filter(r => r.identifier.startsWith('ou_'));
+  const nonOpenId = raw.filter(r => !r.identifier.startsWith('ou_'));
+  if (nonOpenId.length > 0 && !allowArbitraryMention) {
+    return {
+      ok: false,
+      error:
+        `--mention 只接受字面 open_id（ou_…）；不支持用邮箱 @ 任意人。\n` +
+        `如需按完整邮箱/手机号/union_id @ 群内成员，请在该 bot 配置里设 allowArbitraryMention: true。\n` +
+        `无法解析的项：${nonOpenId.map(r => r.identifier).join(', ')}`,
+      openIdMentions,
+      toResolve: [],
+    };
+  }
+  return { ok: true, openIdMentions, toResolve: nonOpenId };
+}
+
+/**
+ * Pure group-membership gate for resolved --mention targets. Given the resolved
+ * open_id per non-open_id identifier and the set of open_ids that are actually
+ * members of the destination chat, return the identifiers whose resolved open_id
+ * is NOT a member (the ones that must be rejected). Extracted from cmdSend so the
+ * "in-group passes / out-of-group rejected" contract is unit-testable without
+ * Lark I/O — a mutation that deletes the check (always [] ) or reverses it
+ * (`has` instead of `!has`) must make these tests fail.
+ */
+export function outsidersForMembership(
+  resolved: Array<{ identifier: string; openId: string }>,
+  memberIds: Set<string>,
+): Array<{ identifier: string; openId: string }> {
+  return resolved.filter(r => !memberIds.has(r.openId));
 }
 
 export interface MentionDecisionArgs {
@@ -269,6 +425,68 @@ export function parseAttentionFlag(args: string[]): { requested: boolean; kind: 
   return { requested: true, kind };
 }
 
+export const URGENT_MODES = ['app', 'sms', 'phone'] as const;
+
+export type UrgentMode = typeof URGENT_MODES[number];
+
+export interface UrgentFlagResult {
+  requested: boolean;
+  mode: UrgentMode;
+  error?: string;
+}
+
+/**
+ * Parse `botmux send --urgent[=app|sms|phone]`.
+ *
+ * A bare flag deliberately means in-app Buzz. SMS and phone are explicit
+ * because they consume tenant quota and are materially more disruptive.
+ * Multiple urgent flags are rejected rather than silently picking one.
+ */
+export function parseUrgentFlag(args: string[]): UrgentFlagResult {
+  const flags = args.filter(arg => arg === '--urgent' || arg.startsWith('--urgent='));
+  if (flags.length === 0) return { requested: false, mode: 'app' };
+  if (flags.length > 1) {
+    return { requested: true, mode: 'app', error: '--urgent 只能指定一次。' };
+  }
+  const flag = flags[0]!;
+  const raw = flag === '--urgent' ? 'app' : flag.slice('--urgent='.length);
+  if (!(URGENT_MODES as readonly string[]).includes(raw)) {
+    return {
+      requested: true,
+      mode: 'app',
+      error: '--urgent 仅支持 app|sms|phone；省略值时默认为 app。',
+    };
+  }
+  return { requested: true, mode: raw as UrgentMode };
+}
+
+export interface UrgentUsageArgs {
+  requested: boolean;
+  mentionBack: boolean;
+  sendTopLevel: boolean;
+  overrideChatId?: string;
+  sendInto?: string;
+  asVoice?: boolean;
+}
+
+/**
+ * Buzz is intentionally single-recipient and bound to the exact turn sender.
+ * This avoids accidentally buzzing every explicit @ (including peer bots).
+ */
+export function urgentUsageError(args: UrgentUsageArgs): string | null {
+  if (!args.requested) return null;
+  if (!args.mentionBack) {
+    return '--urgent 必须与 --mention-back 一起使用，只加急本轮触发者。';
+  }
+  if (args.sendTopLevel || args.overrideChatId || args.sendInto) {
+    return '--urgent 只能用于回复当前会话，不能与 --top-level / --chat-id / --into 混用。';
+  }
+  if (args.asVoice) {
+    return '--urgent 暂不支持 --voice。';
+  }
+  return null;
+}
+
 export interface AttentionUsageArgs {
   requested: boolean;
   /** --top-level */
@@ -301,5 +519,41 @@ export function attentionUsageError(args: AttentionUsageArgs): string | null {
   if (!args.hasText) {
     return '--attention 需要文本 reason（看板「需要你」列要显示原因，不能只发图片/文件）。';
   }
+  return null;
+}
+
+export interface DiffFlagResult {
+  requested: boolean;
+  path?: string;
+  error?: string;
+}
+
+/** Core display flag, parsed alongside --attention and --urgent. */
+export function parseDiffFlag(args: string[]): DiffFlagResult {
+  const flags = args.filter(arg => arg === '--diff' || arg.startsWith('--diff='));
+  if (flags.length === 0) return { requested: false };
+  if (flags.length > 1) return { requested: true, error: '--diff 只能指定一次。' };
+  const flag = flags[0]!;
+  const path = flag === '--diff' ? args[args.indexOf(flag) + 1] : flag.slice('--diff='.length);
+  if (!path?.trim() || path.startsWith('--')) return { requested: true, error: '--diff 需要 unified diff 文件路径。' };
+  if (['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'].includes(path)) {
+    return { requested: true, error: '--diff 需要已保存的文件；stdin 留给消息摘要。' };
+  }
+  return { requested: true, path };
+}
+
+export interface DiffUsageArgs {
+  requested: boolean;
+  customCardRequested: boolean;
+  mediaRequested: boolean;
+  voice: boolean;
+  slash: boolean;
+}
+
+export function diffUsageError(args: DiffUsageArgs): string | null {
+  if (!args.requested) return null;
+  if (args.customCardRequested) return '--diff 不能与 --card-file/--card-json 混用。';
+  if (args.mediaRequested) return '--diff 不能与图片/附件/视频混用；先发送完整文件，再发送 diff 最终卡片。';
+  if (args.voice || args.slash) return '--diff 不能与 --voice/--slash 混用。';
   return null;
 }

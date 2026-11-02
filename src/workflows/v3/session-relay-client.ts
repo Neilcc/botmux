@@ -20,6 +20,7 @@ import { findAncestorSessionContext } from '../../core/session-marker.js';
 import type { WorkflowDaemonMutation, WorkflowDaemonMutationResponse } from './daemon-ipc-client.js';
 import { WorkflowDaemonMutationTransportError } from './daemon-ipc-client.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from './session-relay.js';
+import { loopbackFetchImpl } from '../../core/loopback-fetch.js';
 
 export interface WorkflowSessionRelayContext {
   sessionId: string;
@@ -48,6 +49,8 @@ export function readWorkflowSessionRelayContext(options: {
   env: NodeJS.ProcessEnv;
   dataDir: string;
   startPid?: number;
+  /** Also resolve a protected capability for host-visible ancestry; callers must still attest it. */
+  includeHostSession?: boolean;
   /** Test seams. */
   readClaim?: typeof readManagedOriginCapability;
   findMarker?: typeof findAncestorSessionContext;
@@ -56,7 +59,7 @@ export function readWorkflowSessionRelayContext(options: {
   if (!sessionId) return null;
   const findMarker = options.findMarker ?? findAncestorSessionContext;
   const marker = findMarker(options.dataDir, options.startPid ?? process.ppid, sessionId);
-  if (marker?.sessionId) return null;
+  if (marker?.sessionId && !options.includeHostSession) return null;
   const readClaim = options.readClaim ?? readManagedOriginCapability;
   const relayDir = options.env.BOTMUX_SEND_RELAY?.trim();
   const originChannelId = options.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
@@ -119,7 +122,7 @@ export async function postWorkflowSessionRunMutation(input: {
       ? { originDispatchAttempt: input.context.dispatchAttempt }
       : {}),
   });
-  const fetchImpl = input.fetchImpl ?? fetch;
+  const fetchImpl = input.fetchImpl ?? loopbackFetchImpl;
   let response: Response;
   try {
     response = await fetchImpl(`http://127.0.0.1:${ipcPort}${path}`, {

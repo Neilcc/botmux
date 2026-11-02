@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, vcMeetingListenerPoliciesEqual, type VcMeetingListenerPolicy } from './vc-meeting-listener-policy.js';
 /**
  * vc-meeting-delivery-store.ts — MA-P0 receiver 侧耐久状态：
  * membership projection（hub 下发的成员投影 + fencing 高水位）与
@@ -18,7 +19,7 @@
  * read-modify-write 经 withFileLockSync 跨进程串行化。不引 SQLite。
  * 会议正文不落盘——这里只有位置、身份与 hash（§12.1）。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
@@ -52,6 +53,7 @@ export type VcMeetingMembershipStatus = 'active' | 'paused' | 'removed';
 export type VcMeetingResponseMode = 'silent' | 'listener_thread';
 
 export interface VcMeetingMemberProjectionInput {
+  listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   listenerAppId: string;
   meetingId: string;
   ownerBootId: string;
@@ -405,7 +407,8 @@ function projectionContentEquals(
   a: VcMeetingMemberProjectionInput,
   b: VcMeetingMemberProjectionInput,
 ): boolean {
-  return a.agentAppId === b.agentAppId
+  return vcMeetingListenerPoliciesEqual(a.listenerPolicy, b.listenerPolicy)
+    && a.agentAppId === b.agentAppId
     && a.role === b.role
     && a.instructions === b.instructions
     && a.status === b.status
@@ -431,7 +434,8 @@ function projectionStreamIdentityEquals(
   a: VcMeetingMemberProjectionInput,
   b: VcMeetingMemberProjectionInput,
 ): boolean {
-  return a.agentAppId === b.agentAppId
+  return vcMeetingListenerPoliciesEqual(a.listenerPolicy, b.listenerPolicy)
+    && a.agentAppId === b.agentAppId
     && a.role === b.role
     && a.instructions === b.instructions
     && vcMeetingMemberFilterEquals(a.filter, b.filter)
@@ -449,6 +453,8 @@ export function applyVcMeetingMemberProjection(
 ): VcMeetingProjectionResult {
   const normalizedInstructions = normalizeVcMeetingProfileInstructions(input.instructions);
   if (!normalizedInstructions.ok) return { ok: false, reason: 'invalid' };
+  try { normalizeVcMeetingListenerPolicy(input.listenerPolicy); }
+  catch { return { ok: false, reason: 'invalid' }; }
   input = { ...input, outputPlacement: input.outputPlacement ?? 'auto' };
   const policy = normalizeVcMeetingMemberPolicy({
     memberId: input.memberId,
@@ -671,7 +677,8 @@ export function acceptVcMeetingDelivery(
       && !(['auto', 'chat', 'topic'] as const).includes(input.outputPlacement))
     || (input.listenerOutputProtocol !== undefined
       && input.listenerOutputProtocol !== 'plain'
-      && input.listenerOutputProtocol !== 'decision_v1')
+      && input.listenerOutputProtocol !== 'decision_v1'
+      && input.listenerOutputProtocol !== 'final_summary_v1')
   ) {
     return { kind: 'conflict', reason: 'invalid' };
   }
@@ -1351,6 +1358,59 @@ export function listActiveVcMeetingDeliveriesForSession(
 }
 
 /**
+ * Most-recent authorizable delivery receipt for a receiver session, INCLUDING a
+ * just-`completed` one. Unlike listActiveVcMeetingDeliveriesForSession (which
+ * skips terminal receipts), this returns the latest `dispatched` OR `completed`
+ * receipt by updatedAt.
+ *
+ * Why it exists: the in-meeting managed-output CLI (request-output) normally
+ * carries the LIVE turn's origin (turnId/dispatchAttempt) from the process-tree
+ * marker. But a meeting agent frequently decides to speak AFTER the delivery
+ * turn has gone idle — at which point the live marker's turn fields are cleared,
+ * so the CLI has no origin to send and the daemon's durable authorization
+ * fallback cannot fire. This lets the CLI recover the delivery identity of the
+ * turn it just processed from the durable ledger (keyed only by sessionId), so
+ * the daemon can re-authorize in-meeting output against the completed receipt
+ * (evaluateVcMeetingManagedSend with allowTerminalReceipt + forInMeetingOutput).
+ * Read-only; failed/abandoned/ambiguous receipts are never returned.
+ */
+export function latestVcMeetingDeliveryForSession(
+  dataDir: string,
+  receiverSessionId: string,
+): VcMeetingDeliveryLookupResult | undefined {
+  if (!receiverSessionId.trim()) return undefined;
+  const dir = join(dataDir, DIR_NAME);
+  if (!existsSync(dir)) return undefined;
+
+  let best: VcMeetingDeliveryLookupResult | undefined;
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.json')) continue;
+    const state = readStateFile(join(dir, name));
+    if (!state) continue;
+    for (const stream of Object.values(state.streams)) {
+      if (stream.receiverSessionId !== receiverSessionId) continue;
+      for (const receipt of Object.values(stream.receipts)) {
+        // Only receipts the daemon could still authorize in-meeting output for.
+        if (receipt.status !== 'dispatched' && receipt.status !== 'completed') continue;
+        if (best && receipt.updatedAt <= best.receipt.updatedAt) continue;
+        best = {
+          memberKey: {
+            listenerAppId: stream.listenerAppId,
+            meetingId: stream.meetingId,
+            memberId: stream.memberId,
+            memberEpoch: stream.memberEpoch,
+          },
+          receiverSessionId: stream.receiverSessionId,
+          receipt,
+          receiverCommittedThrough: stream.receiverCommittedThrough,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+/**
  * 按 receiverSessionId 全局反查「当前有效」的 membership projection——
  * status === 'active' 且 memberEpoch 是该 member 的最新 epoch（换代后旧 epoch
  * 的投影残留不算数）。daemon 用它判断一个 botmux 会话是否绑定为 durable
@@ -1386,31 +1446,4 @@ export function listVcMeetingActiveProjectionsForReceiverSession(
     || a.meetingId.localeCompare(b.meetingId)
     || a.memberId.localeCompare(b.memberId)
     || a.memberEpoch - b.memberEpoch);
-}
-
-/**
- * TTL 清理：整场会议粒度删除。保留期下限由调用方保证 ≥
- * max(hub assignment TTL, meeting runtime TTL, sender retry horizon) + 时钟偏移
- * （§9.3）——低于该值 GET 404 会被误当 never-accept 证据。
- */
-export function pruneVcMeetingDeliveryState(
-  dataDir: string,
-  input: { ttlMs: number },
-  now = Date.now(),
-): number {
-  const dir = join(dataDir, DIR_NAME);
-  if (!existsSync(dir)) return 0;
-  let removed = 0;
-  for (const name of readdirSync(dir)) {
-    if (!name.endsWith('.json')) continue;
-    const fp = join(dir, name);
-    withFileLockSync(fp, () => {
-      const state = readStateFile(fp);
-      if (!state) return;
-      if (now - state.updatedAt <= input.ttlMs) return;
-      rmSync(fp, { force: true });
-      removed += 1;
-    });
-  }
-  return removed;
 }

@@ -2,8 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { detectDashboardLocale, normalizeDashboardLocale } from '../src/dashboard/web/i18n.js';
 import { stripMentionPrefix } from '../src/dashboard/web/ui.js';
 import {
-  DEFAULT_BOARD_ORDER,
-  normalizeBoardOrder,
   normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
   normalizeSkin,
@@ -70,23 +68,23 @@ describe('dashboard skin preferences', () => {
 });
 
 describe('sessions view mode preference', () => {
-  it('accepts kanban, board, topics, and table', () => {
+  it('keeps only kanban and table, migrating legacy board/topics to kanban', () => {
     expect(normalizeSessionsViewMode('kanban')).toBe('kanban');
-    expect(normalizeSessionsViewMode('board')).toBe('board');
-    expect(normalizeSessionsViewMode('topics')).toBe('topics');
     expect(normalizeSessionsViewMode('table')).toBe('table');
+    expect(normalizeSessionsViewMode('board')).toBe('kanban');
+    expect(normalizeSessionsViewMode('topics')).toBe('kanban');
     expect(normalizeSessionsViewMode('list')).toBeNull();
     expect(normalizeSessionsViewMode(undefined)).toBeNull();
   });
 
-  it('falls back to board for missing/invalid storage', () => {
+  it('falls back to kanban for missing/invalid storage', () => {
     const make = (value: string | null): Storage =>
       ({ getItem: () => value }) as unknown as Storage;
-    expect(readStoredSessionsViewMode(undefined)).toBe('board');
-    expect(readStoredSessionsViewMode(make(null))).toBe('board');
-    expect(readStoredSessionsViewMode(make('nope'))).toBe('board');
-    expect(readStoredSessionsViewMode(make('kanban'))).toBe('kanban');
-    expect(readStoredSessionsViewMode(make('topics'))).toBe('topics');
+    expect(readStoredSessionsViewMode(undefined)).toBe('kanban');
+    expect(readStoredSessionsViewMode(make(null))).toBe('kanban');
+    expect(readStoredSessionsViewMode(make('nope'))).toBe('kanban');
+    expect(readStoredSessionsViewMode(make('table'))).toBe('table');
+    expect(readStoredSessionsViewMode(make('topics'))).toBe('kanban');
   });
 });
 
@@ -112,29 +110,6 @@ describe('sessions unknown chat preference', () => {
     expect(readStoredSessionsShowUnknownChats(storage)).toBe(true);
     writeStoredSessionsShowUnknownChats(storage, false);
     expect(readStoredSessionsShowUnknownChats(storage)).toBe(false);
-  });
-});
-
-describe('sessions board column order', () => {
-  it('accepts any permutation of the four column ids', () => {
-    expect(normalizeBoardOrder([...DEFAULT_BOARD_ORDER])).toEqual([...DEFAULT_BOARD_ORDER]);
-    expect(normalizeBoardOrder(['working', 'idle', 'needs-you', 'starting']))
-      .toEqual(['working', 'idle', 'needs-you', 'starting']);
-  });
-
-  it('rejects missing, extra, duplicated, or unknown columns', () => {
-    expect(normalizeBoardOrder(['needs-you', 'starting', 'working'])).toBeNull();
-    expect(normalizeBoardOrder([...DEFAULT_BOARD_ORDER, 'closed'])).toBeNull();
-    expect(normalizeBoardOrder(['needs-you', 'needs-you', 'working', 'idle'])).toBeNull();
-    expect(normalizeBoardOrder(['a', 'b', 'c', 'd'])).toBeNull();
-    expect(normalizeBoardOrder('needs-you,starting,working,idle')).toBeNull();
-    expect(normalizeBoardOrder(null)).toBeNull();
-  });
-
-  it('returns a copy, not the caller array', () => {
-    const input = [...DEFAULT_BOARD_ORDER];
-    const out = normalizeBoardOrder(input)!;
-    expect(out).not.toBe(input);
   });
 });
 

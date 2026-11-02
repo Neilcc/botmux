@@ -3,7 +3,10 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
-import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, ASK_SKILL, ASK_SKILL_NAME, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME } from './definitions.js';
+import { BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WORKFLOW_FEATURE_SKILLS, ASK_SKILL, ASK_SKILL_NAME, WHITEBOARD_SKILL, WHITEBOARD_SKILL_NAME, CHAT_MANAGER_SKILL, CHAT_MANAGER_SKILL_NAME } from './definitions.js';
+import { effectiveBuiltinSkills, isBuiltinSkillBodyOverridden } from './effective-builtins.js';
+import { SEND_SKILL_SESSION_LOADER } from './reply-style-guide.js';
+import { isMultiTopicOrchestrationEnabled } from '../global-config.js';
 
 // This module only manages botmux-owned bridge/ask skills. User-defined skills
 // live in src/core/skills/* and services/skill-registry-store.ts so their
@@ -147,11 +150,81 @@ export function ensureWhiteboardSkill(cliId: string, skillsDir: string | undefin
 }
 
 /**
+ * 条件管理 v3 Workflow skill 家族（`botmux-workflow` / `botmux-workflow-create` /
+ * `botmux-goal-ask`）—— 跟随机器级 workflow 开关（与 {@link ensureWhiteboardSkill}
+ * 同构）。这三个 skill 不进 `BUILTIN_SKILLS`（那会被无条件安装），而是按开关动态
+ * 写入 / 删除：
+ *
+ * - `install=true`（workflow 功能开启，默认）：写入每个 SKILL.md，让 agent 看得到
+ *   并能用 `/workflow` / botmux-workflow 能力。
+ * - `install=false`（workflow 功能关闭）：删除这三个 skill 目录，避免给 agent 暴露
+ *   一个当前会被 daemon/CLI 拒绝的能力；也清理旧版本无条件装下的残留。
+ *
+ * `botmux-orchestrate` 不在此列——它是独立的多 bot 长期编排能力，不随本开关关闭。
+ *
+ * 由 worker-pool 的 `ensureCliSkills` 在每次 spawn 时按 `isWorkflowFeatureEnabled()`
+ * 调用（不走一次性缓存），所以运行时切换开关下一个会话即生效，无需重启 daemon。
+ * 幂等：install 时内容相同则跳过；remove 时不存在则跳过。
+ */
+export function ensureWorkflowSkills(cliId: string, skillsDir: string | undefined, install: boolean): void {
+  if (!skillsDir) return;
+  const base = expandHome(skillsDir);
+  for (const skill of WORKFLOW_FEATURE_SKILLS) {
+    const skillDir = join(base, skill.name);
+    const skillFile = join(skillDir, 'SKILL.md');
+    try {
+      if (install) {
+        if (existsSync(skillFile) && readFileSync(skillFile, 'utf-8') === skill.content) continue;
+        mkdirSync(skillDir, { recursive: true });
+        atomicWriteFileSync(skillFile, skill.content);
+        logger.info(`[skills] Installed ${skill.name} (workflow enabled) for ${cliId} → ${skillFile}`);
+      } else {
+        if (!existsSync(skillDir)) continue;
+        rmSync(skillDir, { recursive: true, force: true });
+        logger.info(`[skills] Removed ${skill.name} (workflow disabled) for ${cliId}`);
+      }
+    } catch (err: any) {
+      logger.warn(`[skills] ensureWorkflowSkills(${install}) failed for ${skill.name} on ${cliId}: ${err.message}`);
+    }
+  }
+}
+
+/**
+ * 条件管理 `botmux-chat-manager` skill —— 跟随群负责人开关（与
+ * {@link ensureWhiteboardSkill} 同构）。群负责人默认关闭，所以它的 skill 不进
+ * `BUILTIN_SKILLS`（那会无条件安装），而是按开关动态写入 / 删除。
+ *
+ * 注意：plugin-dir / 全局 skills 目录是机器共享的，调用方在「本机任一 bot 开启」
+ * 时即落文件，因此关闭开关的 bot 会话里也可能看得到该技能；真正的 per-bot
+ * 授权在 daemon 侧（`manager set` 校验该 bot 的 `chatManagerEnabled`），文件可见
+ * 不构成越权。prompt 注入模式则在会话目录里按 bot 精确过滤，不落共享盘。
+ */
+export function ensureChatManagerSkill(cliId: string, skillsDir: string | undefined, install: boolean): void {
+  if (!skillsDir) return;
+  const skillDir = join(expandHome(skillsDir), CHAT_MANAGER_SKILL_NAME);
+  const skillFile = join(skillDir, 'SKILL.md');
+  try {
+    if (install) {
+      if (existsSync(skillFile) && readFileSync(skillFile, 'utf-8') === CHAT_MANAGER_SKILL) return;
+      mkdirSync(skillDir, { recursive: true });
+      atomicWriteFileSync(skillFile, CHAT_MANAGER_SKILL);
+      logger.info(`[skills] Installed ${CHAT_MANAGER_SKILL_NAME} (chat-manager enabled) for ${cliId} → ${skillFile}`);
+    } else {
+      if (!existsSync(skillDir)) return;
+      rmSync(skillDir, { recursive: true, force: true });
+      logger.info(`[skills] Removed ${CHAT_MANAGER_SKILL_NAME} (chat-manager disabled) for ${cliId}`);
+    }
+  } catch (err: any) {
+    logger.warn(`[skills] ensureChatManagerSkill(${install}) failed for ${cliId}: ${err.message}`);
+  }
+}
+
+/**
  * Install (or refresh) the built-in skill library into the given CLI's skills
  * directory. Idempotent — only writes when content differs.
  *
  * Each skill becomes {skillsDir}/<name>/SKILL.md. Sub-directory layout
- * matches Claude Code / Gemini / OpenCode convention. Retired skills (renamed
+ * matches Claude Code / OpenCode convention. Retired skills (renamed
  * or removed in a later version) are deleted from the directory so the CLI
  * doesn't keep surfacing stale entries alongside their replacements.
  */
@@ -160,7 +233,21 @@ export function ensureSkills(cliId: string, skillsDir: string | undefined): void
   const dir = expandHome(skillsDir);
   try { mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
 
-  for (const skill of BUILTIN_SKILLS) {
+  // Apply user overrides: replaced bodies + user-disabled skills removed. The
+  // shipped botmux-send body is the one exception to direct materialisation:
+  // shared skill dirs receive a stable loader, while `botmux skill show` renders
+  // the per-session guide from BOTMUX_REPLY_STYLE. Explicit user bodies still
+  // win and are written verbatim.
+  const shippedBuiltins = isMultiTopicOrchestrationEnabled()
+    ? [...BUILTIN_SKILLS]
+    : BUILTIN_SKILLS.filter(skill => skill.name !== 'botmux-orchestrate');
+  const effective = effectiveBuiltinSkills(shippedBuiltins).map((skill) => {
+    if (skill.name !== 'botmux-send' || isBuiltinSkillBodyOverridden(skill.name)) return skill;
+    return { ...skill, content: SEND_SKILL_SESSION_LOADER };
+  });
+  const effectiveNames = new Set(effective.map((s) => s.name));
+
+  for (const skill of effective) {
     const skillDir = join(dir, skill.name);
     const skillFile = join(skillDir, 'SKILL.md');
     try {
@@ -174,6 +261,21 @@ export function ensureSkills(cliId: string, skillsDir: string | undefined): void
       logger.info(`[skills] Installed ${skill.name} for ${cliId} → ${skillFile}`);
     } catch (err: any) {
       logger.warn(`[skills] Failed to install ${skill.name} for ${cliId}: ${err.message}`);
+    }
+  }
+
+  // Remove a built-in skill's dir when the user has DISABLED it (present in the
+  // shipped set but dropped from the effective set). Without this, a global-mode
+  // CLI would keep injecting a skill the user turned off (stale file on disk).
+  for (const shipped of BUILTIN_SKILLS) {
+    if (effectiveNames.has(shipped.name)) continue;
+    const disabledDir = join(dir, shipped.name);
+    if (!existsSync(disabledDir)) continue;
+    try {
+      rmSync(disabledDir, { recursive: true, force: true });
+      logger.info(`[skills] Removed user-disabled built-in skill ${shipped.name} for ${cliId}`);
+    } catch (err: any) {
+      logger.warn(`[skills] Failed to remove disabled skill ${shipped.name} for ${cliId}: ${err.message}`);
     }
   }
 

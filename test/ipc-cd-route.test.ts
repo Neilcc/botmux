@@ -50,6 +50,7 @@ afterEach(async () => {
   handle = null;
   setIpcAuthSecret(null);
   vi.restoreAllMocks();
+  workerPool.__testOnly_resetRestartCoordinator();
 });
 
 /** auth 三态：capability（默认，沙箱/读隔离 CLI 姿势）/ signed（trusted-host
@@ -119,6 +120,48 @@ describe('POST /api/sessions/:sessionId/cd', () => {
 
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'adopt_cd_unsupported' });
+  });
+
+  it('409s MOJO sessions before repin/kill — remote retirement cannot follow a repin (P1-a)', async () => {
+    // killWorker refuses unprepared live retirement for every remote backend
+    // (P0-2). The riff-only guard let mojo through: repin ran, killWorker
+    // no-opped, and the route reported cold-restart while the live worker kept
+    // running on the OLD cwd. The guard must fire before any mutation.
+    const send = vi.fn();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      larkAppId: 'app-mojo',
+      session: { sessionId: 's-mojo-cd', cliId: 'mojo', backendType: 'mojo' },
+      managedTurnOrigin: { capability: CAP },
+      worker: { send, killed: false },
+      initConfig: { backendType: 'mojo' },
+    } as any);
+    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+    const killSpy = vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
+
+    const res = await postCd('s-mojo-cd', roleDir);
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'remote_cd_unsupported' });
+    expect(send).not.toHaveBeenCalled();
+    expect(repinSpy).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it('409s RIFF sessions with the same remote guard (unchanged contract)', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      larkAppId: 'app-riff',
+      session: { sessionId: 's-riff-cd', cliId: 'riff', backendType: 'riff' },
+      managedTurnOrigin: { capability: CAP },
+      worker: { send: vi.fn(), killed: false },
+      initConfig: { backendType: 'riff' },
+    } as any);
+    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+
+    const res = await postCd('s-riff-cd', roleDir);
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'remote_cd_unsupported' });
+    expect(repinSpy).not.toHaveBeenCalled();
   });
 
   it('403s an existing dir outside the role library root — repin/kill never happen', async () => {
@@ -219,7 +262,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     // TOCTOU 契约：restart 携带的 updateWorkingDir 原样使用校验产出 resolvedPath
     // （realpath 归一），而非请求原始输入。worker 侧据此收敛 lastInitConfig 后
     // respawn（--resume 续上下文 + 新 cwd 开场注入新角色 CLAUDE.md/记忆索引）。
-    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), updateWorkingDir: roleDirReal });
     expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
     // 落盘重钉必须先于 restart（记录 = 唯一事实源；respawn 只是让活进程跟上）。
     expect(repinSpy.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
@@ -295,7 +338,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: roleDirReal });
-    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), updateWorkingDir: roleDirReal });
     expect(killSpy).not.toHaveBeenCalled();
     expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
   });
@@ -316,7 +359,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: roleDirReal });
-    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), updateWorkingDir: roleDirReal });
     expect(killSpy).not.toHaveBeenCalled();
   });
   // ── per-bot 收窄（ds.larkAppId → validateRoleLibraryPath 的 ownAppId）──

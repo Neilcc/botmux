@@ -19,22 +19,377 @@
  * the outer block (CommonMark spec).
  */
 
+import { resolveReplyFooterPolicy } from '../../services/reply-footer.js';
+import { normalizeReplyConsoleUrl, type ReplyCardPresentation } from '../../services/reply-card-render.js';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
+import StateInline from 'markdown-it/lib/rules_inline/state_inline.mjs';
 import { t, type Locale } from '../../i18n/index.js';
+import type { ModelFallbackState } from '../../types.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
+  replyCardHeadingElementId,
 } from './reply-card-footer-signature.js';
+import { buildFeedbackElement } from './skill-feedback-card.js';
+import { buildReplyCardActionOverflow, buildReplyCardChromeRow, type ReplyCardActionBinding } from './reply-card-actions.js';
+import { buildCompletionProposalElement } from './completion-proposal-card.js';
+import { composeFinalCardSections } from './final-card-sections.js';
+import type { FeedbackPolicy } from '../../services/feedback-policy.js';
+import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
+import type { CompletionProposalRecord } from '../../core/completion-proposal.js';
+import type { ReplyCardHeader } from './reply-card-style.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
+import {
+  DEGRADED_TABLE_MAX_ROWS,
+  VEGA_LITE_FENCE_LANGS,
+  convertVegaLiteFence,
+  degradedVegaLiteElements,
+  type CardRenderDiagnostic,
+  type VegaLiteConversion,
+} from './vega-lite-chart.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
+import { logger } from '../../utils/logger.js';
+import {
+  cardMarkdownImageReferences,
+  FEISHU_IMG_KEY,
+} from './card-markdown-image-references.js';
+
+/** Room kept for chrome that callers attach *after* a card is built and
+ * fitted — today the on-call group button (≈483B of request body), added by
+ * `attachOncallGroupButton` in both `botmux send` and the daemon. Reserved
+ * unconditionally; it costs nothing when no button is attached. */
+export const CARD_LATE_CHROME_RESERVE_BYTES = 2_000;
+
+export type { CardRenderDiagnostic } from './vega-lite-chart.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+// This parser only classifies images for removal. Include schemes such as
+// file: that the HTML renderer rejects but Feishu may still treat as images.
+const imageScanMd = new MarkdownIt({ html: false, linkify: false, breaks: false });
+imageScanMd.validateLink = () => true;
+const imageRuleParser = new MarkdownIt();
+imageRuleParser.inline.ruler.enableOnly('image');
+const parseImage = imageRuleParser.inline.ruler.getRules('')[0];
 const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
+/** Keep structured replies readable without letting heading-heavy model output
+ *  multiply schema-v2 body elements without bound. Each promoted heading can
+ *  split one prose buffer into another element, so six keeps ordinary cards
+ *  bounded while still covering the sections in a typical result report. */
+const MAX_PROMOTED_CARD_HEADINGS = 6;
+/** Feishu recommends at most five charts per card. Byte size is not budgeted
+ * here: the only real limit is the 30KB card request body, which can only be
+ * measured once the whole card exists (see `fitChartsToCardBudget`). */
+const MAX_CARD_CHARTS = 5;
+
+interface CardLayoutBudget {
+  promotedHeadings: number;
+  charts: number;
+  diagnostics?: CardRenderDiagnostic[];
+}
+
+/** Every element produced for one ```vega-lite fence is tagged with the same
+ * group so the post-assembly budget pass can step it down without re-parsing.
+ * Stage 0 = chart, 1 = notice + 50-row table, 2 = notice + 10-row table,
+ * 3 = notice only. */
+interface ChartGroup {
+  stage: 0 | 1 | 2 | 3;
+  degraded: Extract<VegaLiteConversion, { ok: false }>;
+  diagnostics?: CardRenderDiagnostic[];
+}
+const chartGroups = new WeakMap<object, ChartGroup>();
+const STAGE_ROWS = [DEGRADED_TABLE_MAX_ROWS, DEGRADED_TABLE_MAX_ROWS, 10, 0] as const;
+
+function tagChartGroup(elements: any[], group: ChartGroup): any[] {
+  for (const element of elements) chartGroups.set(element, group);
+  return elements;
+}
+
+/** Canonical chrome for ordinary Bot Session reply cards. The CLI send path
+ *  and daemon final-output fallback both spread this object so layout cannot
+ *  drift between an explicit `botmux send` and an automatic fallback reply. */
+export const REPLY_CARD_CONFIG = {
+  update_multi: true,
+  width_mode: 'fill',
+} as const;
+
+export interface ReplyCardV2 {
+  schema: '2.0';
+  config: { update_multi: true; width_mode: 'fill' };
+  header?: ReplyCardHeader;
+  body: { direction: 'vertical'; elements: any[] };
+}
+
+/** Single envelope shared by direct sends and fallback reply-card builders. */
+export function createReplyCard(
+  elements: any[],
+  header?: ReplyCardHeader,
+): ReplyCardV2 {
+  return {
+    schema: '2.0',
+    config: { ...REPLY_CARD_CONFIG },
+    ...(header ? { header } : {}),
+    body: { direction: 'vertical', elements },
+  };
+}
+
+// Unified diff previews share the ordinary Markdown reply-card envelope.
+// Keep diff parsing, colored body elements and preview budgeting beside the
+// existing body builder; do not construct a parallel schema/config shell.
+export interface DiffRow {
+  kind: string;
+  text: string;
+  truncated?: boolean;
+}
+
+export interface DiffFile {
+  path: string;
+  oldPath: string;
+  newPath: string;
+  rows: DiffRow[];
+  notes: string[];
+  added: number;
+  removed: number;
+  header: boolean;
+  binary: boolean;
+}
+
+export interface DiffCardResult {
+  card: ReplyCardV2;
+  bytes: number;
+  statsScope: 'full' | 'preview';
+  stats: { files: number | null; added: number | null; removed: number | null };
+  preview: { files: number; rows: number; truncated: boolean; omittedFiles: number | null; reason?: 'input_too_large'; inputBytes?: number };
+}
+
+export const MAX_DIFF_INPUT_BYTES = 2 * 1024 * 1024;
+export const DIFF_PREVIEW_BUDGET_BYTES = 18_000;
+
+function failDiffLine(line: number, detail: string): never {
+  throw new Error(`diff 第 ${line} 行：${detail}`);
+}
+
+function decodeDiffPath(raw: string): string {
+  if (!raw.startsWith('"')) return raw.split('\t')[0];
+  const bytes: number[] = [];
+  const escapes: Record<string, number> = {n: 10, r: 13, t: 9, b: 8, f: 12, v: 11, a: 7, '\\': 92, '"': 34};
+  for (let i = 1; i < raw.length; i++) {
+    if (raw[i] === '"') return new TextDecoder('utf-8', {fatal: true}).decode(Uint8Array.from(bytes));
+    if (raw[i] === '\\') {
+      const char = raw[++i];
+      if (/[0-7]/.test(char ?? '')) {
+        const octal = raw.slice(i).match(/^[0-7]{1,3}/)![0];
+        const value = parseInt(octal, 8);
+        if (value > 255) throw new Error('Git 路径的八进制转义无效');
+        bytes.push(value);
+        i += octal.length - 1;
+      } else if (Object.hasOwn(escapes, char)) bytes.push(escapes[char]);
+      else throw new Error('Git 路径的转义无效');
+    } else {
+      const point = raw.codePointAt(i)!;
+      bytes.push(...Buffer.from(String.fromCodePoint(point)));
+      if (point > 0xffff) i++;
+    }
+  }
+  throw new Error('Git 路径引号未闭合');
+}
+
+function diffPathLabel(raw: string): string {
+  const decoded = decodeDiffPath(raw);
+  return decoded === '/dev/null' ? decoded : decoded.replace(/^[ab]\//, '');
+}
+
+export function parseUnifiedDiff(input: string, { allowIncomplete = false }: { allowIncomplete?: boolean } = {}): DiffFile[] {
+  if (Buffer.byteLength(input, 'utf8') > MAX_DIFF_INPUT_BYTES) throw new Error('diff 输入超过 2MiB');
+  const lines = input.replace(/\r\n/g, '\n').split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  const files: DiffFile[] = [];
+  let file: DiffFile | undefined;
+  let pendingOld: string | undefined;
+  let oldRemaining = 0;
+  let newRemaining = 0;
+
+  const createFile = (): DiffFile => {
+    const next: DiffFile = {path: '文件', oldPath: '', newPath: '', rows: [], notes: [], added: 0, removed: 0, header: false, binary: false};
+    files.push(next);
+    return next;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const partialTail = allowIncomplete && i === lines.length - 1 && !input.endsWith('\n');
+    // A byte-bounded prefix may stop in a header. Keep preceding visible rows
+    // without inventing the trailing file/path/hunk. Content rows are retained.
+    if (partialTail && (pendingOld !== undefined || (!(oldRemaining || newRemaining)
+      && (line.startsWith('diff ') || line.startsWith('--- ') || line.startsWith('@@'))))) break;
+    if (pendingOld !== undefined) {
+      if (!file) failDiffLine(i + 1, '文件头缺少旧路径');
+      if (!line.startsWith('+++ ')) failDiffLine(i + 1, '缺少 +++ 文件头');
+      file.oldPath = diffPathLabel(pendingOld);
+      file.newPath = diffPathLabel(line.slice(4));
+      file.path = file.newPath === '/dev/null' ? file.oldPath : file.newPath;
+      file.header = true;
+      if (file.oldPath === '/dev/null') file.notes.push('新增文件');
+      if (file.newPath === '/dev/null') file.notes.push('删除文件');
+      pendingOld = undefined;
+      continue;
+    }
+    if (line === '\\ No newline at end of file') {
+      if (!file?.rows.length || file.rows.at(-1)!.kind === '@') failDiffLine(i + 1, '换行标记缺少对应内容行');
+      file.rows.push({kind: '\\', text: line});
+      continue;
+    }
+    if (oldRemaining || newRemaining) {
+      if (!file) failDiffLine(i + 1, 'hunk 缺少文件');
+      const kind = line[0];
+      if (!['+', '-', ' '].includes(kind)) failDiffLine(i + 1, 'hunk 内容行缺少 +、- 或空格前缀');
+      if (kind !== '+' && oldRemaining-- <= 0) failDiffLine(i + 1, '旧版本行数超出 hunk 声明');
+      if (kind !== '-' && newRemaining-- <= 0) failDiffLine(i + 1, '新版本行数超出 hunk 声明');
+      file.rows.push({kind, text: line.slice(1), ...(partialTail ? { truncated: true } : {})});
+      if (kind === '+') file.added++;
+      if (kind === '-') file.removed++;
+      continue;
+    }
+    if (line.startsWith('diff --git ')) {
+      file = createFile();
+      const match = line.match(/^diff --git ("(?:\\.|[^"\\])*"|\S+) ("(?:\\.|[^"\\])*"|\S+)$/);
+      if (match) file.path = diffPathLabel(match[2]);
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      if (!file || file.header || file.rows.length) file = createFile();
+      pendingOld = line.slice(4);
+      continue;
+    }
+    if (line.startsWith('@@')) {
+      if (!file?.header) failDiffLine(i + 1, 'hunk 缺少文件头');
+      const match = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/);
+      if (!match) failDiffLine(i + 1, 'hunk 头格式无效');
+      const values = [match[1], match[2] ?? '1', match[3], match[4] ?? '1'].map(Number);
+      if (!values.every(Number.isSafeInteger)) failDiffLine(i + 1, 'hunk 数字超出范围');
+      oldRemaining = values[1];
+      newRemaining = values[3];
+      file.rows.push({kind: '@', text: line});
+      continue;
+    }
+    if (line.startsWith('rename from ') || line.startsWith('copy from ')) {
+      if (!file) failDiffLine(i + 1, '重命名元数据缺少文件');
+      file.oldPath = decodeDiffPath(line.replace(/^(rename|copy) from /, ''));
+      file.notes.push(`原路径：${file.oldPath}`);
+      continue;
+    }
+    if (line.startsWith('rename to ') || line.startsWith('copy to ')) {
+      if (!file) failDiffLine(i + 1, '重命名元数据缺少文件');
+      file.path = file.newPath = decodeDiffPath(line.replace(/^(rename|copy) to /, ''));
+      file.notes.push(line.startsWith('rename') ? '重命名文件' : '复制文件');
+      continue;
+    }
+    if (/^(Binary files |GIT binary patch)/.test(line)) {
+      if (!file) failDiffLine(i + 1, '二进制标记缺少文件');
+      file.binary = true;
+      file.notes.push('二进制变更，无法显示文本 diff');
+      continue;
+    }
+    if (file?.binary) continue;
+    if (/^(new file mode|deleted file mode|old mode|new mode) /.test(line)) {
+      if (!file) failDiffLine(i + 1, '模式元数据缺少文件');
+      file.notes.push(line);
+      continue;
+    }
+    if (line === '' || line.startsWith('diff ') || /^index |^(dis)?similarity index /.test(line)) continue;
+    failDiffLine(i + 1, '不支持的 unified diff 内容');
+  }
+  if (!allowIncomplete && (pendingOld !== undefined || oldRemaining || newRemaining)) failDiffLine(lines.length, '文件头或 hunk 不完整');
+  if (!files.length && input.trim() && !allowIncomplete) throw new Error('输入没有 unified diff 文件头');
+  return allowIncomplete ? files.filter(file => (file.header && file.rows.length > 0) || file.notes.length > 0) : files;
+}
+
+function escapeDiffMarkdown(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/\\/g, '\\\\').replace(/([*_`\[\]~<>])/g, '\\$1');
+}
+
+function displayDiffPath(value: string): string {
+  const controls: Record<string, string> = {'\r': '\\r', '\n': '\\n', '\t': '\\t', '\0': '\\0'};
+  return value.replace(/[\r\n\t\0]/g, char => controls[char]!);
+}
+
+function renderDiffRow(row: DiffRow): string {
+  const color = row.kind === '+' ? 'green' : row.kind === '-' ? 'red' : 'grey';
+  const prefix = ['+', '-'].includes(row.kind) ? row.kind : row.kind === ' ' ? '·' : '';
+  let text = row.text.slice(0, 1024);
+  const last = text.charCodeAt(text.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) text = text.slice(0, -1);
+  if (row.truncated || row.text.length > 1024) text += '…';
+  let content = escapeDiffMarkdown(text);
+  const indent = content.match(/^[ \t]*/)![0].replace(/\t/g, '    ');
+  content = '&nbsp;'.repeat(indent.length) + content.slice(content.match(/^[ \t]*/)![0].length);
+  return `<font color='${color}'>${prefix}${content}</font>`;
+}
+
+export function buildDiffCard(files: DiffFile[], {summary = '', maxLines = 60, inputBytes, inputName}: { summary?: string; maxLines?: number; inputBytes?: number; inputName?: string } = {}): DiffCardResult {
+  if (Buffer.byteLength(summary, 'utf8') > 4_000) throw new Error('摘要过长');
+  if (!Number.isInteger(maxLines) || maxLines < 1 || maxLines > 200) throw new Error('max-lines 需要为 1–200');
+  // The custom final validator reserves botmux_* IDs for host sections.
+  // Preserve the shared heading presentation without carrying those IDs.
+  const summaryElements = summary
+    ? buildCardBodyElements(summary).map(({ element_id: _elementId, ...element }) => element)
+    : [];
+  const partial = inputBytes !== undefined && inputBytes > MAX_DIFF_INPUT_BYTES;
+  const stats = {files: files.length, added: files.reduce((n, f) => n + f.added, 0), removed: files.reduce((n, f) => n + f.removed, 0)};
+  let count = Math.min(files.length, 20);
+  let limit = maxLines;
+  function assemble(): DiffCardResult {
+    const elements: Record<string, unknown>[] = [];
+    elements.push(...summaryElements);
+    if (!partial) elements.push({tag: 'markdown', content: files.length ? `共 ${stats.files} 个文件，+${stats.added} / -${stats.removed}。完整内容请查看原始 diff 文件。` : '未检测到内容差异。'});
+    else if (count === 0) elements.push({tag: 'markdown', text_size: 'notation', content: `<font color='grey'>diff 超限，${inputName ? escapeDiffMarkdown(displayDiffPath(inputName)) + '的' : ''}当前片段暂无可展示行，完整差异请查看原始文件。</font>`});
+    let truncated = partial || count < files.length;
+    const previewStats = { files: count, added: 0, removed: 0 };
+    let shownRows = 0;
+    for (const f of files.slice(0, count)) {
+      const shown = f.rows.slice(0, limit);
+      shownRows += shown.length;
+      const lines = [...f.notes.map(note => `<font color='grey'>${escapeDiffMarkdown(displayDiffPath(note))}</font>`), ...shown.map(renderDiffRow)];
+      const added = partial ? shown.filter(row => row.kind === '+').length : f.added;
+      const removed = partial ? shown.filter(row => row.kind === '-').length : f.removed;
+      previewStats.added += added; previewStats.removed += removed;
+      const longLine = shown.some(row => row.truncated || row.text.length > 1024);
+      const limited = partial || shown.length < f.rows.length || longLine;
+      truncated ||= limited;
+      const caption = limited ? `diff 超限，仅显示前${shown.length}行${partial ? '（计数仅预览）' : ''}${longLine ? '，长行已截断' : ''}。` : '';
+      if (!lines.length) lines.push("<font color='grey'>无文本内容变化。</font>");
+      elements.push({
+        tag: 'collapsible_panel', expanded: false,
+        header: {
+          title: {tag: 'markdown', content: `**${escapeDiffMarkdown(displayDiffPath(f.path))}** <font color='green'>+${added}</font> <font color='red'>-${removed}</font>`},
+          icon: {tag: 'standard_icon', token: 'down-small-ccm_outlined'},
+          icon_position: 'right', icon_expanded_angle: -180,
+        },
+        border: {color: 'grey', corner_radius: '5px'}, padding: '8px 8px 8px 8px',
+        elements: [
+          {tag: 'markdown', content: lines.join('\n')},
+          ...(caption ? [{tag: 'markdown', text_size: 'notation', content: `<font color='grey'>${caption}</font>`}] : []),
+        ],
+      });
+    }
+    if (count < files.length) elements.push({tag: 'markdown', text_size: 'notation', content: `<font color='grey'>另有 ${files.length - count} 个已读取文件未展开预览，完整内容请查看原始 diff 文件。</font>`});
+    const card = createReplyCard(elements);
+    return {card, bytes: Buffer.byteLength(JSON.stringify(card), 'utf8'), statsScope: partial ? 'preview' : 'full', stats: partial ? previewStats : stats, preview: {files: count, rows: shownRows, truncated, omittedFiles: partial ? null : files.length - count, ...(partial ? { reason: 'input_too_large' as const, inputBytes } : {})}};
+  }
+  let result = assemble();
+  while (result.bytes > DIFF_PREVIEW_BUDGET_BYTES && (limit > 1 || count > 0)) {
+    if (limit > 1) limit = Math.max(1, Math.floor(limit / 2));
+    else count = Math.floor(count / 2);
+    result = assemble();
+  }
+  if (result.bytes > DIFF_PREVIEW_BUDGET_BYTES) throw new Error('卡片摘要超过预览预算');
+  return result;
+}
 
 export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
 
@@ -50,6 +405,9 @@ export interface CardUsageSnapshot {
   tokens: {
     in: number;
     out: number;
+    /** Optional cumulative cache reads / writes, both subsets of `in`. */
+    cacheReadTokens?: number;
+    cacheCreateTokens?: number;
   } | null;
   /** Delta for the latest user turn (small, matches the CLI TUI's per-turn
    *  ↑↓). Null for dialects without per-turn tracking. Rendered on the live
@@ -58,10 +416,33 @@ export interface CardUsageSnapshot {
     in: number;
     out: number;
   } | null;
-  /** Latest executor-reported model. Rendered by session-status cards only. */
+  /** Observed runtime model, or the configured launch model when unavailable. */
   model?: string;
-  /** Latest executor-reported reasoning effort. */
+  /** Observed reasoning effort, or the configured session effort when unavailable. */
   reasoningEffort?: string;
+  /** Session-only configuration; separate from the last executor-reported effort. */
+  reasoningControl?: {
+    /** Native CLI menu accepted this setting for the next turn. */
+    nextTurn?: boolean;
+    choices: readonly import('../../services/codex-reasoning-effort.js').CodexReasoningEffort[];
+    selected?: string;
+    pending: boolean;
+  };
+  /** Frozen TraeX backend variant selected for this session. */
+  modelBackendVariant?: string;
+  /** Claude model fallback in effect, rendered as its own notice line on the
+   *  live card. It rides this snapshot rather than a 23rd positional arg on
+   *  buildStreamingCard: every call site already forwards the snapshot (locked
+   *  by test/streaming-card-usage-arg.test.ts), so no call site can forget it.
+   *  Not a usage metric, but the same class of runtime identity as `model`. */
+  modelFallback?: ModelFallbackState;
+  /** Claude Code statusline 快照（`botmux statusline` 落盘，daemon 合并）。存在时
+   *  上下文段改渲染纯百分比 `ctx N%`，并追加 `5h N%` / `7d N%` 账号配额段。
+   *  缺省 / null ⇒ 与无 statusline 时逐字节相同（只看 `context`）。 */
+  quota?: StatuslineQuota | null;
+  /** bots.json `cardFooterExtension` 命令给出的自定义段（已收成短单行纯文本），
+   *  渲染时转义并接在用量段末尾。缺省 ⇒ 与未配置时逐字节相同。 */
+  extensionSegments?: string[];
 }
 
 export interface ReplyCardFooter {
@@ -71,7 +452,7 @@ export interface ReplyCardFooter {
   element: {
     tag: 'markdown';
     element_id: typeof REPLY_CARD_FOOTER_ELEMENT_ID;
-    text_size: 'notation_small_v2';
+    text_size: 'notation';
     content: string;
   };
 }
@@ -335,7 +716,8 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
 
 /** Format usage as one segment shared by reply-card footers and the live
  * streaming card. The caller supplies native facts; this module only formats
- * them and never infers a context window or token count. Returns null when no
+ * them (it may derive ratios between supplied counts) and never infers a
+ * context window or token count. Returns null when no
  * valid native metric is available.
  *
  * `variant`:
@@ -344,25 +726,99 @@ function stripModelProviderPrefix(value: string | undefined): string | undefined
  *     dropped here (it lives on the streaming card / usage ledger). 上下文占用
  *     is the one glanceable "how full am I" metric worth keeping.
  *   - `'streaming'`: rich — context + `本轮 ↑X ↓Y`(per-turn delta, matches the
- *     CLI TUI) + `累计 ↑A ↓B`(session total). The live card has room and
+ *     CLI TUI) + `累计 ↑A ↓B`(session total) + `缓存命中 N%`(session cache
+ *     reads over the cache-inclusive prompt total). The live card has room and
  *     refreshes during execution. */
+/**
+ * True when a context snapshot is at/over the compact threshold — the single
+ * source of truth for BOTH the `建议压缩` hint appended by
+ * {@link cardUsageFooterSegment} and the streaming card's red line colour.
+ *
+ * ⚠️ Callers must NOT re-derive this by string-matching the rendered segment for
+ * the hint text: the hint is user-customizable copy (an override may even be the
+ * empty string, which makes `includes()` match unconditionally and paints every
+ * card red), and coupling colour to copy means editing a translation silently
+ * changes behaviour. Ask this predicate instead.
+ *
+ * No percentage (a CLI that reports usedTokens but no window — Claude Code's
+ * transcript has no context-window field) or no threshold ⇒ false, so the hint
+ * and the colour can never fire on a snapshot that cannot be over any limit.
+ */
+export function contextOverCompactThreshold(
+  usage: CardUsageSnapshot,
+  threshold: number | undefined,
+): boolean {
+  const pct = contextPercentUsed(usage);
+  return pct !== undefined && isNonNegativeFinite(threshold) && pct >= threshold;
+}
+
+/** Rounded, clamped context percentage, or undefined when the CLI reports no
+ *  window (⇒ no percentage to show). Shared so the footer text and
+ *  {@link contextOverCompactThreshold} can never disagree on the value. */
+export function contextPercentUsed(usage: CardUsageSnapshot): number | undefined {
+  // statusline 给的 contextPercent 优先（Claude Code 的 transcript 本身没有窗口字段，
+  // 这是它唯一的百分比来源）；其余 CLI 仍走 transcript 的 percentUsed。
+  const pct = usage.quota?.contextPercent ?? usage.context?.percentUsed;
+  return isNonNegativeFinite(pct)
+    ? Math.min(100, Math.round(pct))
+    : undefined;
+}
+
+/** 配额百分比（5h / 7d）：与上下文同口径 round + clamp；非法值 ⇒ undefined（省略该段）。 */
+function quotaPercent(value: unknown): number | undefined {
+  return isNonNegativeFinite(value) ? Math.min(100, Math.round(value)) : undefined;
+}
+
 export function cardUsageFooterSegment(
   usage: CardUsageSnapshot,
   locale?: Locale,
   variant: 'footer' | 'streaming' = 'footer',
+  opts?: { compactHintThreshold?: number },
 ): string | null {
   const parts: string[] = [];
-  if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
+  const quota = usage.quota ?? undefined;
+  const quotaPct = quota ? contextPercentUsed(usage) : undefined;
+  if (quota && quotaPct !== undefined) {
+    // statusline 路径（Claude Code）：只渲染纯百分比 `ctx 23%`——不带绝对值（statusline
+    // 的 used_percentage 与 transcript 的 usedTokens 口径不同，混排会自相矛盾）、不画
+    // 进度条、不渲染 resets_at。「建议压缩」提示与下方绝对值分支同源同阈值。
+    const overThreshold = contextOverCompactThreshold(usage, opts?.compactHintThreshold);
+    parts.push(
+      `${t('card.usage.ctx', undefined, locale)} ${quotaPct}%`
+      + (overThreshold ? ` · ${t('card.context.compact_hint', undefined, locale)}` : ''),
+    );
+  } else if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
     const used = compactTokenCount(usage.context.usedTokens);
     const window = usage.context.windowTokens;
     const windowSuffix = isNonNegativeFinite(window) && window > 0
       ? `/${compactTokenCount(window)}`
       : '';
-    const percentSuffix = isNonNegativeFinite(usage.context.percentUsed)
-      ? ` (${Math.min(100, Math.round(usage.context.percentUsed))}%)`
-      : '';
+    const pct = contextPercentUsed(usage);
+    const percentSuffix = pct !== undefined ? ` (${pct}%)` : '';
     const suffix = `${windowSuffix}${percentSuffix}`;
-    parts.push(`${t('card.usage.context', undefined, locale)} ${used}${suffix}`);
+    // 「建议压缩」提示（streaming 卡片）。曾经它是**独立一行** `📊 上下文 N%`，
+    // 与本 footer 同源（都读 percentUsed）⟹ 同一个百分比在一张卡上出现两次，
+    // 且那一行还比这里少了绝对值。现在只在这一行的上下文段尾追加提示，不再多占一行。
+    // 无百分比（Claude Code 的 transcript 没有上下文窗口字段）时天然不触发。
+    const overThreshold = contextOverCompactThreshold(usage, opts?.compactHintThreshold);
+    parts.push(
+      `${t('card.usage.context', undefined, locale)} ${used}${suffix}`
+      + (overThreshold ? ` · ${t('card.context.compact_hint', undefined, locale)}` : ''),
+    );
+  }
+  // 账号级配额（statusline 独有）：5h / 7d 滚动窗口用量，footer 与 streaming 都渲染——
+  // 它比 Token 累计更值得占 footer 的位置（用户关心的是「还能跑多久」）。
+  // 窗口已滚动的桶在读取端已被丢弃（readStatuslineSnapshot），这里只看是否有值。
+  if (quota) {
+    const fiveHour = quotaPercent(quota.fiveHourPercent);
+    if (fiveHour !== undefined) parts.push(`${t('card.usage.quota_5h', undefined, locale)} ${fiveHour}%`);
+    const sevenDay = quotaPercent(quota.sevenDayPercent);
+    if (sevenDay !== undefined) parts.push(`${t('card.usage.quota_7d', undefined, locale)} ${sevenDay}%`);
+  }
+  // 自定义扩展段（cardFooterExtension）：footer 与 streaming 都渲染，排在账号配额之后。
+  for (const segment of usage.extensionSegments ?? []) {
+    const text = segment.trim();
+    if (text) parts.push(escapeCardPlainText(text));
   }
   // Footer variant is context-only (keeps the cramped reply-card footer clean);
   // the token breakdown below is streaming-only.
@@ -392,33 +848,164 @@ export function cardUsageFooterSegment(
       `${t('card.usage.total', undefined, locale)} `
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
+    // Session cache hit rate: cache reads over the cache-inclusive prompt total.
+    // Dialects without cache fields still fold to 0/0, which is "unknown", not
+    // "0% hit" — so require one of the counters to be present and non-negative,
+    // and some cache activity. A session whose cache is only written (a remote
+    // provider reporting cacheCreate alone, or a first-turn Claude prompt) thus
+    // honestly renders 0%.
+    const cacheReadRaw = usage.tokens.cacheReadTokens;
+    const cacheCreateRaw = usage.tokens.cacheCreateTokens;
+    const cacheRead = isNonNegativeFinite(cacheReadRaw) ? cacheReadRaw : undefined;
+    const cacheCreate = isNonNegativeFinite(cacheCreateRaw) ? cacheCreateRaw : undefined;
+    if (usage.tokens.in > 0
+      && (cacheRead !== undefined || cacheCreate !== undefined)
+      && ((cacheRead ?? 0) > 0 || (cacheCreate ?? 0) > 0)) {
+      // floor, not round: 99.6% must not read as "100%" (everything cached).
+      // Multiply before dividing: (read / in) * 100 lands at x.99999… in
+      // floating point for exact integer percentages (290000 / 1e6 → 28).
+      // Token counts are integers far below 2^53 / 100, so read * 100 is exact.
+      const pct = Math.min(100, Math.floor((cacheRead ?? 0) * 100 / usage.tokens.in));
+      parts.push(`${t('card.usage.cache_hit', undefined, locale)} ${pct}%`);
+    }
   }
-  // Runtime identity is formatted separately by cardUsageRuntimeSegment, then
-  // the streaming card appends it to this metric string with ` · ` in one
-  // continuous markdown paragraph. Keep this function metric-only so reply-card
-  // footers remain unchanged and the streaming renderer owns the tail layout.
+  // Runtime identity is formatted separately by cardUsageRuntimeSegment. Keep
+  // this function metric-only so callers can also render identity without usage.
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
-/** Streaming-card runtime tail appended after
- * {@link cardUsageFooterSegment}'s metric text. Returns `**model** effort`
- * (model bolded within the shared grey markdown) or null when there is no model.
- * `effort` is dropped when absent — no placeholder. `hasMetrics` prevents a
- * standalone runtime-only row when native usage is unavailable. The
- * model↔effort join uses a non-breaking space so the pair never wraps apart. */
+/** Runtime identity shared by status and reply cards, independent of metrics.
+ * Missing model/effort is never guessed. Keep the selected model ID intact
+ * within the label budget: CLIs such as Cursor encode effort in that ID. */
 export function cardUsageRuntimeSegment(
   usage: CardUsageSnapshot,
-  hasMetrics: boolean,
 ): string | null {
-  if (!hasMetrics) return null;
   // Strip a leading `provider/` routing prefix (e.g. `model_hub/es1_orange_o48`
   // \u2192 `es1_orange_o48`) so the card shows the bare model name, not the relay's
   // internal namespace. A value with no slash (e.g. `gpt-5.6-sol`) is untouched.
   // Keep the tail compact so the continuous usage paragraph wraps predictably.
-  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 20);
+  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 64);
   if (!model) return null;
+  const variant = usage.modelBackendVariant === 'standard'
+    ? 'Standard'
+    : usage.modelBackendVariant === 'max'
+      ? 'Max'
+      : '';
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
-  return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
+  const tail = [variant, reasoningEffort].filter(Boolean);
+  return `**${model}**${tail.length > 0 ? `\u00a0${tail.join(' · ')}` : ''}`;
+}
+
+/** Friendly Claude model name for card copy: `claude-fable-5-1[1m]` → `Fable 5.1`,
+ *  `claude-opus-5` → `Opus 5`, `claude-haiku-4-5-20251001` → `Haiku 4.5`.
+ *  Anything that is not a recognised `claude-<family>-<major>[-<minor>][-<date>]`
+ *  id keeps its raw form.
+ *
+ *  The minor is capped at TWO digits on purpose. Date-suffixed ids without a
+ *  minor (`claude-opus-4-20250514`) otherwise let the minor group swallow the
+ *  date and render "Opus 4.20250514"; with the cap the regex backtracks into
+ *  the date branch and the id reads as plain "Opus 4". No real Claude minor has
+ *  ever been longer than two digits. */
+function claudeModelLabel(id: string): string {
+  const bare = id.trim().replace(/\[[^\]]*\]$/, '').trim();
+  const m = /^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{6,})?$/i.exec(bare);
+  if (!m) return id.trim();
+  const family = m[1].toLowerCase();
+  return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}`;
+}
+
+/** Escape markdown control characters without the non-breaking-space rewrite
+ *  compactRuntimeLabel applies — this notice is prose, not a compact tail. */
+function escapeCardPlainText(value: string): string {
+  return value.replace(/[*_~`\[\]\\<>]/g, char => `\\${char}`);
+}
+
+const MODEL_FALLBACK_LABEL_MAX = 32;
+/** Tighter than the model cap: `trigger` / `apiRefusalCategory` are raw
+ *  provider strings that ride in parentheses at the end of an already-full
+ *  line, and unlike a model id nothing about them is worth more than a glance.
+ *  Real values (`overloaded`, `model_not_found`, `cyber`) fit easily. */
+const MODEL_FALLBACK_REASON_MAX = 24;
+
+/** Bound one transcript-derived token of the notice and force it onto ONE line.
+ *  Every token here comes from Claude's own record, so it can carry newlines,
+ *  control characters or an arbitrarily long `/model` alias — any of which
+ *  would break the single-line footnote the notice is. Real values are well
+ *  under the caps (the longest Claude id, `claude-haiku-4-5-20251001`, is 25
+ *  chars), so this only ever bites a pathological value. */
+function compactNoticeToken(value: string, maxLength: number): string {
+  const normalized = value
+    // C0/C1 controls (newlines included) plus the Unicode line/paragraph
+    // separators, flattened to a space before whitespace is collapsed.
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const compact = normalized.length > maxLength
+    ? `${normalized.slice(0, Math.max(1, maxLength - 1))}\u2026`
+    : normalized;
+  return escapeCardPlainText(compact);
+}
+
+function fallbackModelText(id: string): string {
+  return compactNoticeToken(claudeModelLabel(id), MODEL_FALLBACK_LABEL_MAX);
+}
+
+/** One-line notice for a model fallback still in effect, or null when there is
+ *  none. Only the model ids and the reason are rendered — Claude's own record
+ *  carries a full paragraph of prose, which would swamp a status line. */
+export function cardModelFallbackNotice(
+  fallback: ModelFallbackState | undefined,
+  locale?: Locale,
+): string | null {
+  if (!fallback?.originalModel || !fallback.fallbackModel) return null;
+  const rawReason = fallback.kind === 'refusal'
+    ? fallback.apiRefusalCategory
+    : fallback.kind === 'unavailable' ? fallback.trigger : undefined;
+  // The reason is a raw provider string straight out of the transcript, so it
+  // gets the same one-line + bounded + escaped treatment as the model labels;
+  // a multi-line or novel-length trigger would otherwise wreck the footnote.
+  const compactReason = rawReason
+    ? compactNoticeToken(rawReason, MODEL_FALLBACK_REASON_MAX)
+    : '';
+  const reason = compactReason
+    ? t('card.model_fallback.reason', { reason: compactReason }, locale)
+    : t('card.model_fallback.no_reason', undefined, locale);
+  return t(`card.model_fallback.${fallback.kind}`, {
+    originalModel: fallbackModelText(fallback.originalModel),
+    fallbackModel: fallbackModelText(fallback.fallbackModel),
+    reason,
+  }, locale);
+}
+
+function formatReplyDuration(durationMs: number, locale?: Locale): string {
+  // Round before splitting units so seconds never overflow into 60.0.
+  const tenths = Math.round(durationMs / 100);
+  if (tenths < 600) {
+    return t('card.duration_seconds', { seconds: (tenths / 10).toFixed(1) }, locale);
+  }
+  const hours = Math.floor(tenths / 36000);
+  const minutes = Math.floor((tenths % 36000) / 600);
+  const seconds = (tenths % 600) / 10;
+  const parts: string[] = [];
+  if (hours > 0) parts.push(t('card.duration_hours', { hours }, locale));
+  if (minutes > 0) parts.push(t('card.duration_minutes', { minutes }, locale));
+  if (seconds > 0) {
+    parts.push(t('card.duration_seconds', { seconds: seconds.toFixed(1) }, locale));
+  }
+  return parts.join(' ');
+}
+
+/** Whether a custom brand already carries this machine's console entry.
+ *  Compare normalized markdown-link targets rather than a raw substring: a
+ *  hand-written brand may spell the same entry with an uppercase host or no
+ *  trailing slash, and an exact-substring check then renders two links. */
+function brandSegmentHasConsoleEntry(brandSeg: string, consoleUrl: string): boolean {
+  const entry = consoleUrl.replace(/\/+$/, '');
+  for (const match of brandSeg.matchAll(/\]\(([^()\s]+)\)/gu)) {
+    const href = normalizeReplyConsoleUrl(match[1]);
+    if (href && href.replace(/\/+$/, '') === entry) return true;
+  }
+  return false;
 }
 
 /** Build the one canonical footer shared by all Bot Session reply cards.
@@ -428,17 +1015,38 @@ export function buildReplyCardFooter(opts: {
   brand?: string;
   recipientOpenIds?: readonly string[];
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
   locale?: Locale;
 }): ReplyCardFooter | null {
+  const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
+  if (!policy.enabled) return null;
   const parts: string[] = [];
-  const brandSeg = brandFooterSegment(opts.brand);
+  const brandSeg = !policy.brand ? null : brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
+  const consoleUrl = normalizeReplyConsoleUrl(opts.presentation?.consoleUrl);
+  if (brandSeg && consoleUrl && !brandSegmentHasConsoleEntry(brandSeg, consoleUrl)) {
+    parts.push(`[${t('card.reply_console', undefined, opts.locale)}](${consoleUrl})`);
+  }
   let hasUsage = false;
   if (opts.usage) {
-    const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
+    const usageSeg = !policy.usage ? null : cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
+    const runtimeSeg = !policy.model ? null : cardUsageRuntimeSegment(opts.usage);
+    if (runtimeSeg) { parts.push(runtimeSeg); hasUsage = true; }
   }
-  const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
+  const durationMs = opts.presentation?.timing?.executionDurationMs ?? opts.executionDurationMs;
+  const hasDuration = typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0;
+  const waitingMs = opts.presentation?.timing?.waitingDurationMs ?? opts.waitingDurationMs;
+  const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
+  if (hasWaiting) {
+    parts.push(t('card.waiting_duration', { duration: formatReplyDuration(waitingMs, opts.locale) }, opts.locale));
+  }
+  if (hasDuration) {
+    parts.push(t(opts.presentation?.timing?.executionInProgress ? 'card.execution_until_reply' : 'card.execution_duration', { duration: formatReplyDuration(durationMs, opts.locale) }, opts.locale));
+  }
+  const recipientOpenIds = !policy.recipients ? [] : [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
   if (hasRecipient) {
     parts.push(
@@ -448,25 +1056,27 @@ export function buildReplyCardFooter(opts: {
   }
   if (parts.length === 0) return null;
 
-  // The marker is a visible, versioned link that lets the parser identify a
-  // card's footer (and strip it before a bot-to-bot relay). It doubles as the
-  // first separator. But a BRAND-ONLY footer (no usage, no recipient — the
-  // common case now that usageDisplay defaults to the streaming card body and
-  // the reply-card footer is context-only) needs no marker: appending it renders
-  // a dangling "botmux ·". The default/repository brand is plain link text with
-  // no `@`, so it cannot trigger bot-to-bot pollution and does not need the
-  // ownership marker (the parser already treats a bare repo link as ordinary
-  // content, matching the long-standing "brand-only is undecidable, keep it"
-  // contract). Any footer carrying usage or a recipient is still signed.
-  const signMarker = hasUsage || hasRecipient;
+  // The marker lets the parser identify a card's footer (and strip it before a
+  // bot-to-bot relay). Keep it as invisible text beside the first ordinary
+  // separator: a Markdown-link marker makes Lark render the separator dot as a
+  // clickable Botmux website link. But a BRAND-ONLY footer (no usage or
+  // recipient — the common case now that usageDisplay defaults to the streaming
+  // card body and the reply-card footer is context-only) needs no marker:
+  // appending it renders a dangling "botmux ·". The default/repository brand is
+  // plain link text with no mention, so it cannot trigger bot-to-bot pollution
+  // and does not need the ownership marker (the parser already treats a bare
+  // repo link as ordinary content, matching the long-standing "brand-only is
+  // undecidable, keep it" contract). Any footer carrying usage, timing, or a recipient
+  // is still signed.
+  const signMarker = hasUsage || hasDuration || hasWaiting || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
-    signedContent = parts[0]; // brand-only — no marker
+    signedContent = parts.join(' · '); // brand/console only — no marker
   } else if (parts.length > 1) {
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
+    signedContent = `${parts[0]} ·${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
   } else {
     // usage-only / recipient-only (brand disabled) — still marked for parsing.
-    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+    signedContent = `${parts[0]}${REPLY_CARD_FOOTER_MARKER}`;
   }
   const content = `<font color='grey'>${signedContent}</font>`;
   return {
@@ -474,10 +1084,32 @@ export function buildReplyCardFooter(opts: {
     element: {
       tag: 'markdown',
       element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
-      text_size: 'notation_small_v2',
+      text_size: 'notation',
       content,
     },
   };
+}
+
+/** Compose the entire footer once: text, divider and optional voice/menu
+ * actions. Footer, voice and the per-bot reply-card action menu share one
+ * chrome row (stable id `botmux_reply_actions`) so the on-call button, long
+ * card degradation and group-context projection can locate them. */
+export function buildReplyCardFooterElements(
+  opts: Parameters<typeof buildReplyCardFooter>[0] & {
+    voiceButton?: Record<string, unknown>;
+    actionMenu?: Record<string, unknown>;
+  },
+): any[] {
+  const policy = resolveReplyFooterPolicy(opts.presentation?.footerPreferences);
+  if (!policy.enabled) return [];
+  const footer = buildReplyCardFooter(opts);
+  const controls: Array<Record<string, unknown>> = [];
+  if (policy.voice && opts.voiceButton) controls.push(opts.voiceButton);
+  if (opts.actionMenu) controls.push(opts.actionMenu);
+  if (!footer && controls.length === 0) return [];
+  return [{ tag: 'hr' }, ...(controls.length > 0
+    ? [buildReplyCardChromeRow({ footer, controls })]
+    : [footer!.element])];
 }
 
 /** Clone a caller-supplied schema-2 card and append the canonical reply
@@ -506,8 +1138,7 @@ export function appendReplyCardFooterToV2Card(
   ) {
     return null;
   }
-  const footer = buildReplyCardFooter(opts);
-  if (footer) body.elements.push({ tag: 'hr' }, footer.element);
+  body.elements.push(...buildReplyCardFooterElements(opts));
   return cloned;
 }
 
@@ -574,15 +1205,7 @@ function buildTableFromTokens(tokens: Token[]): any | null {
   return {
     tag: 'table',
     page_size: Math.min(10, Math.max(1, rows.length || 1)),
-    row_height: 'low',
-    header_style: {
-      text_align: 'left',
-      text_size: 'normal',
-      background_style: 'grey',
-      text_color: 'default',
-      bold: true,
-      lines: 1,
-    },
+    ...TABLE_AUTO_ROW_STYLE,
     columns,
     rows,
   };
@@ -626,6 +1249,79 @@ function unescapeFenceLines(input: string): string {
   return input.replace(/^[ ]{0,3}(?:\\`){3,}[^\n`]*$/gm, m => m.replace(/\\`/g, '`'));
 }
 
+/** Resolve real Markdown images, preserving code examples and untouched source.
+ * The image-only rule supplies exact source spans; the full parser above
+ * decides which occurrences are actually images rather than literal code. */
+export async function resolveCardMarkdownImages(
+  input: string,
+  resolveSource: (source: string) => Promise<string | undefined>,
+): Promise<string> {
+  input = unescapeFenceLines(input);
+  const references = cardMarkdownImageReferences(input);
+  if (!references.length) return input;
+  const env: Record<string, unknown> = {};
+  imageScanMd.parse(input, env);
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const reference of references) {
+    if (reference.position < cursor || FEISHU_IMG_KEY.test(reference.source)) continue;
+    const state = new StateInline(input, imageScanMd, env, []);
+    state.pos = reference.position;
+    if (!parseImage(state, false)) continue;
+    const token = state.tokens.at(-1);
+    if (token?.type !== 'image' || token.attrGet('src') !== reference.source) continue;
+    const key = await resolveSource(reference.source);
+    if (!key || !FEISHU_IMG_KEY.test(key)) continue;
+    parts.push(input.slice(cursor, reference.position), `![${token.content}](${key})`);
+    cursor = state.pos;
+  }
+  return parts.join('') + input.slice(cursor);
+}
+
+function normalizeCardImages(input: string, omitAll = false): string {
+  const unsupported = new Set(cardMarkdownImageReferences(input)
+    .filter(image => omitAll || !FEISHU_IMG_KEY.test(image.source)).map(image => image.position));
+  return input.replace(/!\[/g, (match: string, offset: number) =>
+    unsupported.has(offset) ? '[Image omitted] [' : match);
+}
+
+/** Last-resort image-free version of a rejected reply card. Keep the card
+ * envelope, text, tables, code and controls so existing delivery accounting
+ * can continue to use the same message type and provider UUID. */
+export function omitReplyCardImages(cardJson: string): string {
+  let card: unknown;
+  try { card = JSON.parse(cardJson); } catch { return cardJson; }
+  let changed = false;
+  const visit = (value: unknown, markdownFields?: ReadonlySet<string>): unknown => {
+    if (Array.isArray(value)) return value.map(child => visit(child, markdownFields));
+    if (!value || typeof value !== 'object') return value;
+    if ('tag' in value && value.tag === 'img') {
+      changed = true;
+      const alt = 'alt' in value ? value.alt : undefined;
+      const text = typeof alt === 'string' ? alt
+        : alt && typeof alt === 'object' && 'content' in alt && typeof alt.content === 'string'
+          ? alt.content : '';
+      return { tag: 'markdown', content: `[Image omitted] ${md.utils.escapeHtml(text).replace(/[\\`*_[\]<>!]/g, '\\$&')}`.trim() };
+    }
+    const tableFields = 'tag' in value && value.tag === 'table' && 'columns' in value && Array.isArray(value.columns)
+      ? new Set<string>(value.columns.flatMap((column: unknown) =>
+        column && typeof column === 'object' && 'data_type' in column && column.data_type === 'lark_md'
+          && 'name' in column && typeof column.name === 'string' ? [column.name] : []))
+      : undefined;
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => {
+      if (typeof child === 'string' && (markdownFields?.has(key)
+        || ('tag' in value && (value.tag === 'markdown' || value.tag === 'lark_md') && key === 'content'))) {
+        const content = normalizeCardImages(child, true);
+        if (content !== child) changed = true;
+        return [key, content];
+      }
+      return [key, visit(child, key === 'rows' ? tableFields : undefined)];
+    }));
+  };
+  const result = visit(card);
+  return changed ? JSON.stringify(result) : cardJson;
+}
+
 /** Normalize source bytes that must be settled before the card is rendered. */
 export function prepareCardMarkdown(
   input: string,
@@ -636,41 +1332,104 @@ export function prepareCardMarkdown(
   return normalizeLocalHomeLinks(input, homedir(), cwd, existsSync, localHomeLinkMode);
 }
 
+export interface ExtractedReplyCardHeading {
+  /** Markdown body with the selected heading source line removed. */
+  markdown: string;
+  /** Plain visible text for `header.title`; absent when no eligible heading exists. */
+  heading?: string;
+}
+
+function inlineTokenPlainText(token: Token | undefined): string {
+  if (!token) return '';
+  if (!Array.isArray(token.children)) return token.content.trim();
+  return token.children
+    .map(child => {
+      if (child.type === 'text' || child.type === 'code_inline') return child.content;
+      if (child.type === 'softbreak' || child.type === 'hardbreak') return ' ';
+      if (child.type === 'image') return child.content;
+      return '';
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Consume the first heading that the ordinary body renderer would promote:
+ * a top-level ATX H1/H2 outside code fences. The exact source line is removed
+ * so the Card 2.0 header and body do not repeat it. No other markdown changes.
+ */
+export function extractFirstReplyCardHeading(input: string): ExtractedReplyCardHeading {
+  if (!input) return { markdown: input };
+  const parseInput = unescapeFenceLines(input);
+  const tokens = md.parse(parseInput, {});
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (
+      token.level !== 0
+      || token.type !== 'heading_open'
+      || !/^h[12]$/.test(token.tag)
+      || !/^#{1,2}$/.test(token.markup)
+      || !token.map
+    ) {
+      continue;
+    }
+    const heading = inlineTokenPlainText(tokens[index + 1]);
+    if (!heading) continue;
+    const lines = input.split('\n');
+    const [start, end] = token.map as [number, number];
+    lines.splice(start, Math.max(1, end - start));
+    return { markdown: lines.join('\n'), heading };
+  }
+  return { markdown: input };
+}
+
 /**
  * Split markdown into card v2 body elements:
  *   1. Pipe tables → native `table` widget (Feishu's markdown widget can't
  *      render them as a grid).
- *   2. Headings → bold (Feishu's markdown widget doesn't render ATX `#`).
+ *   2. H1/H2 → bounded standalone heading widgets; H3-H6 → bold (Feishu's
+ *      markdown widget doesn't render ATX `#`).
  *   3. Code fences → re-emitted with the original backtick run, joined with
  *      blank lines on either side (Feishu's widget needs them to recognise the
- *      fence).
+ *      fence). Code nested in lists/quotes becomes a standalone element.
  *   4. Everything else → original source slice, glued by blank lines.
  *
- * All non-table blocks are merged into a single `markdown` element to keep
- * card element counts modest.
+ * Prose between promoted headings/tables/image rows is merged into one
+ * `markdown` element to keep card element counts modest.
  */
 export function buildCardBodyElements(
   input: string,
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  imageMode = 'fit_horizontal',
+  diagnostics?: CardRenderDiagnostic[],
 ): any[] {
   if (!input) return [];
   // Recover model-escaped fences first so markdown-it can classify their
   // contents as code before local-link normalization inspects link tokens.
   input = prepareCardMarkdown(input, cwd, localHomeLinkMode);
+  // Only sanitize at the rendering boundary: sandbox relay preparation runs
+  // before --images uploads resolve img:N placeholders to real image keys.
+  input = normalizeCardImages(input);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
-  for (const seg of splitImageRowSegments(input)) {
+  const layoutBudget: CardLayoutBudget = { promotedHeadings: 0, charts: 0, diagnostics };
+  for (const seg of splitImageRowSegments(input, imageMode)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
-    else elements.push(...buildMarkdownElements(seg.content));
+    else if (seg.type === 'img') elements.push(singleImageLayout(seg.key, imageMode, seg.alt));
+    else elements.push(...buildMarkdownElements(seg.content, layoutBudget));
   }
   return elements;
 }
 
-function buildMarkdownElements(input: string): any[] {
+function buildMarkdownElements(
+  input: string,
+  layoutBudget: CardLayoutBudget,
+): any[] {
   if (!input) return [];
   input = unescapeFenceLines(input);
   const tokens = md.parse(input, {});
@@ -703,8 +1462,43 @@ function buildMarkdownElements(input: string): any[] {
     if (t.type === 'heading_open') {
       const inline = tokens[i + 1];
       const text = (inline?.content ?? '').replace(/^#{1,6}\s+/, '').trim();
-      if (text) buf.push(`**${text}**`);
+      const level = Number.parseInt(t.tag.slice(1), 10);
+      const promote = text
+        && level <= 2
+        && /^#{1,2}$/.test(t.markup)
+        && layoutBudget.promotedHeadings < MAX_PROMOTED_CARD_HEADINGS;
+      if (promote) {
+        // Feishu's markdown widget does not render ATX markers. A standalone
+        // Card JSON 2.0 20px heading restores hierarchy without making H1
+        // model output dominate the card. The element id carries the original
+        // ATX level because message reads strip `text_size` — without it the
+        // heading would come back as bare glued text.
+        flushBuf();
+        layoutBudget.promotedHeadings++;
+        elements.push({
+          tag: 'markdown',
+          element_id: replyCardHeadingElementId(
+            level as 1 | 2,
+            layoutBudget.promotedHeadings,
+          ),
+          text_size: 'heading-2',
+          content: text,
+        });
+      } else if (text) {
+        // H3-H6 and headings beyond the safety budget retain the established
+        // compact fallback instead of increasing the component count further.
+        buf.push(`**${text}**`);
+      }
       i += 3; // heading_open, inline, heading_close
+      continue;
+    }
+
+    if (t.type === 'fence' && VEGA_LITE_FENCE_LANGS.has((t.info || '').trim().split(/\s+/)[0]!.toLowerCase())) {
+      // A chart fence becomes a native Card 2.0 chart, or a notice plus a
+      // plain-text data table — never the raw spec (see vega-lite-chart.ts).
+      flushBuf();
+      elements.push(...buildVegaLiteElements(t.content, layoutBudget));
+      i++;
       continue;
     }
 
@@ -729,12 +1523,41 @@ function buildMarkdownElements(input: string): any[] {
       continue;
     }
 
-    // Generic open token (paragraph_open, bullet_list_open, ordered_list_open,
-    // blockquote_open, …): slice source by the open-token's line map and skip
-    // to the matching close.
+    // Lark can omit fences nested inside lists/quotes. Lift those code blocks
+    // into standalone elements; keep the surrounding source (and numbering)
+    // in order instead of handing the unsupported container to its renderer.
     if (t.type.endsWith('_open') && t.map) {
-      buf.push(sliceLines(lines, t.map as [number, number]));
-      i = findMatchingClose(tokens, i) + 1;
+      const end = findMatchingClose(tokens, i);
+      let startLine = t.map[0];
+      for (let nested = i + 1; nested < end; nested++) {
+        const code = tokens[nested];
+        // A continuation paragraph has lost its opening list item/quote in
+        // the previous element. Use the parsed text so its old indentation
+        // cannot turn prose into an accidental indented code block.
+        if (startLine > t.map[0] && code.type === 'paragraph_open' && code.map
+          && tokens[nested - 1].nesting !== 1) {
+          buf.push(sliceLines(lines, [startLine, code.map[0]]));
+          buf.push(tokens[nested + 1].content);
+          startLine = code.map[1];
+          continue;
+        }
+        if ((code.type !== 'fence' && code.type !== 'code_block') || !code.map) continue;
+        buf.push(sliceLines(lines, [startLine, code.map[0]]));
+        flushBuf();
+        const info = (code.info || '').trim();
+        if (code.type === 'fence' && VEGA_LITE_FENCE_LANGS.has(info.split(/\s+/)[0]!.toLowerCase())) {
+          elements.push(...buildVegaLiteElements(code.content, layoutBudget));
+        } else {
+          const fence = code.markup || '`'.repeat(Math.max(3,
+            ...(code.content.match(/`+/g) ?? []).map(run => run.length + 1)));
+          // Do not run code through flushBuf: its prose whitespace cleanup
+          // would collapse intentional blank lines inside the code block.
+          elements.push({ tag: 'markdown', content: `${fence}${info}\n${code.content}${fence}` });
+        }
+        startLine = code.map[1];
+      }
+      buf.push(sliceLines(lines, [startLine, t.map[1]]));
+      i = end + 1;
       continue;
     }
 
@@ -745,9 +1568,125 @@ function buildMarkdownElements(input: string): any[] {
   return elements;
 }
 
-/** A single uploaded image rendered full-width (legacy single-image look). */
+function buildVegaLiteElements(source: string, layoutBudget: CardLayoutBudget): any[] {
+  let result = convertVegaLiteFence(source);
+  if (result.ok) {
+    const rows = (result.element.chart_spec as { data: { values: Record<string, string | number | boolean | null>[] } }).data.values;
+    const fallback = { ok: false as const, reason: 'card_budget_exceeded', ...(result.title ? { title: result.title } : {}), rows };
+    if (layoutBudget.charts < MAX_CARD_CHARTS) {
+      layoutBudget.charts++;
+      return tagChartGroup([result.element], { stage: 0, degraded: fallback, diagnostics: layoutBudget.diagnostics });
+    }
+    // Over the per-card chart count: keep the data as a table.
+    result = { ...fallback, reason: 'too_many_charts' };
+  }
+  layoutBudget.diagnostics?.push({
+    kind: 'chart_degraded',
+    reason: result.reason,
+    ...(result.title ? { title: result.title } : {}),
+  });
+  const group: ChartGroup = { stage: 1, degraded: result };
+  return tagChartGroup(degradedVegaLiteElements(result), group);
+}
+
+/** Placeholder `receive_id` for sizing when the target chat is not known;
+ * real chat ids have the same length. */
+const SIZING_CHAT_ID = `oc_${'0'.repeat(32)}`;
+
+export interface CardBudgetResult {
+  /** Request body bytes after fitting, measured like the Feishu API call. */
+  bytes: number;
+  /** False when the card is still over budget after every chart group has
+   * been stepped down (i.e. the excess is not chart content). */
+  fits: boolean;
+}
+
+/**
+ * Step chart groups down (chart → 50-row table → 10-row table → notice) until
+ * the card's request body fits Feishu's 30KB card limit. Measures the real
+ * request (`turnReplyCardRequestBytes`: callback markers, envelope and the
+ * second JSON serialization of `content`), not the bare card JSON. Only
+ * elements produced for ```vega-lite fences are touched; the card is edited in
+ * place. `reserveBytes` leaves room for chrome added after this call.
+ */
+export function fitChartsToCardBudget(
+  card: { body?: { elements?: any[] } },
+  opts: { chatId?: string; reserveBytes?: number; diagnostics?: CardRenderDiagnostic[] } = {},
+): CardBudgetResult {
+  const elements = card.body?.elements;
+  const limit = TURN_REPLY_CARD_MAX_BYTES - (opts.reserveBytes ?? 0);
+  const measure = () => turnReplyCardRequestBytes(JSON.stringify(card), opts.chatId ?? SIZING_CHAT_ID);
+  let bytes = measure();
+  if (!elements || bytes <= limit) return { bytes, fits: bytes <= limit };
+  for (;;) {
+    // Collect contiguous runs belonging to one group that can still shrink.
+    const runs: Array<{ group: ChartGroup; start: number; end: number; size: number }> = [];
+    for (let index = 0; index < elements.length; index++) {
+      const group = chartGroups.get(elements[index]);
+      if (!group || group.stage >= 3) continue;
+      let end = index;
+      while (end + 1 < elements.length && chartGroups.get(elements[end + 1]) === group) end++;
+      runs.push({ group, start: index, end, size: Buffer.byteLength(JSON.stringify(elements.slice(index, end + 1)), 'utf8') });
+      index = end;
+    }
+    if (runs.length === 0) return { bytes, fits: false };
+    const largest = runs.reduce((best, run) => (run.size > best.size ? run : best));
+    const { group } = largest;
+    if (group.stage === 0) {
+      const sink = opts.diagnostics ?? group.diagnostics;
+      sink?.push({
+        kind: 'chart_degraded',
+        reason: 'card_budget_exceeded',
+        ...(group.degraded.title ? { title: group.degraded.title } : {}),
+      });
+      group.degraded = { ...group.degraded, reason: 'card_budget_exceeded' };
+    }
+    group.stage = (group.stage + 1) as ChartGroup['stage'];
+    const replacement = tagChartGroup(degradedVegaLiteElements(group.degraded, STAGE_ROWS[group.stage]), group);
+    elements.splice(largest.start, largest.end - largest.start + 1, ...replacement);
+    bytes = measure();
+    if (bytes <= limit) return { bytes, fits: true };
+  }
+}
+
+/** Budget pass for cards built inside this module and delivered by the
+ * daemon. Reserves room for late chrome (on-call button) and makes chart
+ * degradation or an unfixable overflow observable in the daemon log. */
+function fitBuiltCard(card: { body?: { elements?: any[] } }, label: string): void {
+  const diagnostics: CardRenderDiagnostic[] = [];
+  const result = fitChartsToCardBudget(card, { reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES, diagnostics });
+  if (!result.fits) {
+    logger.warn(`[card] ${label}: request body ~${result.bytes}B still exceeds Feishu's 30KB card limit after chart degradation`);
+  }
+  if (diagnostics.length > 0) {
+    logger.warn(`[card] ${label}: degraded charts: ${diagnostics.map(item => item.reason).join(', ')}`);
+  }
+}
+
+// Existing multi-image rows retain their legacy payload for compatibility.
 function singleImgElement(imgKey: string): any {
   return { tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true };
+}
+
+/** Botmux width presets, not Feishu's square/cropping `size` presets. */
+function singleImageLayout(imgKey: string, mode: string, alt: string): any {
+  const img = {
+    tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: alt },
+    scale_type: 'fit_horizontal', preview: true,
+  };
+  const columnCounts: Record<string, number> = { medium: 2, small: 3, tiny: 4 };
+  const count = columnCounts[mode];
+  if (!count) return img;
+  // Feishu normalizes unequal weights to 1. Use N equal columns instead:
+  // one image and N-1 empty columns. `none` preserves the fraction on narrow
+  // screens; fit_horizontal keeps the entire image without a fixed height.
+  return {
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: '0px',
+    columns: Array.from({ length: count }, (_, index) => ({
+      tag: 'column', width: 'weighted', weight: 1,
+      elements: index === 0 ? [img] : [],
+    })),
+  };
 }
 
 /**
@@ -787,19 +1726,16 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  * such key is promoted to a native `img` row — a model reply may emit a
  * `![](https://…) ![](…)` URL line (or other non-key src like `img_v2foo.png`),
  * and a native `img` element with a non-key as its "img_key" makes Feishu reject
- * the whole card. Non-key lines fall through to the markdown widget unchanged
- * (same as before this feature existed).
+ * the whole card. Non-key images are downgraded before this layout pass.
  */
-const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
-
-type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] };
+type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] } | { type: 'img'; key: string; alt: string };
 
 /**
  * Split a markdown body into segments, pulling out lines that consist solely of
  * 2+ image tokens as `imgrow` segments (→ side-by-side row). Fence-aware: lines
  * inside ``` / ~~~ code blocks are never treated as image rows.
  */
-function splitImageRowSegments(input: string): BodySegment[] {
+function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): BodySegment[] {
   const segs: BodySegment[] = [];
   let buf: string[] = [];
   const flush = () => { if (buf.length) { segs.push({ type: 'text', content: buf.join('\n') }); buf = []; } };
@@ -823,6 +1759,16 @@ function splitImageRowSegments(input: string): BodySegment[] {
       }
       buf.push(line);
       continue;
+    }
+    // Only promote standalone images for an explicit size override. Keep the
+    // legacy Markdown output, inline prose, code blocks, and image grids intact.
+    if (!fenceChar && imageMode !== 'fit_horizontal') {
+      const single = line.match(/^ {0,3}!\[([^\]]*)\]\(([^)\s]+)\)\s*$/);
+      if (single && FEISHU_IMG_KEY.test(single[2])) {
+        flush();
+        segs.push({ type: 'img', key: single[2], alt: single[1] });
+        continue;
+      }
     }
     if (!fenceChar && IMG_ROW_LINE.test(line)) {
       const keys = Array.from(line.matchAll(IMG_TOKEN_SRC), m => m[1]);
@@ -854,14 +1800,18 @@ function splitImageRowSegments(input: string): BodySegment[] {
  * pre-pass turns multi-image lines into the actual `column_set` rows. This keeps
  * one rendering path: a caller that embeds `![](img_key)` directly and puts two
  * on a line (e.g. the menu poster) gets the same grid without using `--images`.
+ * `imageMode` overrides standalone single images only; inline Markdown images
+ * and side-by-side rows retain their existing layout.
  */
 export function buildImageCardElements(
   md: string,
   imageKeys: string[],
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  imageMode?: string,
+  diagnostics?: CardRenderDiagnostic[],
 ): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode) : [];
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode, diagnostics) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>
@@ -892,29 +1842,7 @@ export function buildImageCardElements(
   const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
-  return buildCardBodyElements(resolved, cwd, localHomeLinkMode);
-}
-
-/**
- * Heuristic: does `text` contain markdown syntax that renders badly as plain
- * text in Feishu (code fences, headings, lists, bold, inline code, links,
- * tables, blockquotes, hr)? Callers use this to decide between an interactive
- * card and a plain post.
- */
-export function hasMarkdown(text: string): boolean {
-  if (!text) return false;
-  return (
-    /```/.test(text) ||
-    /^#{1,6}\s/m.test(text) ||
-    /^\s{0,3}[-*+]\s+\S/m.test(text) ||
-    /^\s{0,3}\d+\.\s+\S/m.test(text) ||
-    /\*\*[^*\n]+\*\*/.test(text) ||
-    /(^|[^`])`[^`\n]+`([^`]|$)/.test(text) ||
-    /\[[^\]\n]+\]\([^)\n]+\)/.test(text) ||
-    /^\s*\|.+\|\s*$/m.test(text) ||
-    /^>\s/m.test(text) ||
-    /^(?:---|\*\*\*|___)\s*$/m.test(text)
-  );
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode, diagnostics);
 }
 
 /**
@@ -931,6 +1859,8 @@ export function hasMarkdown(text: string): boolean {
  * suppressed, else custom. When brand, usage, and recipient are all absent the
  * whole footer (HR included) is omitted.
  */
+// No production send path calls buildMarkdownCard today (tests only); the
+// budget pass is kept so a future caller cannot reopen the 30KB gap.
 export function buildMarkdownCard(
   md: string,
   recipientOpenId?: string,
@@ -939,24 +1869,66 @@ export function buildMarkdownCard(
   workingDir?: string,
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   usage?: CardUsageSnapshot,
+  presentation?: ReplyCardPresentation,
 ): string {
   const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
-  const footer = buildReplyCardFooter({
+  const footerElements = buildReplyCardFooterElements({
     brand,
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    presentation,
   });
   // No brand, usage, or recipient → no footer at all (skip the orphan HR too).
-  if (footer) {
-    elements.push({ tag: 'hr' });
-    elements.push(footer.element);
-  }
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    body: { direction: 'vertical', elements },
+  elements.push(...footerElements);
+  const card = createReplyCard(elements);
+  fitBuiltCard(card, 'markdown_card');
+  return JSON.stringify(card);
+}
+
+/** Build the canonical final-answer card. Streaming/progress/session cards
+ * must keep using their existing builders and never call this helper. */
+export function buildCanonicalFinalReplyCard(opts: {
+  markdown: string;
+  feedback?: { policy: FeedbackPolicy };
+  completionProposal?: CompletionProposalRecord;
+  recipientOpenId?: string;
+  brand?: string;
+  locale?: Locale;
+  workingDir?: string;
+  localHomeLinkMode?: LocalHomeLinkMode;
+  usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
+}): string {
+  const elements = opts.markdown
+    ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
+    : [];
+  const footerElements = buildReplyCardFooterElements({
+    brand: opts.brand,
+    recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
+    usage: opts.usage,
+    presentation: opts.presentation,
+    executionDurationMs: opts.executionDurationMs,
+    waitingDurationMs: opts.waitingDurationMs,
+    locale: opts.locale,
+    ...(opts.cardActions
+      ? { actionMenu: buildReplyCardActionOverflow(opts.cardActions, opts.locale) }
+      : {}),
   });
+  elements.push(...footerElements);
+  const card = createReplyCard(elements);
+  composeFinalCardSections(card, {
+    ...(opts.completionProposal
+      ? { completionProposal: buildCompletionProposalElement(opts.completionProposal) }
+      : {}),
+    ...(opts.feedback ? { feedback: buildFeedbackElement(opts.feedback.policy) } : {}),
+  });
+  fitBuiltCard(card, 'final_reply');
+  return JSON.stringify(card);
 }
 
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
@@ -994,6 +1966,12 @@ export function buildContextualReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
+  presentation?: ReplyCardPresentation;
+  feedback?: { policy: FeedbackPolicy };
+  /** Per-bot opt-in reply-card action menu binding. */
+  cardActions?: ReplyCardActionBinding;
 }): string {
   const {
     title,
@@ -1011,7 +1989,7 @@ export function buildContextualReplyCard(opts: {
 
   elements.push({
     tag: 'markdown',
-    text_size: 'heading_2_v2',
+    text_size: 'heading-2',
     content: title,
   });
 
@@ -1019,7 +1997,7 @@ export function buildContextualReplyCard(opts: {
     const u = userText.trim();
     elements.push({
       tag: 'markdown',
-      content: `**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`,
+      content: normalizeCardImages(`**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`),
     });
   }
 
@@ -1034,20 +2012,23 @@ export function buildContextualReplyCard(opts: {
     : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
 
-  const footer = buildReplyCardFooter({
+  if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
+
+  const footerElements = buildReplyCardFooterElements({
     brand,
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    executionDurationMs: opts.executionDurationMs,
+    waitingDurationMs: opts.waitingDurationMs,
+    presentation: opts.presentation,
+    ...(opts.cardActions
+      ? { actionMenu: buildReplyCardActionOverflow(opts.cardActions, locale) }
+      : {}),
   });
-  if (footer) {
-    elements.push({ tag: 'hr' });
-    elements.push(footer.element);
-  }
+  elements.push(...footerElements);
 
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    body: { direction: 'vertical', elements },
-  });
+  const card = createReplyCard(elements);
+  fitBuiltCard(card, 'contextual_reply');
+  return JSON.stringify(card);
 }

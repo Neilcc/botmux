@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  authorizeVcMeetingSummaryShare,
   evaluateVcMeetingManagedOriginClaim,
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -37,6 +38,7 @@ function seed(
   responseMode: 'silent' | 'listener_thread',
   outputPlacement: 'auto' | 'chat' | 'topic' = 'auto',
   listenerOutputProtocol: 'plain' | 'decision_v1' = 'plain',
+  allowSummarySharing?: boolean,
 ): void {
   applyVcMeetingMemberProjection(dir, {
     ...memberKey,
@@ -54,6 +56,7 @@ function seed(
     receiverSessionId: 'receiver-session',
     outputChatId: 'listener-chat',
     outputPlacement,
+    ...(allowSummarySharing !== undefined ? { listenerPolicy: { allowSummarySharing } } : {}),
   });
   acceptVcMeetingDelivery(dir, {
     ...memberKey,
@@ -91,6 +94,46 @@ describe('evaluateVcMeetingManagedSend', () => {
       receiverSessionId: 'receiver-session', receiverSession: true,
       turnId: 'delivery-key', dispatchAttempt: 1,
     })).toMatchObject({ ok: false, errorCode: 'silent_delivery' });
+  });
+
+  it('Plan B: authorizes a silent delivery for the IN-MEETING output channel (silent only gates listener auto-post)', () => {
+    // responseMode:silent means "do not auto-post to the listener group", NOT
+    // "cannot speak in the meeting". The in-meeting managed-output channel
+    // (request-output → hub managed-action) is authorized by capability +
+    // textOutputPolicy/voiceOutputPolicy at the hub, so forInMeetingOutput skips
+    // the silent veto while still proving receipt identity/liveness. A "会议主持"
+    // that is silent in the group must still be able to speak in the meeting.
+    seed('silent');
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: true, kind: 'listener_thread' });
+    // Same delivery, default (listener auto-post) path stays suppressed.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({ ok: false, errorCode: 'silent_delivery' });
+  });
+
+  it('Plan B: forInMeetingOutput still fails closed on a missing/mismatched receipt (no silent bypass of identity checks)', () => {
+    // The flag skips ONLY the silent veto — every identity/liveness check
+    // (receipt exists for this session, attempt matches, active projection,
+    // dispatched/completed) still applies, so it can never authorize output the
+    // receipt itself wouldn't.
+    seed('silent');
+    // Wrong dispatchAttempt → origin_mismatch even with forInMeetingOutput.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 99,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: false, errorCode: 'origin_mismatch' });
+    // Unknown turnId → receipt_not_found even with forInMeetingOutput.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'no-such-delivery', dispatchAttempt: 1,
+      forInMeetingOutput: true,
+    })).toMatchObject({ ok: false, errorCode: 'receipt_not_found' });
   });
 
   it('allows the exact durable origin for listener_thread mode', () => {
@@ -203,6 +246,23 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
   });
 
+  it('Plan B: an orphaned-stamp session (no active projection) falls back to ordinary instead of bricking', () => {
+    // Regression: stampVcMeetingBinding marks an ordinary chat-scope session as
+    // a receiver, but when projection registration fails (e.g. Pi has no
+    // reliableTurnTerminal) or the projection is removed, the stamp remains.
+    // The managed-output gate must not brick such a session: with no active
+    // projection it is an ordinary session and may send ordinary IM.
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+    })).toEqual({ ok: true, kind: 'ordinary' });
+    // A stale IM turn origin does not upgrade it to listener_thread, but the
+    // session still sends as ordinary (not origin_unproven).
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'om_current', currentImTurnOrigin: imOrigin,
+    })).toEqual({ ok: true, kind: 'ordinary' });
+  });
+
   it('fences an explicit IM send after removal or ownership churn', () => {
     seed('silent');
     expect(applyVcMeetingMemberProjection(dir, {
@@ -213,10 +273,13 @@ describe('evaluateVcMeetingManagedSend', () => {
       sinkOwnerGeneration: 1, joinedAtIngestSeq: 0,
       receiverSessionId: 'receiver-session', outputChatId: 'listener-chat',
     })).toMatchObject({ ok: true });
+    // Plan B: after removal there is no active projection, so the session is
+    // ordinary again — the stale IM turn origin does not authorize a
+    // listener_thread send, but ordinary sends are allowed (not bricked).
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
       turnId: 'om_current', currentImTurnOrigin: imOrigin,
-    })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
+    })).toEqual({ ok: true, kind: 'ordinary' });
 
     const epoch2 = { ...memberKey, memberEpoch: 2 };
     expect(applyVcMeetingMemberProjection(dir, {
@@ -227,6 +290,8 @@ describe('evaluateVcMeetingManagedSend', () => {
       sinkOwnerGeneration: 2, joinedAtIngestSeq: 0,
       receiverSessionId: 'receiver-session', outputChatId: 'listener-chat',
     })).toMatchObject({ ok: true });
+    // Ownership churn: epoch 2 is active, but the IM turn origin is epoch 1
+    // (stale). An active projection keeps the fail-closed gate.
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
       turnId: 'om_current', currentImTurnOrigin: imOrigin,
@@ -358,5 +423,37 @@ describe('evaluateVcMeetingManagedSend', () => {
       claimedTurnId: 'delivery-key',
       claimedDispatchAttempt: 1,
     })).toMatchObject({ ok: false, errorCode: 'origin_unproven' });
+  });
+});
+
+describe('human summary-share authority', () => {
+  function input() {
+    const grant = { ...imOrigin, replyTargetSenderOpenId: 'ou_human', summaryShareTargetChatId: 'oc_destination' };
+    return { agentAppId: 'agent', session: { sessionId: grant.receiverSessionId, vcMeetingImTurnOrigins: { om_current: grant } },
+      liveOrigin: { capability: 'live-secret', turnId: 'om_current' } as { capability: string; turnId: string; dispatchAttempt?: number },
+      claimedCapability: 'live-secret' };
+  }
+  it('authorizes an exact human turn even after automatic delivery has completed', () => {
+    seed('listener_thread', 'auto', 'decision_v1', true);
+    completeVcMeetingDelivery(dir, { ...memberKey, deliveryKey: 'delivery-key' }, { dispatchAttempt: 1 });
+    expect(authorizeVcMeetingSummaryShare(dir, input()).summaryShareTargetChatId).toBe('oc_destination');
+  });
+  it('keeps sharing disabled for an old or explicitly disabled meeting', () => {
+    seed('listener_thread');
+    expect(() => authorizeVcMeetingSummaryShare(dir, input())).toThrow('human_share_authorization_required');
+  });
+  it('rejects stale capabilities, automatic deliveries, other apps and subsequent human turns', () => {
+    seed('listener_thread', 'auto', 'decision_v1', true);
+    const request = input();
+    for (const changed of [
+      { ...request, claimedCapability: 'old-secret' },
+      { ...request, agentAppId: 'other-app' },
+      { ...request, liveOrigin: { ...request.liveOrigin, dispatchAttempt: 1 } },
+      { ...request, liveOrigin: { ...request.liveOrigin, turnId: 'delivery-key' } },
+      { ...request, liveOrigin: { ...request.liveOrigin, turnId: 'om_next' } },
+      { ...request, session: { ...request.session, sessionId: 'other-session' } },
+    ]) expect(() => authorizeVcMeetingSummaryShare(dir, changed)).toThrow();
+    request.session.vcMeetingImTurnOrigins.om_current.membershipGeneration += 1;
+    expect(() => authorizeVcMeetingSummaryShare(dir, request)).toThrow();
   });
 });

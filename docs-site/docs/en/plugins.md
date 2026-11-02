@@ -43,11 +43,16 @@ publisher.
 
 ## Create a project
 
-Botmux currently requires Node.js 22 or newer. Install Botmux, then run the
-generator:
+Plugin **development** requires Node.js 22 or newer with `npm` on your `PATH` —
+the generator shells out to npm to scaffold, install, and test the project. (This
+is a requirement of plugin development specifically; botmux itself is a
+self-contained binary and needs no Node — see [Quickstart](/en/quickstart).)
+
+Install botmux by whichever route you prefer, then run the generator:
 
 ```bash
-npm install -g botmux@latest
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+# or, if you'd rather install through npm: npm install -g botmux@latest
 
 botmux plugin init my-plugin
 cd botmux-plugin-my-plugin
@@ -225,6 +230,41 @@ Botmux aggregates the enabled MCP servers for a session through one MCP Gateway.
 The plugin set and credential snapshot are fixed for the lifetime of a CLI
 process, so create a new session after changing bindings or configuration.
 
+#### Trusted caller identity injection
+
+When a turn is triggered by a real IM user, the Gateway injects a
+**host-stamped, model-unforgeable** caller identity into forwarded `tools/call`
+requests, for plugins that need per-user authorization or auditing. The
+contract:
+
+- The identity appears in two places: `_meta.botmuxTrustedCaller` on the MCP
+  request (injected for both `stdio` and `streamable-http`), and, for
+  `streamable-http`, the `x-botmux-trusted-open-id` / `x-botmux-trusted-union-id`
+  / `x-botmux-trusted-app-id` request headers (plus `x-botmux-turn-id` /
+  `x-botmux-dispatch-attempt`). The fields inside `botmuxTrustedCaller` are
+  `requestUserOpenId` / `requestUserUnionId` / `requestLarkAppId`.
+- **Trust only these `botmux`-namespaced keys.** Before injecting, the Gateway
+  **unconditionally strips** any client- (model-) supplied `_meta` key that
+  starts with `botmux`, and any inbound `x-botmux-trusted-*` header — whether or
+  not a host identity exists for the turn. A model therefore cannot impersonate
+  anyone by putting `_meta.botmuxTrustedCaller` in the tool arguments.
+- Conversely, do **not** read bare keys (an un-namespaced `requestUserUnionId`,
+  a custom `trustedCaller`, etc.) as an identity source: those are outside the
+  strip set and can be freely set by the model.
+- Not every turn has a trusted identity: system/recovery turns, and turns whose
+  sender has no `open_id`/`union_id`, inject nothing. Plugins must **fail closed**
+  when `botmuxTrustedCaller` is absent (refuse the identity-bound operation)
+  rather than falling back to any model-reported value.
+- The identity lives only in the host worker's process memory, set per turn, and
+  is never written to a file; do not surface it (or the transport token) to users
+  or logs.
+
+Background and design (Feishu docs): [Botmux Plugin Development and Market
+Registration Guide](https://bytedance.larkoffice.com/docx/FE2mdNdSgoFMVuxWTS7ctqO6nFb)
+and the [Agent Chrome Plugin Guide](https://bytedance.larkoffice.com/docx/RJPfdn0oHoC5zgxVXH1cKMjFnqc)
+(the latter is a full worked example of packaging MCP + Skill + Service into a
+`@botmux-ai/plugin-*` with per-session isolation).
+
 ### Dashboard
 
 `src/dashboard/index.js` default-exports a component:
@@ -241,7 +281,32 @@ provides:
 - `getServiceStatus()`;
 - `startService()`;
 - `stopService()`;
-- `restartService()`.
+- `restartService()`;
+
+- `react`: the host React instance (use it instead of bundling another copy);
+- `getSettings()`: read the adapter's browser-safe settings;
+- `saveSettings(value)`: save a JSON value through the adapter;
+- `listBots()`: list the manageable bots.
+
+Settings require an explicit `dist/server/settings.js` ES module exporting both methods:
+
+```ts
+export function getSettings(api: { config: PluginConfigApi }): unknown | Promise<unknown>;
+export function saveSettings(api: { config: PluginConfigApi }, value: unknown): unknown | Promise<unknown>;
+```
+
+`api` contains **only `config`**, with `get(key?)`, `set(key, value)`,
+`replace(object)` and `path`. It is not `baseApi`: there is no `runtime`,
+`logger`, `resolve`, or `settingsPath`. Use the controlled config API and
+explicitly select safe fields; never return the raw `config.json` or secrets.
+Both methods may return a JSON-serializable value or void; null/undefined
+is normalized to `{ ok: true }`. Malformed request JSON returns 400; missing
+plugins/adapters return 404; unsupported methods return 405. Adapter failures,
+invalid exports and non-serializable results return a complete 500 JSON response
+with the generic `plugin_settings_failed` code, never the internal exception.
+The adapter exports are checked when requested, without executing plugin code
+in the convention scanner.
+
 
 Dashboard code runs inside the authority boundary of the user who installed
 Botmux. Do not render sensitive configuration into the page or browser logs.

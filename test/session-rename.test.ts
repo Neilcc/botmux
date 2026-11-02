@@ -37,6 +37,7 @@ function liveWorker(send = vi.fn()): any {
 describe('requestAgentSessionRename', () => {
   it.each([
     ['codex', '/bin/codex'],
+    ['traex', '/bin/traex'],
     ['claude-code', '/bin/claude'],
   ] as const)('sends the dedicated IPC for live %s sessions', (cliId, cliPathOverride) => {
     const send = vi.fn();
@@ -78,10 +79,10 @@ describe('requestAgentSessionRename', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('never sends a TUI command through the riff backend', () => {
+  it.each(['riff', 'mojo', 'remote-runner'] as const)('never sends a TUI command through the %s backend', backendType => {
     const send = vi.fn();
     const ds = makeDs({
-      session: { ...makeDs().session, backendType: 'riff' },
+      session: { ...makeDs().session, backendType },
       worker: liveWorker(send),
     });
 

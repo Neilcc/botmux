@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node >= 22">
+  <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
@@ -36,35 +36,69 @@ A daemon watches Lark messages and spawns an isolated session process for each n
 
 ## 5-Minute Setup
 
-> About 5 minutes: a single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (add `--no-open-platform-auto` to only create the app and skip the permission + publish automation, which you then complete manually; creating the app manually / pasting credentials is a separate option inside setup).
+> A single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (manual app creation / credential entry is also supported).
 
 ```bash
-npm install -g botmux        # requires Node >= 22
-botmux setup                 # one scan to create the app → pick a CLI → pick a working dir (permissions + publish auto-configured)
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+botmux setup                 # one scan to create app → pick CLI → pick working dir (auto-configured)
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
 
-Then DM the bot, or run `botmux dashboard` to create a group, and start chatting. Full steps (Lark international, manual permission / publish setup after `--no-open-platform-auto`, troubleshooting) are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
+- **Self-contained single-file binary**: Runtime and PTY are embedded — **no Node required on the host to install or run**. Supports Linux / macOS (x64 / arm64, stable Apple Developer ID signature for official macOS builds); on Windows, run inside WSL2.
+- **Seamless upgrade**: Run `botmux upgrade` or re-run the curl command above for safe in-place upgrades.
+- **Full Guide**: Lark international edition, manual permission configuration, and troubleshooting are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
+
+<details>
+<summary>Prefer the Node / npm ecosystem? npm works too (same binary)</summary>
+
+```bash
+npm install -g botmux        # requires Node >= 22 for installation
+```
+
+The npm package contains the identical binary with the same commands and capabilities.
+
+</details>
+
+Then DM the bot, or run `botmux dashboard` to create a group and start chatting.
 
 ## Core Scenarios
 
 - **[Live streaming cards](https://deepcoldy.github.io/botmux/en/cards)** — one live-updating card per turn, relaying the terminal screen verbatim as a screenshot; one tap to show/hide output, scroll, or restart/close/adopt the session.
 - **[Multi-bot collaboration](https://deepcoldy.github.io/botmux/en/multi-bot)** — multi-bot @mention routing in one group; different CLIs mean different models and natural diversity — have them critique each other on design reviews, code reviews, tech-stack choices.
+- **[Zero prompt injection](https://bytedance.larkoffice.com/docx/IECddVsSFotuuXx8gf3cQdKqnCd)** — skips framework prompt / role / skill injection to pass clean task prompts straight to the CLI, capturing answers from transcripts. Perfect for lead-bot dispatching sub-bots.
+- **[Principal lanes](docs/principal-lanes.md)** — isolate turns across users with independent CLI contexts and git worktrees within the same group.
 - **[Multi-topic orchestration](https://deepcoldy.github.io/botmux/en/multi-topic)** — hand an orchestrator a big task and it seeds topics in the group, spins up an isolated session per bot to run a pipeline, and the Lark task board shows every subtask's progress at a glance.
 - **[Interactive web terminal](https://deepcoldy.github.io/botmux/en/web-terminal)** — not just viewing output: drive the CLI directly from a browser / phone, with a floating shortcut bar on mobile (Esc, Ctrl+C, arrow keys).
-- **[Adopt & relay sessions](https://deepcoldy.github.io/botmux/en/adopt)** — running halfway in local tmux, `/adopt` it from your phone; `/relay` moves the whole session (same process, same memory) into a team group to continue.
+- **[Adopt & relay sessions](https://deepcoldy.github.io/botmux/en/adopt)** — pick up a running tmux, Zellij, Herdr, or Orca (experimental) session from your phone with `/adopt`; `/relay` moves the whole session (same process, same memory) into a team group to continue.
 - **[Scheduled tasks](https://deepcoldy.github.io/botmux/en/schedule) & [external triggers](https://deepcoldy.github.io/botmux/en/webhook)** — configure recurring tasks in natural language (alert analysis / group summaries); trigger programmatically from external systems via [Webhook](https://deepcoldy.github.io/botmux/en/webhook) or the [task-trigger API](https://deepcoldy.github.io/botmux/en/api-task-trigger).
 - **[On-call mode](https://deepcoldy.github.io/botmux/en/oncall) & [voice summary](https://deepcoldy.github.io/botmux/en/voice)** — pull it into an on-call group and any member's @ triggers a probe in the project dir; once TTS is configured, each card footer gains a 🔊 voice-summary button that makes the model "speak plainly".
 
-More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sandbox](https://deepcoldy.github.io/botmux/en/sandbox) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [tmux persistence](https://deepcoldy.github.io/botmux/en/tmux) · [VC meeting agent (showcase)](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg).
+More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sandbox](https://deepcoldy.github.io/botmux/en/sandbox) · [Final answer feedback](docs/feedback-capability-current-implementation.md) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [tmux persistence](https://deepcoldy.github.io/botmux/en/tmux) · [VC meeting agent (showcase)](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg).
+
+## Per-Bot Zero Prompt Injection
+
+Designed for multi-agent dispatch pipelines (lead-bot delegating tasks to sub-bots). Bypasses all botmux system prompts, per-turn reminders, identity envelopes, roles, and skill directory injections, while automatically collecting final replies from CLI transcripts.
+
+- ✨ **Showcase and Guide**: [Feishu Illustrated Showcase](https://bytedance.larkoffice.com/docx/IECddVsSFotuuXx8gf3cQdKqnCd)
+- 📑 **Technical Spec & Compatibility**: [Zero Prompt Injection Spec](docs/zero-prompt-injection.md)
+
+**Quick Setup**:
+- **Dashboard**: Bot Config → Select Bot → Advanced → Toggle "Zero Injection" (or group bots under Agent Config).
+- **`bots.json`**: Set `"promptInjection": "none"` on the corresponding bot entry (`"default"` or omitting restores default behavior).
 
 ## Supported CLIs & Agents
 
-Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process). Representative ones:
+Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents:
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `aiden` · `coco` (TRAE) · `hermes` · `mira` · `riff` (cloud agent) …
+`claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([Configuration Guide](docs/ebsd.md)) · `mira` · `riff` (cloud agent) · `mojo` · `remote-runner` ([Remote Runner Protocol](docs/remote-runner.md)) · `minimax` ([MiniMax Code](docs/minimax-code.md)) · `zcode` (ZCode TUI; the adapter declares `interruptKey: 'esc'` and preempts a running turn when a new message arrives) …
 
-The current full set of `cliId`s is authoritative in [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts); per-CLI config and wrapper / gateway setups are in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
+- **Gemini CLI removed**: the `gemini` adapter is gone; use `antigravity` instead. A bot still set to `cliId: "gemini"` refuses to start with a hint to switch to Antigravity, and other bots are unaffected; Gemini-specific `cliPathOverride` / `wrapperCli` / `model` / `GEMINI_CLI_HOME` do not carry over. See the [migration notes](https://deepcoldy.github.io/botmux/en/adapters#gemini-cli-has-been-removed).
+- **Session-level CLI Selection**: Select a registered CLI for an upcoming session with `/cli <cliId>`.
+- **Codex Multi-Account & Instances**: Configure multiple login homes and distribution strategies via [Session-level Codex Instances](docs/codex-instances.md).
+- **Compatible Distributions**: Codex-compatible and Kimi-compatible distributions can declare independent identities via `cliRuntime`, see [Codex-compatible Distributions](https://deepcoldy.github.io/botmux/en/adapters#codex-compatible-distributions).
+- **Shared Memory (Optional)**: Enable cross-agent persistent memory with [OpenViking Shared Memory](examples/openviking-memory/README.md).
+
+Authoritative `cliId` list and wrapper setups are documented in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 
@@ -81,6 +115,11 @@ The table below compares only **verifiable integration boundaries** — it does 
 | Multi-bot | Multi-bot @mention routing in one group | Depends on the implementation |
 | Direct terminal | Local CLIs can `tmux attach` into the real process | Depends on the implementation |
 
+## Advanced Integrations
+
+- **[Signed Chat Defaults](docs/signed-chat-defaults.md)** — Automated chat provisioning services can declare default `ambient` (mention-free) modes for standard groups via signed bindings.
+- **[Model Proxy Mode](docs/model-proxy.md)** — External applications (such as [OpenCodeReview](https://github.com/alibaba/open-code-review)) can access CLI model capabilities through an authenticated local Chat Completions endpoint, backed by [constrained invocation interfaces](docs/constrained-invocations.md).
+
 ## Docs · Community · Contributing
 
 - 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>**
@@ -89,5 +128,13 @@ The table below compares only **verifiable integration boundaries** — it does 
 - 💬 **Community**: the [About & Resources](https://deepcoldy.github.io/botmux/en/about) page has QR entries to join the internal / external "Botmux" chat groups.
 - 🤝 **Contributing**: issues / PRs welcome. To add an adapter, see [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 - 📄 **License**: [MIT](LICENSE)
+
+## Contributors
+
+botmux may well be the most-contributed-to open-source project built specifically for Feishu/Lark — and that is entirely thanks to everyone who has taken part. Thanks to all who have contributed code, documentation, and issues:
+
+<a href="https://github.com/deepcoldy/botmux/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
+</a>
 
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>

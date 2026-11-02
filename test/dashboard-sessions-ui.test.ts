@@ -1,53 +1,51 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { store } from '../src/dashboard/web/store.js';
-import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanState } from '../src/dashboard/web/sessions-kanban.js';
+import { KANBAN_COLUMN_PAGE, SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanState } from '../src/dashboard/web/sessions-kanban.js';
+import { isOffBoardDormant } from '../src/dashboard/web/kanban-model.js';
+import { filterSessionRows, SESSION_STATUS_ANY, type SessionRowFilters } from '../src/dashboard/web/sessions.js';
 import {
   canRestartSession,
   CLI_FILTER_OPTIONS,
   SESSION_STATUS_OPTIONS,
+  clearSessionFilters,
   deriveSessionBoardColumn,
-  groupSessionsByTopic,
+  hasActiveSessionFilters,
   isUnknownChatSession,
+  normalizeStatusFilterForView,
+  preferChatFilterLabel,
+  chatFilterLabelIsUnresolved,
   restartConfirmMessage,
+  resumeErrorMessage,
   historySenderKey,
   sessionLocationText,
   sessionExchangePreview,
-  sessionTopicKey,
   shouldOpenWritableTerminal,
-  previewOverlayReducer,
-  previewOverlayInitialState,
 } from '../src/dashboard/web/sessions.js';
-import { CliFilterGroup, TopicGroupsView } from '../src/dashboard/web/sessions-page.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { previewMarkdownHtml } from '../src/dashboard/web/preview-markdown.js';
 
 const kanbanCallbacks: SessionsKanbanCallbacks = {
   canRestartSession: row => row.status !== 'closed',
-  getTeamChatIds: () => new Set<string>(),
   icons: {
-    details: '<svg></svg>',
     feishu: '<svg></svg>',
     history: '<svg></svg>',
-    key: '<svg></svg>',
     lock: '<svg></svg>',
     restart: '<svg></svg>',
+    close: '<svg></svg>',
     terminal: '<svg></svg>',
     unlock: '<svg></svg>',
   },
   lockActionLabel: row => (row.locked ? 'unlock' : 'lock'),
   sessionStatusText: status => String(status ?? 'unknown'),
+  onClose: () => {},
   onDetails: () => {},
   onHistory: () => {},
   onMoveRows: () => {},
-  onNeedTeamBoard: () => {},
-  onNeedTeams: () => {},
   onOpenTerminal: () => {},
-  onOpenWritableTerminal: () => {},
   onRename: () => {},
   onRestart: () => {},
-  onTeamScope: () => {},
   onToggleLock: () => {},
   onToggleSelect: () => {},
   selectedSessionIds: new Set<string>(),
@@ -56,12 +54,6 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
 function renderKanban(state: Partial<SessionsKanbanState>): string {
   const fullState: SessionsKanbanState = {
     rows: [],
-    groupBy: 'flow',
-    teams: [],
-    teamsLoaded: true,
-    teamKey: '',
-    teamBoardData: null,
-    teamBoardKey: '',
     ...state,
   };
   return renderToStaticMarkup(createElement(SessionsKanbanView, {
@@ -70,6 +62,18 @@ function renderKanban(state: Partial<SessionsKanbanState>): string {
     ...fullState,
   }));
 }
+
+describe('dashboard session resume errors', () => {
+  it.each([
+    ['zh', '该会话的工作区已回收，无法恢复。请在有效工作区创建新会话。', '恢复失败'],
+    ['en', 'This session’s workspace has been reclaimed and the session cannot be resumed. Create a new session in a valid workspace.', 'Resume failed'],
+  ] as const)('explains retirement in %s and preserves other failure details', (locale, message, failure) => {
+    const translate = createDashboardTranslator(locale);
+    expect(resumeErrorMessage('workspace_retired', translate)).toBe(message);
+    expect(resumeErrorMessage('daemon_unavailable', translate)).toBe(`${failure}: daemon_unavailable`);
+    expect(resumeErrorMessage(503, translate)).toBe(`${failure}: 503`);
+  });
+});
 
 describe('dashboard sessions filters', () => {
   it('shows only a current bot reply in the latest exchange preview', () => {
@@ -161,56 +165,17 @@ describe('dashboard sessions filters', () => {
     });
   });
 
-  it('renders accessible user and bot preview lines on session cards', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    expect(page).toContain('className="session-card-exchange"');
-    expect(page).toContain("t('sessions.history.user')");
-    expect(page).toContain("t('sessions.history.bot')");
-    expect(page).toContain('className="session-card-exchange-tooltip"');
-    // Overlay carries interactive Markdown links, so it is a non-modal dialog
-    // (not a tooltip): keyboard-focusable and reachable.
-    expect(page).toContain('role="dialog"');
-    expect(page).toContain("t('sessions.preview.showFull')");
-    expect(page).toContain('aria-expanded={open}');
-    expect(page).toContain('onPointerEnter={event => {');
-    expect(page).toContain("if (event.key === 'Escape') hide();");
-    // Card summary stays plain-text (2-line clamp); the overlay renders Markdown.
-    expect(page).toContain('<p>{exchange.userText}</p>');
-    expect(page).toContain('<p>{exchange.botText}</p>');
-    expect(css).toContain('.session-card-exchange-line > p');
-    expect(css).toContain('-webkit-line-clamp: 2');
-    expect(css).toContain('.session-card-exchange-tooltip {');
-    expect(css).toContain('position: fixed;');
-    expect(css).toContain('.session-card-exchange-tooltip-scroll {');
-    expect(css).toContain('.session-card-exchange-tooltip-line > p');
-    expect(css).toContain('user-select: text;');
-  });
-
-  it('renders the full-exchange overlay as sanitized Markdown, not raw text', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-    const md = readFileSync(new URL('../src/dashboard/web/preview-markdown.ts', import.meta.url), 'utf8');
-
-    // The overlay renders both sides through the Markdown helper (raw HTML off
-    // for XSS safety), replacing the old raw `<p>{fullText}</p>` nodes.
-    expect(page).toContain("import { previewMarkdownHtml } from './preview-markdown.js'");
-    expect(page).toContain('previewMarkdownHtml(exchange.userFullText)');
-    expect(page).toContain('previewMarkdownHtml(exchange.botFullText)');
-    expect(page).toContain('className="session-card-exchange-md"');
-    expect(page).not.toContain('<p>{exchange.userFullText}</p>');
-    expect(page).not.toContain('<p>{exchange.botFullText}</p>');
-
-    // Reuses markdown-it with the same hardening insights.ts applies: no raw
-    // HTML, links forced to a safe scheme, and a plain-text escape fallback.
-    expect(md).toContain("new MarkdownIt({ html: false");
-    expect(md).toContain('validateLink');
-    expect(md).toContain("attrSet('rel', 'noopener noreferrer nofollow')");
-    expect(md).toContain('escapeHtml');
-
-    // Overlay Markdown body is styled with dashboard tokens (no new palette).
-    expect(css).toContain('.session-card-exchange-md');
+  it('links preview Markdown only to http(s)/mailto targets and opens them without an opener', () => {
+    const safe = previewMarkdownHtml('[docs](https://example.com/guide)');
+    expect(safe).toContain('href="https://example.com/guide"');
+    expect(safe).toContain('target="_blank"');
+    expect(safe).toContain('rel="noopener noreferrer nofollow"');
+    expect(previewMarkdownHtml('[mail](mailto:ops@example.com)')).toContain('href="mailto:ops@example.com"');
+    // markdown-it's default validator would accept these; the preview must not
+    // turn a prompt or bot reply into a clickable dashboard-relative or ftp link.
+    for (const unsafe of ['[x](/api/sessions/s1/close)', '[x](ftp://host/file)', '[x](javascript:alert(1))']) {
+      expect(previewMarkdownHtml(unsafe)).not.toContain('href=');
+    }
   });
 
   it('never emits an auto-loading <img> for Markdown image syntax (SSRF / tracking-pixel safe)', () => {
@@ -235,280 +200,6 @@ describe('dashboard sessions filters', () => {
     expect(previewMarkdownHtml('**bold**')).toContain('<strong>bold</strong>');
     // Raw HTML / script stays escaped.
     expect(previewMarkdownHtml('<script>alert(1)</script>')).not.toMatch(/<script/i);
-  });
-
-  it('keeps the overlay open and reachable for keyboard focus into Markdown links', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-
-    // Focus entering the panel cancels the trigger's blur-close timer, so
-    // Tabbing into a rendered link does not unmount the overlay mid-navigation.
-    expect(page).toContain('onFocusCapture={clearHide}');
-    // It only closes once focus leaves BOTH the panel and the trigger.
-    expect(page).toContain('tooltipRef.current?.contains(next) || triggerRef.current?.contains(next)');
-    // Escape closes and returns focus to the trigger.
-    expect(page).toContain('triggerRef.current?.focus()');
-    // Popover semantics on the trigger (not aria-describedby on a tooltip).
-    expect(page).toContain('aria-haspopup="dialog"');
-    expect(page).toContain('aria-controls={open ? tooltipId : undefined}');
-  });
-
-  it('Escape then refocus does not reopen the overlay (reducer the component actually uses)', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-
-    // Guard against "test the model, run other code": assert the component wires
-    // its useReducer to THIS reducer + dispatches the transitions under test.
-    expect(page).toContain('useReducer(previewOverlayReducer, previewOverlayInitialState)');
-    expect(page).toContain("dispatch('escape-refocus')");
-    expect(page).toContain("dispatch('focus')");
-
-    // Now EXECUTE the transitions in the exact order the Escape key produces:
-    // an open overlay with focus inside → 'escape-refocus' (close + arm one-shot)
-    // → the trigger's programmatic refocus dispatches 'focus'. The one-shot must
-    // be consumed WITHOUT reopening, so the terminal state is closed.
-    let state = previewOverlayInitialState;
-    state = previewOverlayReducer(state, 'open');
-    expect(state.open).toBe(true);
-    state = previewOverlayReducer(state, 'escape-refocus');
-    expect(state).toEqual({ open: false, suppressFocusOpen: true });
-    state = previewOverlayReducer(state, 'focus');
-    expect(state).toEqual({ open: false, suppressFocusOpen: false });
-
-    // A normal (non-suppressed) focus opens; suppress is one-shot only.
-    expect(previewOverlayReducer(previewOverlayInitialState, 'focus'))
-      .toEqual({ open: true, suppressFocusOpen: false });
-    // A second focus after the consumed one-shot opens as usual.
-    expect(previewOverlayReducer({ open: false, suppressFocusOpen: false }, 'focus').open).toBe(true);
-  });
-
-  it('drops the ••• details button and makes the preview body itself the toggle', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
-
-    // The dedicated ••• button is gone entirely — content + markup + styles.
-    expect(page).not.toContain('•••');
-    expect(page).not.toContain('session-card-exchange-details');
-    expect(css).not.toContain('.session-card-exchange-details');
-
-    // The exchange body itself is now the toggle: keyboard + pointer reachable,
-    // so touch users (no hover) and keyboard users keep a way to open the
-    // overlay that the ••• button used to provide.
-    const exchangeStart = page.indexOf('className="session-card-exchange"');
-    expect(exchangeStart).toBeGreaterThan(-1);
-    const exchangeAttrs = page.slice(exchangeStart - 400, exchangeStart + 400);
-    expect(exchangeAttrs).toContain('role="button"');
-    expect(exchangeAttrs).toContain('tabIndex={0}');
-    // Enter/Space toggles the overlay for keyboard users.
-    expect(page).toContain("event.key === 'Enter' || event.key === ' '");
-    expect(css).toContain('.session-card-exchange {');
-    expect(css).toContain('cursor: pointer;');
-  });
-
-  it('wires @ completion and pasted-image previews into the create-session composer', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-
-    expect(page).toContain('findMentionTrigger');
-    expect(page).toContain('onPaste={event => { void handleContentPaste(event); }}');
-    expect(page).toContain('event.preventDefault();');
-    expect(page).toContain('images: images.map(image => ({');
-    expect(page).toContain('className="cs-image-list"');
-    expect(page).toContain('insertImageMarkers(content, pasteStart, pasteEnd');
-    expect(page).toContain('className="cs-image-remove"');
-    expect(page).toContain('removeAndReindexImageMarkers(');
-    expect(page).toContain('nextImageOrdinalRef.current = remaining.length + 1;');
-  });
-
-  it('reads filter input values before entering React state updaters', () => {
-    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
-
-    expect(page).toContain('const q = event.currentTarget.value;');
-    expect(page).toContain('const active = event.currentTarget.checked;');
-    expect(page).toContain('const multiBotTopics = event.currentTarget.checked;');
-    expect(page).toContain('const botTriggeredTopics = event.currentTarget.checked;');
-    expect(page).not.toContain('q: event.currentTarget.value');
-    expect(page).not.toContain('active: event.currentTarget.checked');
-    expect(page).not.toContain('multiBotTopics: event.currentTarget.checked');
-    expect(page).not.toContain('botTriggeredTopics: event.currentTarget.checked');
-  });
-
-  it('groups thread sessions by chat and root message without claiming ancestry', () => {
-    const rows = [
-      {
-        sessionId: 'codex',
-        chatId: 'oc_coding',
-        rootMessageId: 'om_topic',
-        scope: 'thread',
-        larkAppId: 'app_codex',
-        botName: 'Nil-Codex',
-        status: 'working',
-        title: '@Nil-Codex 协作排查',
-        spawnedAt: 10,
-        lastMessageAt: 100,
-        lastInputFromBot: true,
-      },
-      {
-        sessionId: 'traex',
-        chatId: 'oc_coding',
-        rootMessageId: 'om_topic',
-        scope: 'thread',
-        larkAppId: 'app_traex',
-        botName: 'Nil-TraeX',
-        status: 'closed',
-        title: '后续处理',
-        spawnedAt: 20,
-        lastMessageAt: 90,
-      },
-      {
-        sessionId: 'other-topic',
-        chatId: 'oc_coding',
-        rootMessageId: 'om_other',
-        scope: 'thread',
-        larkAppId: 'app_codex',
-        botName: 'Nil-Codex',
-        status: 'idle',
-        lastMessageAt: 80,
-      },
-    ];
-
-    const groups = groupSessionsByTopic(rows);
-    expect(groups).toHaveLength(2);
-    expect(sessionTopicKey(rows[0])).toBe(sessionTopicKey(rows[1]));
-    expect(sessionTopicKey(rows[0])).not.toBe(sessionTopicKey(rows[2]));
-    expect(groups[0]).toMatchObject({
-      kind: 'thread',
-      chatId: 'oc_coding',
-      rootMessageId: 'om_topic',
-      title: '@Nil-Codex 协作排查',
-      botCount: 2,
-      activeCount: 1,
-      closedCount: 1,
-      inferredBotInputCount: 1,
-      multiBot: true,
-      inferredBotTriggered: true,
-    });
-    expect(groups[0].rows.map(row => row.sessionId)).toEqual(['codex', 'traex']);
-  });
-
-  it('groups chat-scope sessions at whole-chat granularity', () => {
-    const first = { sessionId: 'a', chatId: 'oc_chat', rootMessageId: 'om_a', scope: 'chat', status: 'idle' };
-    const second = { sessionId: 'b', chatId: 'oc_chat', rootMessageId: 'om_b', scope: 'chat', status: 'idle' };
-    const groups = groupSessionsByTopic([first, second]);
-
-    expect(sessionTopicKey(first)).toBe(sessionTopicKey(second));
-    expect(groups).toHaveLength(1);
-    expect(groups[0]).toMatchObject({ kind: 'chat', chatId: 'oc_chat' });
-    expect(groups[0].rootMessageId).toBeUndefined();
-  });
-
-  it('keeps thread sessions with incomplete topic anchors separate', () => {
-    const first = {
-      sessionId: 'a', chatId: 'oc_chat', rootMessageId: '', scope: 'thread',
-      larkAppId: 'app_a', status: 'idle',
-    };
-    const second = {
-      sessionId: 'b', chatId: 'oc_chat', scope: 'thread',
-      larkAppId: 'app_b', status: 'idle',
-    };
-    const groups = groupSessionsByTopic([first, second]);
-
-    expect(sessionTopicKey(first)).not.toBe(sessionTopicKey(second));
-    expect(groups).toHaveLength(2);
-    expect(groups.every(group => group.kind === 'session')).toBe(true);
-    expect(groups.every(group => !group.multiBot)).toBe(true);
-  });
-
-  it('does not infer multiple Bots from sessions whose Bot identity is missing', () => {
-    const groups = groupSessionsByTopic([
-      { sessionId: 'a', chatId: 'oc_chat', rootMessageId: 'om_topic', scope: 'thread', status: 'idle' },
-      { sessionId: 'b', chatId: 'oc_chat', rootMessageId: 'om_topic', scope: 'thread', status: 'idle' },
-    ]);
-
-    expect(groups).toHaveLength(1);
-    expect(groups[0]).toMatchObject({ botCount: 1, multiBot: false });
-  });
-
-  it('renders topic aggregation with multi-Bot and inferred trigger signals', () => {
-    const html = renderToStaticMarkup(createElement(TopicGroupsView, {
-      rows: [
-        {
-          sessionId: 'codex', chatId: 'oc_coding', rootMessageId: 'om_topic', scope: 'thread',
-          larkAppId: 'app_codex', botName: 'Nil-Codex', cliId: 'codex', status: 'working',
-          title: '@Nil-Codex 协作排查', lastMessageAt: 100, lastInputFromBot: true,
-        },
-        {
-          sessionId: 'traex', chatId: 'oc_coding', rootMessageId: 'om_topic', scope: 'thread',
-          larkAppId: 'app_traex', botName: 'Nil-TraeX', cliId: 'traex', status: 'idle',
-          title: '后续处理', lastMessageAt: 90,
-        },
-      ],
-      selected: new Set<string>(),
-      hidden: false,
-      onToggleSelect: () => {},
-      onOpen: () => {},
-      onHistory: () => {},
-      onLocate: async () => true,
-      onRestart: () => {},
-      onLock: () => {},
-      onClose: () => {},
-    }));
-
-    expect(html).toContain('class="session-topic-group multi-bot inferred-bot-trigger"');
-    expect(html).toContain('data-topic-key="thread');
-    expect(html).toContain('多 Bot 协作');
-    expect(html).toContain('1 个会话最近由 Bot 唤醒（推断）');
-    expect((html.match(/<article class="session-card/g) ?? []).length).toBe(2);
-  });
-
-  it('labels an incomplete topic anchor as a single session', () => {
-    const html = renderToStaticMarkup(createElement(TopicGroupsView, {
-      rows: [{
-        sessionId: 'orphan', chatId: 'oc_coding', rootMessageId: '', scope: 'thread',
-        larkAppId: 'app_codex', botName: 'Nil-Codex', cliId: 'codex', status: 'idle',
-        lastMessageAt: 100,
-      }],
-      selected: new Set<string>(),
-      hidden: false,
-      onToggleSelect: () => {},
-      onOpen: () => {},
-      onHistory: () => {},
-      onLocate: async () => true,
-      onRestart: () => {},
-      onLock: () => {},
-      onClose: () => {},
-    }));
-
-    expect(html).toContain('>单会话</code>');
-    expect(html).not.toContain('整群会话');
-  });
-
-  it('keeps full topic relation metadata when current filters hide sibling sessions', () => {
-    const visible = {
-      sessionId: 'codex', chatId: 'oc_coding', rootMessageId: 'om_topic', scope: 'thread',
-      larkAppId: 'app_codex', botName: 'Nil-Codex', cliId: 'codex', status: 'working',
-      title: '协作排查', lastMessageAt: 100,
-    };
-    const hiddenClosed = {
-      sessionId: 'traex', chatId: 'oc_coding', rootMessageId: 'om_topic', scope: 'thread',
-      larkAppId: 'app_traex', botName: 'Nil-TraeX', cliId: 'traex', status: 'closed',
-      title: '后续处理', lastMessageAt: 90, lastInputFromBot: true,
-    };
-    const html = renderToStaticMarkup(createElement(TopicGroupsView, {
-      rows: [visible],
-      relationRows: [visible, hiddenClosed],
-      selected: new Set<string>(),
-      hidden: false,
-      onToggleSelect: () => {},
-      onOpen: () => {},
-      onHistory: () => {},
-      onLocate: async () => true,
-      onRestart: () => {},
-      onLock: () => {},
-      onClose: () => {},
-    }));
-
-    expect(html).toContain('session-topic-group multi-bot inferred-bot-trigger');
-    expect(html).toContain('2 个会话');
-    expect(html).toContain('1 已关闭');
-    expect((html.match(/<article class="session-card/g) ?? []).length).toBe(1);
   });
 
   it('surfaces stalled sessions as a filterable needs-you state', () => {
@@ -559,6 +250,31 @@ describe('dashboard sessions filters', () => {
     expect(isUnknownChatSession({}, () => null)).toBe(false);
   });
 
+  it('detects chat-filter labels that still fall back to the raw chatId', () => {
+    expect(chatFilterLabelIsUnresolved('单聊 · oc_dm - Nil-RD', 'oc_dm')).toBe(true);
+    expect(chatFilterLabelIsUnresolved('单聊 · 韩毅 - Nil-RD', 'oc_dm')).toBe(false);
+    expect(chatFilterLabelIsUnresolved('群聊 · oc_group', 'oc_group')).toBe(true);
+    expect(chatFilterLabelIsUnresolved('anything', '')).toBe(false);
+  });
+
+  it('prefers a resolved chat-filter label over a raw-id one during dedup', () => {
+    // Same p2p chatId: one row resolved the human name, another (a scheduled
+    // task with no user sender) fell back to the raw id. The resolved name must
+    // win regardless of arrival order, even though ASCII `oc_…` sorts before CJK.
+    const resolved = '单聊 · 韩毅 - 韩毅';
+    const rawId = '单聊 · oc_cfa427 - 韩毅';
+    expect(preferChatFilterLabel(undefined, rawId, 'oc_cfa427')).toBe(rawId);
+    expect(preferChatFilterLabel(rawId, resolved, 'oc_cfa427')).toBe(resolved);
+    expect(preferChatFilterLabel(resolved, rawId, 'oc_cfa427')).toBe(resolved);
+  });
+
+  it('falls back to a deterministic lexicographic pick when both labels are equally resolved', () => {
+    expect(preferChatFilterLabel('群聊 · B', '群聊 · A', 'oc_x')).toBe('群聊 · A');
+    expect(preferChatFilterLabel('群聊 · A', '群聊 · B', 'oc_x')).toBe('群聊 · A');
+    // Both unresolved (raw id) → still deterministic, no crash.
+    expect(preferChatFilterLabel('群聊 · oc_x', '群聊 · oc_x', 'oc_x')).toBe('群聊 · oc_x');
+  });
+
   it('groups consecutive app/bot history records by sender identity', () => {
     expect(historySenderKey({ senderType: 'app', senderId: 'ou_bot' }))
       .toBe(historySenderKey({ senderType: 'bot', senderId: 'ou_bot' }));
@@ -572,28 +288,6 @@ describe('dashboard sessions filters', () => {
     expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: true })).toBe(false);
     expect(shouldOpenWritableTerminal({ authed: false, publicReadOnly: false })).toBe(false);
   });
-
-  it('renders the CLI filter as a multi-select checkbox group, not a dropdown', () => {
-    const html = renderToStaticMarkup(createElement(CliFilterGroup, {
-      selected: new Set(CLI_FILTER_OPTIONS),
-      onToggle: () => {},
-    }));
-    // One checkbox per CLI option, named "cli" — never a <select> dropdown.
-    expect(html).toContain('name="cli"');
-    expect(html).not.toContain('<select');
-    expect((html.match(/type="checkbox"/g) ?? []).length).toBe(CLI_FILTER_OPTIONS.length);
-    // Full set selected ⇒ summary shows "all", not the partial/active marker.
-    expect(html).not.toContain('cli-filter-active');
-  });
-
-  it('reflects a partial CLI selection (unchecked entries + active marker)', () => {
-    const selected = new Set(CLI_FILTER_OPTIONS.filter(cli => cli !== 'codex'));
-    const html = renderToStaticMarkup(createElement(CliFilterGroup, { selected, onToggle: () => {} }));
-    expect(html).toContain('value="codex"');
-    expect(html).toContain('cli-filter-active');
-    // Exactly the deselected CLI is unchecked.
-    expect((html.match(/checked=""/g) ?? []).length).toBe(CLI_FILTER_OPTIONS.length - 1);
-  });
 });
 
 describe('dashboard sessions kanban react view', () => {
@@ -602,7 +296,7 @@ describe('dashboard sessions kanban react view', () => {
       rows: [
         { sessionId: 's-backlog', status: 'idle', kanbanColumn: 'backlog', cliId: 'codex', title: 'Backlog', botName: 'Bot A', lastMessageAt: 1000 },
         { sessionId: 's-todo', status: 'idle', cliId: 'codex', title: 'Todo', botName: 'Bot A', lastMessageAt: 2000 },
-        { sessionId: 's-progress', status: 'working', cliId: 'codex', title: 'Working', botName: 'Bot A', lastMessageAt: 3000 },
+        { sessionId: 's-progress', status: 'working', cliId: 'codex', title: 'Working', botName: 'Bot A', lastMessageAt: 3000, webPort: 3001 },
         { sessionId: 's-review', status: 'limited', cliId: 'codex', title: 'Review', botName: 'Bot A', lastMessageAt: 4000 },
         { sessionId: 's-stalled', status: 'stalled', cliId: 'codex-app', title: 'Stalled', botName: 'Bot A', lastMessageAt: 4500 },
         { sessionId: 's-done', status: 'closed', cliId: 'codex', title: 'Done', botName: 'Bot A', lastMessageAt: 5000 },
@@ -617,9 +311,32 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).toContain('class="kanban-card');
     expect(html).toContain('data-id="s-progress"');
     expect(html).toContain('role="button"');
-    expect(html).toContain('class="session-signal"');
+    // 「需要你」原因单独一行，不再挤在卡片头里。
+    expect(html).toContain('class="session-signal kanban-card-reason"');
     expect(html).toContain('长时间无进展');
-    expect(html).toContain('class="card-act kanban-card-act"');
+    // 重设计后：状态色条 + 「终端」文字按钮 + 「⋯」菜单（原 icon rail 已移除）
+    expect(html).toContain('data-signal="needs-you"');
+    expect(html).toContain('class="kanban-card-term"');
+    expect(html).toContain('data-action="more"');
+    expect(html).toContain('kanban-col-dot kanban-col-dot-');
+  });
+
+  it('disables the selection checkbox on closed cards but not on active cards', () => {
+    const html = renderKanban({
+      rows: [
+        { sessionId: 's-active', status: 'idle', cliId: 'codex', title: 'Active', botName: 'Bot A', lastMessageAt: 1000 },
+        { sessionId: 's-closed', status: 'closed', cliId: 'codex', title: 'Closed', botName: 'Bot A', lastMessageAt: 900 },
+      ],
+    });
+    // 已关闭卡片（done 列）勾选框必须 disabled：与表格行一致，避免选中后被下一次 SSE 清空、
+    // 以及批量关闭对已关闭会话再发一次 /close。
+    const closedCard = html.slice(html.indexOf('data-id="s-closed"'));
+    const closedCheck = closedCard.slice(0, 2000).match(/<input[^>]*kanban-card-check[^>]*>/)?.[0] ?? '';
+    expect(closedCheck).toContain('type="checkbox"');
+    expect(closedCheck).toContain('disabled');
+    const activeCard = html.slice(html.indexOf('data-id="s-active"'));
+    const activeCheck = activeCard.slice(0, 2000).match(/<input[^>]*kanban-card-check[^>]*>/)?.[0] ?? '';
+    expect(activeCheck).not.toContain('disabled');
   });
 
   it('clusters cards by chat and preserves the done column cap', () => {
@@ -649,12 +366,34 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).toContain('还有 5 个未显示');
   });
 
+  it('renders only the first page of a long column and offers to show the rest', () => {
+    const extra = 7;
+    const rows = Array.from({ length: KANBAN_COLUMN_PAGE + extra }, (_, i) => ({
+      sessionId: `idle-${i}`,
+      chatId: `oc_${i}`,
+      status: 'idle',
+      cliId: 'codex',
+      title: `Idle ${i}`,
+      botName: 'Bot A',
+      lastMessageAt: 10_000 - i,
+    }));
+    const html = renderKanban({ rows });
+
+    expect((html.match(/data-id="idle-/g) ?? []).length).toBe(KANBAN_COLUMN_PAGE);
+    // 最近活跃的在前：被收起的是最旧的那几张。
+    expect(html).toContain('data-id="idle-0"');
+    expect(html).not.toContain(`data-id="idle-${KANBAN_COLUMN_PAGE}"`);
+    expect(html).toContain('kanban-col-show-more');
+    expect(html).toContain(`显示更多（还有 ${extra} 个）`);
+    // 列头计数仍是整列总数，不是已渲染数。
+    expect(html).toContain(`<span class="kanban-col-count">${KANBAN_COLUMN_PAGE + extra}</span>`);
+  });
+
   it('omits the terminal action when the embedding shell does not provide it', () => {
     const html = renderToStaticMarkup(createElement(SessionsKanbanView, {
       host: null,
       ...kanbanCallbacks,
       onOpenTerminal: undefined,
-      onOpenWritableTerminal: undefined,
       rows: [{
         sessionId: 'embedded-session',
         status: 'working',
@@ -664,19 +403,12 @@ describe('dashboard sessions kanban react view', () => {
         lastMessageAt: 1000,
         webPort: 3001,
       }],
-      groupBy: 'flow',
-      teams: [],
-      teamsLoaded: true,
-      teamKey: '',
-      teamBoardData: null,
-      teamBoardKey: '',
     }));
 
     expect(html).not.toContain('data-action="terminal"');
-    expect(html).not.toContain('data-action="write-link"');
   });
 
-  it('renders separate read-only and writable terminal actions when both are available', () => {
+  it('renders a single terminal entry and no separate writable-terminal menu item', () => {
     const html = renderKanban({
       rows: [{
         sessionId: 'dual-terminal-session',
@@ -689,7 +421,132 @@ describe('dashboard sessions kanban react view', () => {
       }],
     });
 
-    expect(html).toContain('data-action="terminal"');
-    expect(html).toContain('data-action="write-link"');
+    // 只有底部一个「终端」按钮：开可操作还是只读由页面按身份决定，「⋯」菜单里不再重复一项。
+    expect((html.match(/data-action="terminal"/g) ?? []).length).toBe(1);
+    expect(html).toContain('data-menu-items="history,restart,lock,close"');
+  });
+});
+
+describe('filterSessionRows', () => {
+  const base: SessionRowFilters = { q: '', status: '', adopt: '', bot: '', chat: '', cli: '', showUnknownChats: true };
+  const rows = [
+    { sessionId: 'a', status: 'idle', cliId: 'codex', larkAppId: 'bot_1', chatId: 'oc_1', chatDisplayName: 'Alpha', adopt: false },
+    { sessionId: 'b', status: 'working', cliId: 'claude-code', larkAppId: 'bot_2', chatId: 'oc_2', chatDisplayName: 'Beta', adopt: true },
+    { sessionId: 'c', status: 'closed', cliId: 'codex', larkAppId: 'bot_1', chatId: 'oc_1', chatDisplayName: 'Alpha', adopt: false },
+    { sessionId: 'd', status: 'idle', larkAppId: 'bot_2', chatId: 'oc_3', chatDisplayName: 'Gamma', adopt: false },
+  ];
+  const ids = (f: Partial<SessionRowFilters>, keepClosed = false) =>
+    filterSessionRows(rows, { ...base, ...f }, { keepClosed }).map(r => r.sessionId);
+
+  it('hides closed sessions by default, keeps them for the kanban, and shows them for "all incl. closed"', () => {
+    expect(ids({})).toEqual(['a', 'b', 'd']);
+    expect(ids({}, true)).toEqual(['a', 'b', 'c', 'd']);
+    expect(ids({ status: SESSION_STATUS_ANY })).toEqual(['a', 'b', 'c', 'd']);
+    expect(ids({ status: 'closed' })).toEqual(['c']);
+    expect(ids({ status: 'idle' })).toEqual(['a', 'd']);
+  });
+
+  it('filters by bot, chat, source and a single CLI (missing cliId counts as unknown)', () => {
+    expect(ids({ bot: 'bot_2' })).toEqual(['b', 'd']);
+    expect(ids({ chat: 'oc_1' }, true)).toEqual(['a', 'c']);
+    expect(ids({ adopt: 'yes' })).toEqual(['b']);
+    expect(ids({ adopt: 'no' })).toEqual(['a', 'd']);
+    expect(ids({ cli: 'codex' })).toEqual(['a']);
+    expect(ids({ cli: 'unknown' })).toEqual(['d']);
+  });
+
+  it('combines filters with the free-text search', () => {
+    expect(ids({ q: 'gamma' })).toEqual(['d']);
+    expect(ids({ q: 'alpha', status: SESSION_STATUS_ANY, cli: 'codex' })).toEqual(['a', 'c']);
+  });
+});
+
+describe('hasActiveSessionFilters / clearSessionFilters', () => {
+  const fresh: SessionRowFilters = { q: '', status: '', adopt: '', bot: '', chat: '', cli: '', showUnknownChats: true };
+
+  it('does not treat the showUnknownChats display setting as an active filter in either position', () => {
+    // 默认（显示未知聊天=true）全新页面不该出现「清除筛选」；关掉它也不出现——它有自己的开关。
+    expect(hasActiveSessionFilters(fresh)).toBe(false);
+    expect(hasActiveSessionFilters({ ...fresh, showUnknownChats: false })).toBe(false);
+  });
+
+  it.each([
+    ['status', { status: 'idle' }],
+    ['adopt', { adopt: 'yes' }],
+    ['bot', { bot: 'app_1' }],
+    ['chat', { chat: 'oc_1' }],
+    ['cli', { cli: 'codex' }],
+  ] as const)('reports active when %s is set', (_key, patch) => {
+    expect(hasActiveSessionFilters({ ...fresh, ...patch })).toBe(true);
+  });
+
+  it('clears the five narrowing dimensions but keeps the search query and the unknown-chats setting', () => {
+    const cleared = clearSessionFilters({
+      q: 'build', status: 'idle', adopt: 'yes', bot: 'app_1', chat: 'oc_1', cli: 'codex',
+      showUnknownChats: false,
+    });
+    expect(cleared).toEqual({
+      q: 'build', status: '', adopt: '', bot: '', chat: '', cli: '', showUnknownChats: false,
+    });
+    // 默认开启时同样保持开启：清除筛选绝不能反过来隐藏一批会话。
+    expect(clearSessionFilters({ ...fresh, q: 'x' }).showUnknownChats).toBe(true);
+  });
+});
+
+describe('normalizeStatusFilterForView', () => {
+  it('collapses "all incl. closed" only when the view already keeps closed sessions', () => {
+    expect(normalizeStatusFilterForView(SESSION_STATUS_ANY, true)).toBe('');
+    expect(normalizeStatusFilterForView(SESSION_STATUS_ANY, false)).toBe(SESSION_STATUS_ANY);
+    expect(normalizeStatusFilterForView('idle', true)).toBe('idle');
+    expect(normalizeStatusFilterForView('', false)).toBe('');
+  });
+});
+
+describe('isOffBoardDormant', () => {
+  it('keeps dormant sessions off the board unless they were placed by hand', () => {
+    expect(isOffBoardDormant({ status: 'dormant' })).toBe(true);
+    expect(isOffBoardDormant({ status: 'dormant', kanbanColumn: 'bogus' })).toBe(true);
+    expect(isOffBoardDormant({ status: 'dormant', kanbanColumn: 'backlog' })).toBe(false);
+    expect(isOffBoardDormant({ status: 'idle' })).toBe(false);
+    expect(isOffBoardDormant({ status: 'working' })).toBe(false);
+    expect(isOffBoardDormant({ status: 'closed' })).toBe(false);
+  });
+});
+
+describe('deriveSessionBoardColumn', () => {
+  it('drops closed sessions off the board', () => {
+    expect(deriveSessionBoardColumn({ status: 'closed' })).toBeNull();
+  });
+
+  it('routes needs-you signals ahead of runtime state', () => {
+    expect(deriveSessionBoardColumn({ status: 'working', pendingRepo: true })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'idle', tuiPromptActive: true })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'idle', agentAttention: { kind: 'x', reason: 'y', at: 1 } })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'limited' })).toBe('needs-you');
+  });
+
+  it('folds "starting" into the "working" (进行中) column', () => {
+    for (const status of ['starting', 'working', 'analyzing', 'active']) {
+      expect(deriveSessionBoardColumn({ status })).toBe('working');
+    }
+  });
+
+  it('treats idle/dormant with no open todos as idle', () => {
+    expect(deriveSessionBoardColumn({ status: 'idle' })).toBe('idle');
+    expect(deriveSessionBoardColumn({ status: 'dormant' })).toBe('idle');
+    // openTodos present but nothing left → still idle (task delivered).
+    expect(deriveSessionBoardColumn({ status: 'idle', openTodos: { total: 3, done: 3, remaining: 0, hasInProgress: false } })).toBe('idle');
+  });
+
+  it('routes an idle process with unfinished todos to the "待办" (todo) column', () => {
+    expect(deriveSessionBoardColumn({ status: 'idle', openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: false } })).toBe('todo');
+    expect(deriveSessionBoardColumn({ status: 'dormant', openTodos: { total: 2, done: 0, remaining: 2, hasInProgress: true } })).toBe('todo');
+  });
+
+  it('keeps running/needs-you state ahead of the todo task-state', () => {
+    // 运行态优先：机器还在跑就归「进行中」，即便有未完成 todo。
+    expect(deriveSessionBoardColumn({ status: 'working', openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: true } })).toBe('working');
+    // needs-you 信号仍最高优先。
+    expect(deriveSessionBoardColumn({ status: 'idle', pendingRepo: true, openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: false } })).toBe('needs-you');
   });
 });

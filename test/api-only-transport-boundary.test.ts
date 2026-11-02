@@ -28,6 +28,8 @@ vi.mock('../src/services/groups-store.js', async (importOriginal) => {
 import { triggerSessionTurn } from '../src/core/trigger-session.js';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { larkTransportEnabled, isHttpVirtualSession, type DaemonSession } from '../src/core/types.js';
+import { resolve } from 'node:path';
+import ts from 'typescript';
 
 const APP = 'local_riff';
 
@@ -56,16 +58,62 @@ describe('larkTransportEnabled — central no-Feishu predicate', () => {
   it('disables transport for an HTTP virtual session even on a normal bot', () => {
     expect(larkTransportEnabled({ chatId: 'http_async_abc', apiOnly: false })).toBe(false);
     expect(larkTransportEnabled({ chatId: 'http_wait_abc', apiOnly: undefined })).toBe(false);
+    expect(larkTransportEnabled({ chatId: 'headless_hl_abc12345', apiOnly: false })).toBe(false);
   });
   it('enables transport for a normal bot in a real chat', () => {
     expect(larkTransportEnabled({ chatId: 'oc_real', apiOnly: false })).toBe(true);
   });
-  it('isHttpVirtualSession recognizes both synthetic prefixes only', () => {
+  it('isHttpVirtualSession recognizes synthetic no-transport prefixes only', () => {
     expect(isHttpVirtualSession('http_async_x')).toBe(true);
     expect(isHttpVirtualSession('http_wait_x')).toBe(true);
+    expect(isHttpVirtualSession('headless_hl_abc12345')).toBe(true);
     expect(isHttpVirtualSession('oc_real')).toBe(false);
     expect(isHttpVirtualSession('doc:tok')).toBe(false);
   });
+  it('tolerates a nullish chatId (a missing surface is not an HTTP virtual chat)', () => {
+    // Hardened when converging worker.ts's four inline copies onto this predicate:
+    // one site (screenshot-upload gate) fed a `msg.chatId` that could be undefined,
+    // and inline code guarded with `?.` — so the central helper must not throw.
+    expect(isHttpVirtualSession(undefined)).toBe(false);
+    expect(isHttpVirtualSession(null)).toBe(false);
+    // A nullish chatId with a non-apiOnly bot ⇒ transport still enabled (no crash).
+    expect(larkTransportEnabled({ chatId: undefined, apiOnly: false })).toBe(true);
+    expect(larkTransportEnabled({ chatId: undefined, apiOnly: true })).toBe(false);
+  });
+  it('rejects at compile time a call that omits `chatId` (a missing key cannot silently fail open)', () => {
+    // Tolerating a nullish VALUE (above) must not become tolerating a missing KEY:
+    // `larkTransportEnabled({ apiOnly: false })` would read as "transport enabled",
+    // so the omission has to be a type error. Type-check an in-memory probe against
+    // the real signature with the TypeScript compiler (test/ is not covered by tsc).
+    const probePath = resolve('test/__lark-transport-enabled-probe.ts');
+    const probe = [
+      "import { larkTransportEnabled } from '../src/core/types.js';",
+      'larkTransportEnabled({ chatId: undefined, apiOnly: false });', // line 2: compiles
+      'larkTransportEnabled({ chatId: null });', // line 3: compiles
+      'larkTransportEnabled({ apiOnly: false });', // line 4: must NOT compile
+    ].join('\n');
+    const options: ts.CompilerOptions = {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      strict: true,
+      noEmit: true,
+      skipLibCheck: true,
+    };
+    const host = ts.createCompilerHost(options);
+    const readSourceFile = host.getSourceFile.bind(host);
+    host.getSourceFile = (fileName, languageVersion, ...rest) =>
+      resolve(fileName) === probePath
+        ? ts.createSourceFile(fileName, probe, languageVersion)
+        : readSourceFile(fileName, languageVersion, ...rest);
+    const fileExists = host.fileExists.bind(host);
+    host.fileExists = (fileName) => resolve(fileName) === probePath || fileExists(fileName);
+    const program = ts.createProgram([probePath], options, host);
+    const sf = program.getSourceFile(probePath)!;
+    const errorLines = program.getSemanticDiagnostics(sf)
+      .map((d) => sf.getLineAndCharacterOfPosition(d.start ?? 0).line + 1);
+    expect(errorLines).toEqual([4]);
+  }, 30_000);
 });
 
 describe('triggerSessionTurn — apiOnly request-shape fail-closed', () => {
